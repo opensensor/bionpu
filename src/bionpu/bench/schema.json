@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/matteius/genetics/bionpu/bench/schema.json",
+  "title": "bionpu measurements.json",
+  "description": "Schema for results/<track>/<run-id>/measurements.json. Implements PRD §4.2 (umbrella) and the units locked in bionpu/bench/UNITS.md. Custom annotation x-deterministic marks fields that legitimately differ run-to-run (timestamp, run_id) so consumers can diff records modulo non-determinism.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "timestamp",
+    "track",
+    "n_iters",
+    "records"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "SemVer of this schema. Bump when records' shape changes.",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "ISO-8601 timestamp + 4-char hex suffix; unique per bench_all invocation.",
+      "x-deterministic": false
+    },
+    "timestamp": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp recorded at bench_all entry. Differs run-to-run by definition.",
+      "x-deterministic": false
+    },
+    "track": {
+      "type": "string",
+      "description": "Track name. _smoke is reserved for the default `bionpu bench --all` workload.",
+      "enum": ["basecalling", "crispr", "umbrella", "_smoke"]
+    },
+    "n_iters": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Iterations per (op, device) pair."
+    },
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/MeasurementRecord" }
+    }
+  },
+  "$defs": {
+    "MeasurementRecord": {
+      "type": "object",
+      "description": "One timed run's measurements per UNITS.md.",
+      "required": [
+        "track",
+        "op",
+        "device",
+        "t_start",
+        "t_end",
+        "throughput",
+        "accuracy",
+        "energy_j",
+        "energy_per_unit",
+        "energy_source",
+        "latencies_ms",
+        "rss_bytes",
+        "vram_peak_bytes",
+        "tile_memory_bytes",
+        "env",
+        "n_iters",
+        "reason_unavailable"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "track": { "type": "string" },
+        "op": {
+          "type": "string",
+          "description": "Operator name (e.g. 'basecall', 'scan', 'mock_op')."
+        },
+        "device": {
+          "type": "string",
+          "enum": ["cpu", "gpu", "npu"],
+          "description": "Device the work ran on. UNITS.md §0; POWER_DOMAINS.md per-device caveats."
+        },
+        "t_start": {
+          "type": "number",
+          "description": "Monotonic seconds at start of timed window. Captured via time.monotonic_ns()/1e9.",
+          "x-deterministic": false
+        },
+        "t_end": {
+          "type": "number",
+          "description": "Monotonic seconds at end of timed window.",
+          "x-deterministic": false
+        },
+        "throughput": {
+          "type": "object",
+          "description": "Map of throughput-unit name to value. Keys are a subset of UNITS.md ThroughputUnit.",
+          "additionalProperties": false,
+          "properties": {
+            "samples_per_sec": { "type": ["number", "null"] },
+            "bp_per_sec": { "type": ["number", "null"] },
+            "guides_per_sec": { "type": ["number", "null"] },
+            "sites_per_sec": { "type": ["number", "null"] }
+          }
+        },
+        "accuracy": {
+          "type": "object",
+          "description": "Accuracy metrics per UNITS.md §2. Empty in mock workloads; populated by //.",
+          "additionalProperties": false,
+          "properties": {
+            "modal_accuracy": { "type": ["number", "null"] },
+            "indel_rate": { "type": ["number", "null"] },
+            "set_equality_pct": { "type": ["number", "null"] }
+          }
+        },
+        "energy_j": {
+          "type": ["number", "null"],
+          "description": "Joules consumed over the timed window per the device's EnergyReader. Null when reader is unavailable; never zero-as-fake (POWER_DOMAINS.md §4 rule #3)."
+        },
+        "energy_per_unit": {
+          "type": "object",
+          "description": "Energy-derivative metrics per UNITS.md §3.",
+          "additionalProperties": false,
+          "properties": {
+            "joules_per_megabase": { "type": ["number", "null"] },
+            "joules_per_guide": { "type": ["number", "null"] },
+            "joules_per_guide_genome": { "type": ["number", "null"] }
+          }
+        },
+        "energy_source": {
+          "type": "string",
+          "description": "How the joules figure was obtained. 'stub' marks / preliminary-only readings; (CPU/GPU) and (NPU) replace with real-* values.",
+          "enum": ["stub", "real-rapl", "real-nvidia-smi", "real-xrt-smi"]
+        },
+        "latencies_ms": {
+          "type": "object",
+          "description": "Nearest-rank percentiles + max from per-chunk samples (UNITS.md §4.1).",
+          "required": ["p50", "p95", "p99", "max"],
+          "additionalProperties": false,
+          "properties": {
+            "p50": { "type": ["number", "null"] },
+            "p95": { "type": ["number", "null"] },
+            "p99": { "type": ["number", "null"] },
+            "max": { "type": ["number", "null"] }
+          }
+        },
+        "rss_bytes": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Process RSS bytes per UNITS.md §5.1."
+        },
+        "vram_peak_bytes": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Torch CUDA peak per UNITS.md §5.2; null when CUDA absent."
+        },
+        "tile_memory_bytes": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "AIE2P tile-local memory bytes per UNITS.md §5.3. Null on CPU/GPU. Null != 0."
+        },
+        "env": {
+          "type": "object",
+          "description": "Stable env snapshot (no host-specific values; see harness._capture_env).",
+          "additionalProperties": { "type": "string" }
+        },
+        "n_iters": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Iterations driven through this (op, device) pair."
+        },
+        "reason_unavailable": {
+          "type": ["string", "null"],
+          "description": "If energy_j or another field is null because a reader is unavailable, the human-readable reason. Null means 'all readers were available'."
+        }
+      }
+    }
+  }
+}

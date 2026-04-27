@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+.venv/
+venv/
+
+# Build outputs (regenerable from kernel sources)
+src/bionpu/kernels/**/build/
+src/bionpu/kernels/**/_build/
+src/bionpu/kernels/**/*.o
+src/bionpu/kernels/**/*.xclbin
+src/bionpu/kernels/**/insts.bin
+src/bionpu/kernels/**/host_runner
+
+# Reference data caches (large; downloaded by fetchers)
+data_cache/
+*.pod5
+*.fa
+*.fa.gz
+*.fasta
+*.fastq
+*.bam
+*.cram
+
+# But keep the small reference fixtures we ship with the repo
+!reference/**/*.tsv
+!reference/**/*.fastq
+!reference/**/*.json
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~

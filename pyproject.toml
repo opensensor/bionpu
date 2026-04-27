@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bionpu"
+version = "0.1.0.dev0"
+description = "AIE2P-accelerated genomics with reference-equivalence verification"
+readme = "README.md"
+license = { text = "GPL-3.0-only" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Matt Davis", email = "matt@opensensor.io" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "numpy>=1.26",
+    # mlir-aie (the iron Python API + dialect bindings) is consumed at
+    # runtime; users build it themselves and put it on PYTHONPATH.
+    # We do not pip-depend on it because it is not on PyPI.
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7",
+    "pytest-cov",
+]
+dev = [
+    "ruff",
+    "mypy",
+    "build",
+]
+
+[project.scripts]
+bionpu = "bionpu.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/opensensor/bionpu"
+Repository = "https://github.com/opensensor/bionpu.git"
+Issues = "https://github.com/opensensor/bionpu/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+bionpu = ["kernels/**/*.cc", "kernels/**/*.cpp", "kernels/**/*.py", "kernels/**/Makefile", "kernels/**/MANIFEST.md"]

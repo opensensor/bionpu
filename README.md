@@ -96,13 +96,15 @@ src/bionpu/
 │   ├── crispr/          CRISPR off-target scan (PAM filter, match, …)
 │   └── basecalling/     Nanopore basecalling (LSTM cell, conv stem, …)
 ├── dispatch/            NPU silicon-dispatch + serialisation lock
-├── verify/              Byte-equality harness (public API)
+├── verify/              Byte-equality harness (public API; +score policies)
+├── scoring/             Off-target probability scorers (CPU/GPU; NPU TBD)
 ├── bench/               Energy + timing measurement (RAPL)
 ├── data/                Reference / fixture fetchers
 └── quant/               Quantisation helpers (FP32 → bf16/int8)
 docs/                    Methodology + reproduction docs
 reference/               Canonical CPU-reference outputs (TSVs, FASTQs)
 benchmarks/              Run scripts + pre-computed results
+third_party/             Pinned upstream research repos (git submodules)
 tests/                   pytest suite
 ```
 

@@ -43,7 +43,13 @@ The upstream training pipeline expects:
 1. **Yaish 2024 datasets** — the Lazzarotto 2020 GUIDE-seq + CHANGE-seq
    off-target pairs, packaged by Yaish *et al.* at
    <https://github.com/OrensteinLab/CRISPR-Bulge/blob/main/files/datasets.zip>.
-   Extract under a directory the upstream `config.yaml` points at.
+   Pin SHA-256: `f892f70b...3eab0` (524 MiB). Pre-wired as a fetcher:
+   ```python
+   from bionpu.data import REGISTRY, Fetcher
+   Fetcher().fetch(REGISTRY["yaish_2024"], mode="full")
+   # → ~/.../data_cache/crispr/yaish_2024/datasets.zip
+   ```
+   Extract that zip under a directory the upstream `config.yaml` points at.
 2. **DNABERT-3 base weights** — Hugging Face model
    `zhihan1996/DNA_bert_3`. Downloaded automatically by `transformers`
    on first use, or pre-pulled via:
@@ -94,33 +100,21 @@ ROC-AUC `0.9857 ± 0.0124` across folds.
 ## Export a checkpoint for `bionpu score`
 
 The upstream training writes a state dict for the full
-`DNABERTEpiModule`. For the no-epi variant the only weights bionpu's
-clean-room classifier head needs are the final
-`Dropout → Linear(768, 2)` projection. Extract them:
+`DNABERTEpiModule`. For the no-epi variant bionpu's clean-room
+classifier head only needs the final `Dropout → Linear(768, 2)`
+projection. Use the bundled extractor:
 
-```python
-# Run from the bionpu-public root; requires torch installed.
-import torch
-from pathlib import Path
-
-upstream_ckpt = Path("third_party/crispr_dnabert/.../fold0_iter0.pt")
-state = torch.load(upstream_ckpt, map_location="cpu")
-
-# In the upstream module the no-epi linear lives under classifier.1
-# (Sequential[ Dropout(0.1), Linear(768, 2) ]).
-head_state = {
-    "0.weight": state["classifier.1.weight"]   if "classifier.1.weight" in state
-                else state["classifier.weight"],   # tolerate both layouts
-    "0.bias":   state["classifier.1.bias"]     if "classifier.1.bias" in state
-                else state["classifier.bias"],
-}
-# Save in the shape bionpu/scoring/_head.py expects:
-torch.save({"1.weight": head_state["0.weight"], "1.bias": head_state["0.bias"]},
-           "bionpu-dnabert-epi-noEpi-fold0.pt")
+```bash
+bionpu score-extract-head \
+    --upstream-checkpoint third_party/crispr_dnabert/.../fold0_iter0.pt \
+    --out bionpu-dnabert-epi-noEpi-fold0.pt
 ```
 
-(The `1.*` keys match `nn.Sequential(Dropout, Linear)` where Linear is
-index 1.)
+The extractor handles three upstream key layouts (`classifier.1.*`,
+flat `classifier.*`, and DataParallel `module.classifier.*`). It
+fails loud with a precise error if the checkpoint was trained WITH
+epigenetic features (the with-epi `Linear`'s `in_features` is
+`768 + 256*N`, not `768` — the wrong shape for the no-epi head).
 
 Then:
 

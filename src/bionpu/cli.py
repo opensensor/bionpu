@@ -233,6 +233,46 @@ def _cmd_score(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_score_extract_head(args: argparse.Namespace) -> int:
+    """Convert an upstream DNABERT-Epi checkpoint into a bionpu head dict.
+
+    The upstream training pipeline saves the full ``DNABERTEpiModule``
+    state dict (BERT body + epi-encoder + gating MLP + classifier).
+    bionpu's no-epi scorer only needs the classifier head's
+    ``Linear(768, 2)`` weights; this command extracts them into a
+    state_dict file that ``bionpu score --weights ...`` can load.
+    """
+    try:
+        import torch
+    except ImportError:
+        print(
+            "bionpu score-extract-head: torch is required for this command "
+            "(install with `pip install torch`).",
+            file=sys.stderr,
+        )
+        return 3
+
+    from .scoring._extract_head import ExtractError, extract_no_epi_head
+
+    upstream_path = pathlib.Path(args.upstream_checkpoint)
+    out_path = pathlib.Path(args.out)
+    try:
+        bionpu_state = extract_no_epi_head(upstream_path)
+    except ExtractError as exc:
+        print(f"bionpu score-extract-head: {exc}", file=sys.stderr)
+        return 4
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(bionpu_state, out_path)
+    print(
+        f"bionpu score-extract-head: wrote {out_path} "
+        f"(weight shape {tuple(bionpu_state['1.weight'].shape)}, "
+        f"bias shape {tuple(bionpu_state['1.bias'].shape)})",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def _cmd_bench_probe(args: argparse.Namespace) -> int:
     """Probe per-device energy readers on this host.
 
@@ -522,6 +562,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Per-row score tolerance for NUMERIC_EPSILON. Default 1e-6.",
     )
     p_score.set_defaults(func=_cmd_score)
+
+    # score-extract-head — upstream-checkpoint → bionpu-head converter
+    p_xhead = sub.add_parser(
+        "score-extract-head",
+        help=(
+            "Convert an upstream DNABERT-Epi state-dict checkpoint into "
+            "a bionpu-loadable no-epi head state-dict (the bridge "
+            "between third_party/crispr_dnabert training output and "
+            "`bionpu score --weights`)."
+        ),
+    )
+    p_xhead.add_argument(
+        "--upstream-checkpoint",
+        required=True,
+        help="Path to the upstream DNABERT-Epi state_dict (.pt).",
+    )
+    p_xhead.add_argument(
+        "--out",
+        required=True,
+        help="Output path for the bionpu head state_dict.",
+    )
+    p_xhead.set_defaults(func=_cmd_score_extract_head)
 
     # bench
     p_bench = sub.add_parser(

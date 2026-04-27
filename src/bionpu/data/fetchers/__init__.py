@@ -481,6 +481,7 @@ from bionpu.data.fetchers import doench_2016 as _doench_2016  # noqa: E402,F401
 from bionpu.data.fetchers import guide_seq as _guide_seq  # noqa: E402,F401
 from bionpu.data.fetchers import pod5_hg002 as _pod5_hg002  # noqa: E402,F401
 from bionpu.data.fetchers import reference_genomes as _reference_genomes  # noqa: E402,F401
+from bionpu.data.fetchers import yaish_2024 as _yaish_2024  # noqa: E402,F401
 
 # Mark unused imports as used (for type checkers / ruff F401).
 _ = (_doench_2016, _guide_seq, _pod5_hg002, _reference_genomes, field)

@@ -476,6 +476,7 @@ derivative publication.
 # Placed at the bottom to avoid circular imports.
 # ---------------------------------------------------------------------------
 
+from bionpu.data.fetchers import crisproff as _crisproff  # noqa: E402,F401
 from bionpu.data.fetchers import doench_2016 as _doench_2016  # noqa: E402,F401
 from bionpu.data.fetchers import guide_seq as _guide_seq  # noqa: E402,F401
 from bionpu.data.fetchers import pod5_hg002 as _pod5_hg002  # noqa: E402,F401

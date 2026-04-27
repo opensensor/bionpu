@@ -39,3 +39,5 @@ data_cache/
 .idea/
 *.swp
 *~
+_npu_artifacts/  # pre-built kernel cache; rebuilt via 'make' in each kernel dir
+src/bionpu/dispatch/_npu_artifacts/

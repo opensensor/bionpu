@@ -1,6 +1,6 @@
 # — PacketFifo PAM-filter retrofit (C-M5-pktmerge)
 
-This is the kernel-author DESIGN doc for the retrofit of 's
+This is the kernel-author DESIGN doc for the retrofit of
 filter-early variant using the fork's PacketFifo. Read this
 together with `results/crispr/c-m5-pktmerge/verdict.md` for the
 ratification outcome.
@@ -21,7 +21,7 @@ Close the OTHER HALF of :
   class accepts the canonical filter-early construction.
 
 * **Phase 2 — silicon** ratifies the silicon-level
-  pktMerge N:1 shape in two forms. The `pktmerge_topology()` helper
+  pktMerge N:1 shape in two forms. The `pktmerge_topology` helper
   constructs the canonical PacketFifo at API-surface level, and the
   opt-in `DIRECT_STREAM=1` path replaces the `windows_out` payload
   edge with compact core-to-core streams. The default dispatch artifact
@@ -31,14 +31,14 @@ Close the OTHER HALF of :
 ## Topology (target)
 
 The canonical replacement topology, declared via
-`pktmerge_topology()`:
+`pktmerge_topology`:
 
 ```
 shim ──windows_in (ObjectFifo)── Tile A
                                    │ PacketFifo / core stream
-                                   │   valid windows only:
-                                   │   u32 window_idx + 5 spacer bytes
-                                   │   + 3 pad bytes
+                                   │ valid windows only:
+                                   │ u32 window_idx + 5 spacer bytes
+                                   │ + 3 pad bytes
                                    ▼
                           match tiles (variable-rate consumers;
                                        only see PAM-passing windows)
@@ -78,14 +78,14 @@ uses lower-level AIE2P Peano intrinsics from `<aie2p/aie2p_streams.h>`:
 * Tile A calls `crispr_pam_filter_tile_a_pktmerge_stream_i32`.
   It scans a 64-window chunk, emits only NGG-passing windows, and writes
   three 32-bit stream words per valid packet:
-  `uint32 window_idx`, packed spacer bytes 0..3, packed spacer byte 4.
+  `uint32 window_idx`, packed spacer bytes 0.3, packed spacer byte 4.
   Empty chunks emit one sentinel packet (`window_idx == UINT32_MAX`) so
   both stream consumers execute the same per-chunk receive protocol; Tile
   Z skips the sentinel and emits no sparse records for that chunk.
 * Each match tile calls
   `crispr_match_multitile_match_packetized_stream_i32`. It reads the
   per-chunk valid count from a sideband ObjectFifo, receives exactly that
-  many three-word packets with `get_ss_int()`, computes 64 guide
+  many three-word packets with `get_ss_int`, computes 64 guide
   mismatches, and writes compact partial records keyed by original
   `window_idx`.
 * IRON emits only compact `scf.for` chunk loops plus two explicit
@@ -114,17 +114,17 @@ looked attractive but did not scale:
 
 The match-tile entry (`crispr_match_multitile_match`) is unchanged
 from . Tile A's filter and Tile Z's emit kernels are renamed to
-disambiguate from 's symbols, but their bodies match 's
+disambiguate from symbols, but their bodies match 's
 filter-early variants byte-for-byte.
 
 ## Per-tile memory
 
-| tile             | bytes | budget hit                                    |
+| tile | bytes | budget hit |
 |------------------|------:|-----------------------------------------------|
-| `tile_a_pktmerge`| 1664  | windows_in DBL + windows_out DBL + pam_meta DBL + 128 B header DBL |
-| `match_tile`     | 9472  | guides resident + windows DBL + partial DBL  |
-| `tile_z_emit`    | 20608 | partials DBL + pam_meta DBL + sparse ring DBL |
-| **peak**         | 20608 | (Tile Z; ~32% of AIE2P 64 KiB DM cap)         |
+| `tile_a_pktmerge`| 1664 | windows_in DBL + windows_out DBL + pam_meta DBL + 128 B header DBL |
+| `match_tile` | 9472 | guides resident + windows DBL + partial DBL |
+| `tile_z_emit` | 20608 | partials DBL + pam_meta DBL + sparse ring DBL |
+| **peak** | 20608 | (Tile Z; ~32% of AIE2P 64 KiB DM cap) |
 
 Default Δ vs filter-early: +128 B at Tile A for the per-chunk
 packet header buffer; otherwise identical. The `DIRECT_STREAM=1`
@@ -138,7 +138,7 @@ valid counts and compact partial packets. Both forms remain under cap.
   per window. PAM byte layout: bits 1:0 = pam[0] (N, ignored),
   3:2 = pam[1] (must be G), 5:4 = pam[2] (must be G), 7:6 = padding.
 * **Packetized valid-window payload** (`DIRECT_STREAM=1`): three 32-bit
-  words per valid window: `uint32 window_idx`, spacer bytes 0..3 packed
+  words per valid window: `uint32 window_idx`, spacer bytes 0.3 packed
   little-endian, spacer byte 4 in the low byte of the third word.
 * **Sparse emit record** (Tile Z output): 8 B per surviving (window,
   guide) pair: u16 window_idx (LE) | u8 guide_idx | u8 mismatches |
@@ -158,7 +158,7 @@ valid counts and compact partial packets. Both forms remain under cap.
   producer. Uses `put_ms` to emit three i32 words for each PAM-passing
   window. No ADF stream pointer ABI.
 * `crispr_match_multitile_match_packetized_stream_i32` — direct-stream
-  match consumer. Uses `get_ss_int()` to receive packet words and emits
+  match consumer. Uses `get_ss_int` to receive packet words and emits
   compact partial mismatch records.
 * `crispr_pam_filter_tile_z_pktmerge_packetized` — packetized Tile Z
   reducer for compact partial records.
@@ -243,10 +243,10 @@ Valid-density matrix (`n_iters=3`, `warmup=1`, no-hit fixtures):
 
 | valid windows / chunk | direct-stream | filter-early | early/direct | verdict |
 |----------------------:|--------------:|-------------:|-------------:|---------|
-| 0                     |      ~292 us  |      ~687 us |        2.35x | pass    |
-| 1                     |      ~326 us  |      ~670 us |        2.06x | pass    |
-| 4                     |      ~769 us  |      ~690 us |        0.90x | pass but slower |
-| 16                    |           TDR |            - |            - | fail    |
+| 0 |      ~292 us |      ~687 us | 2.35x | pass |
+| 1 |      ~326 us |      ~670 us | 2.06x | pass |
+| 4 |      ~769 us |      ~690 us | 0.90x | pass but slower |
+| 16 |           TDR | - | - | fail |
 
 The knee is therefore between 1 and 4 valid windows per 64-window chunk.
 The current Peano AIE2P stream helper exposes only the single
@@ -291,10 +291,10 @@ Valid-density matrix (`n_iters=10`, `warmup=2`, no-hit fixtures):
 
 | valid windows / chunk | compact packets | filter-early | early/compact | verdict |
 |----------------------:|----------------:|-------------:|--------------:|---------|
-| 0                     |         171 us  |      724 us  |         4.25x | pass    |
-| 1                     |         240 us  |      680 us  |         2.84x | pass    |
-| 4                     |         704 us  |      683 us  |         0.97x | pass but slightly slower |
-| 16                    |        2553 us  |     1857 us  |         0.73x | pass but slower |
+| 0 |         171 us |      724 us |         4.25x | pass |
+| 1 |         240 us |      680 us |         2.84x | pass |
+| 4 |         704 us |      683 us |         0.97x | pass but slightly slower |
+| 16 |        2553 us |     1857 us |         0.73x | pass but slower |
 
 This is better than direct-stream for robustness: the dense-valid TDR is
 gone. Shrinking the packet ABI improved the sparse end enough to hit the

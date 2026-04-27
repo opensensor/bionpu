@@ -58,7 +58,7 @@ conditions independent — either alone is sufficient to skip.
 ** CPU branch: Partial.** Per POWER_DOMAINS.md §1.4 and the 
 task brief: never fabricate. Production behaviour:
 
-- `RaplReader()` in `bionpu/bench/energy/rapl.py` correctly raises
+- `RaplReader` in `bionpu/bench/energy/rapl.py` correctly raises
   `RaplUnavailableError` with an actionable message.
 - `auto_reader("cpu")` falls back to `bionpu.bench.harness.RaplStub`
   with a `WARNING`-level log line citing the unavailability reason.
@@ -109,20 +109,20 @@ path documented in POWER_DOMAINS.md §2.3, polling `power.draw` at
 ### Idle baseline (5 s, system at rest)
 
 ```
-idle 5s: 70.56 J  (14.11 W avg)
+idle 5s: 70.56 J (14.11 W avg)
 ```
 
 ### CUDA matmul load (8192×8192, ~5 s)
 
 ```
-cuda matmul 49 iters over 5.11s: 350.14 J  (68.51 W avg)
+cuda matmul 49 iters over 5.11s: 350.14 J (68.51 W avg)
 ```
 
 ### Delta
 
 ```
-delta_W: 54.40 W   (gate requires > 5 W)
-ratio:   4.85x      (load_j / idle_j over equal windows)
+delta_W: 54.40 W (gate requires > 5 W)
+ratio: 4.85x (load_j / idle_j over equal windows)
 ```
 
 **PASSES with margin.** The reader is responsive to real GPU load.
@@ -132,7 +132,7 @@ ratio:   4.85x      (load_j / idle_j over equal windows)
 ** GPU branch: Completed.** `NvidiaSmiReader` is the canonical
 GPU energy reader for the bench harness. Future tasks
 import from `bionpu.bench.energy` rather than re-defining the
-trapezoidal poller. 's `NvidiaSmiReal` in
+trapezoidal poller. `NvidiaSmiReal` in
 `tracks/crispr/baseline/run_baseline.py` remains untouched in this
 commit per the task brief; 's runner can adopt
 `bionpu.bench.energy.NvidiaSmiReader` in a follow-up.
@@ -159,8 +159,8 @@ than crashing. is the gate to promote this to a real reader.
 
 ```
 source .venv/bin/activate
-pytest tests/test_energy_real.py -q -m "not slow"        # all GREEN
-pytest tests/test_energy_real.py -q -m slow              # GPU PASS,
+pytest tests/test_energy_real.py -q -m "not slow" # all GREEN
+pytest tests/test_energy_real.py -q -m slow # GPU PASS,
                                                          # CPU SKIPPED
                                                          # (RAPL gated)
 ```
@@ -188,7 +188,7 @@ $ stat -c "%a %U %G %n" /sys/class/powercap/intel-rapl:0/energy_uj
 444 root root /sys/class/powercap/intel-rapl:0/energy_uj
 
 $ stat -c "%a %U %G %n" /sys/class/powercap/intel-rapl:0:0/energy_uj
-400 root root /sys/class/powercap/intel-rapl:0:0/energy_uj   # subdomain still 0400; harmless
+400 root root /sys/class/powercap/intel-rapl:0:0/energy_uj # subdomain still 0400; harmless
 
 $ which stress-ng
 /usr/bin/stress-ng
@@ -199,7 +199,7 @@ $ cat /proc/sys/kernel/dmesg_restrict
 
 Note: only the package-level counter (`intel-rapl:0/energy_uj`) was
 chmodded; the core-subdomain counter (`intel-rapl:0:0/energy_uj`)
-remains `0400`. `RaplReader.probe_rapl()` uses the package counter
+remains `0400`. `RaplReader.probe_rapl` uses the package counter
 first, so the reader is fully functional. If a future task needs
 core-only attribution, the operator will need to chmod that node too.
 
@@ -212,13 +212,13 @@ auto-probed `/sys/class/powercap/intel-rapl:0/energy_uj`:
 RAPL path: /sys/class/powercap/intel-rapl:0/energy_uj
 
 Idle baseline (time.sleep(10)):
-    152.761 J  (15.28 W avg)
+    152.761 J (15.28 W avg)
 
 Loaded (stress-ng --cpu 8 --timeout 10s):
-    611.449 J  (61.14 W avg)
+    611.449 J (61.14 W avg)
 
-delta_W: 45.86 W   (gate requires strictly load > idle; >5x ideal)
-ratio:   4.00x      (load_j / idle_j over equal 10 s windows)
+delta_W: 45.86 W (gate requires strictly load > idle; >5x ideal)
+ratio: 4.00x (load_j / idle_j over equal 10 s windows)
 ```
 
 A 4.00× ratio over a 10 s window is solidly above the "strictly
@@ -238,8 +238,8 @@ $ .venv/bin/pytest tests/test_energy_real.py -v -m slow
 platform linux -- Python 3.11.15, pytest-9.0.3, pluggy-1.6.0
 collecting ... collected 18 items / 16 deselected / 2 selected
 
-tests/test_energy_real.py::test_rapl_responsive_to_load PASSED           [ 50%]
-tests/test_energy_real.py::test_nvsmi_responsive_to_load PASSED          [100%]
+tests/test_energy_real.py::test_rapl_responsive_to_load PASSED [ 50%]
+tests/test_energy_real.py::test_nvsmi_responsive_to_load PASSED [100%]
 
 ====================== 2 passed, 16 deselected in 23.18s =======================
 ```
@@ -301,7 +301,7 @@ preferred without changing `XrtReader`'s public surface.
 ### Idle baseline (5 s, system at rest, no hardware context)
 
 ```
-idle 5s: 0.0000 J  (firmware noise floor 0.001-0.003 W; integrates to <10 mJ, rounds to 0 at 4 dp)
+idle 5s: 0.0000 J (firmware noise floor 0.001-0.003 W; integrates to <10 mJ, rounds to 0 at 4 dp)
 ```
 
 ### Loaded (100x `vector_scalar_mul` dispatches, ~10-15 s wall-clock)
@@ -312,7 +312,7 @@ mlir-aie host binary, loads the xclbin via XRT, runs the kernel,
 and exits. Sustained NPU load throughout the integration window.
 
 ```
-load: 0.1406 J  (100 dispatches; n_dispatches=100)
+load: 0.1406 J (100 dispatches; n_dispatches=100)
 ```
 
 A separate unbroken-load capture (50000 iterations in a single
@@ -323,8 +323,8 @@ POWER_DOMAINS.md §7.2.
 ### Delta
 
 ```
-delta:   +0.1406 J (idle 0.0000 J → load 0.1406 J)
-ratio:   ~∞ (idle floors near-zero; assertion is `load_j > idle_j`, holds with clear margin)
+delta: +0.1406 J (idle 0.0000 J → load 0.1406 J)
+ratio: ~∞ (idle floors near-zero; assertion is `load_j > idle_j`, holds with clear margin)
 ```
 
 **PASSES.** The reader is responsive to real NPU load. The
@@ -351,9 +351,9 @@ energy as `energy_source="real-xrt-smi"` rather than `"stub"`.
 measurements.json:
 
 ```
-cpu -> real-rapl       energy_j=0.0     (sub-ms work below RAPL counter resolution)
-gpu -> real-nvidia-smi energy_j=1.10    (CUDA matmul reference)
-npu -> real-xrt-smi    energy_j=0.0013  (vector_scalar_mul kernel; firmware-estimated)
+cpu -> real-rapl energy_j=0.0 (sub-ms work below RAPL counter resolution)
+gpu -> real-nvidia-smi energy_j=1.10 (CUDA matmul reference)
+npu -> real-xrt-smi energy_j=0.0013 (vector_scalar_mul kernel; firmware-estimated)
 ```
 
 ### Caveat for absolute-number citations
@@ -377,9 +377,9 @@ external reviewer asks.
 ```
 source /opt/xilinx/xrt/setup.sh
 source <ironenv>/bin/activate
-pytest tests/test_t44_xrt_energy.py -m "not npu" -q       # all GREEN (fast)
-pytest tests/test_t44_xrt_energy.py -m npu -q             # all GREEN (10-20 s)
-python -m bionpu bench --all --device npu --iters 3       # writes results/u-m2/measurements.json
+pytest tests/test_t44_xrt_energy.py -m "not npu" -q # all GREEN (fast)
+pytest tests/test_t44_xrt_energy.py -m npu -q # all GREEN (10-20 s)
+python -m bionpu bench --all --device npu --iters 3 # writes results/u-m2/measurements.json
 ```
 
 ## Cross-references

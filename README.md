@@ -36,8 +36,24 @@ internal planning / research-tracking infrastructure.
 
 3. **Reproducible on any chromosome / any pod5.** Benchmarks ship as
    shell scripts that take a target chromosome (CRISPR) or a pod5
-   read set (basecalling) as input. Pre-computed results for chr1,
-   chr19, chr22 are in `benchmarks/results/`.
+   read set (basecalling) as input. Pre-computed results across
+   chromosomes are v0.2 scope — see [`docs/STATUS.md`](docs/STATUS.md)
+   for the v0.1-vs-v0.2 split.
+
+## What ships in v0.1
+
+Concrete inventory; every number here is reproducible from the
+committed source on a clean clone.
+
+| Component | Count / size | Notes |
+|---|---|---|
+| AIE2P kernels (CRISPR) | **6** | PAM filter (filter-early + filter-late variants), match (singletile / multitile / multitile-memtile), `crispr_net`, pktmerge variant. |
+| AIE2P kernels (basecalling) | **12** | conv stem, linear projection, LSTM cell (7 precision / cascade / int8 / compressed variants), LSTM stack (3 variants). |
+| Verify-harness tests | **18 / 18 passing** | 8 CRISPR + 10 basecalling. SHA-256 regression-pinned. Run: `pytest tests/`. |
+| Cas-OFFinder canonical reference | **422 records, 30 877 canonical bytes** | SHA-256 `0765660ed275d7516937029c05e2b113f45d5e5fa94c17cbb4a9057d3a60432b` — pinned by `tests/test_verify_crispr.py::test_sha256_known_value_for_canonical_fixture`. |
+| chr22 ten-guide fixture | **31 524 records, 2.30 MB canonical bytes** | SHA-256 `c2104e5c446b8d93889f5e9244e08f74745127f9319f4190b47cc6ed2661271d`. |
+| Energy methodology spec | **480 lines** in `bench/POWER_DOMAINS.md` | Per-device rail spec (CPU / GPU / NPU) with includes, excludes, sampling rates, sources, known issues, cross-compare caveats. Mechanically lint-checked front-matter. |
+| Calibration log | **408 lines** in `bench/energy/SANITY-LOG.md` | Per-host probe results — which counters are AVAILABLE / UNAVAILABLE on this host. Append, never overwrite. |
 
 ## Quick start
 
@@ -68,10 +84,10 @@ src/bionpu/
 ├── bench/               Energy + timing measurement (RAPL)
 ├── data/                Reference / fixture fetchers
 └── quant/               Quantisation helpers (FP32 → bf16/int8)
-docs/                   Methodology + reproduction docs
-reference/              Canonical CPU-reference outputs (TSVs, FASTQs)
-benchmarks/             Run scripts + pre-computed results
-tests/                  pytest suite
+docs/                    Methodology + reproduction docs
+reference/               Canonical CPU-reference outputs (TSVs, FASTQs)
+benchmarks/              Run scripts + pre-computed results
+tests/                   pytest suite
 ```
 
 ## Status

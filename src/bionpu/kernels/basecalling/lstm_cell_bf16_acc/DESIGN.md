@@ -2,11 +2,11 @@
 
 This document records the design of
 `bionpu/kernels/basecalling/lstm_cell_bf16_acc/` — the mixed-precision
-sibling of 's bf16 `lstm_cell_bf16` kernel. 's scope is
+sibling of bf16 `lstm_cell_bf16` kernel. scope is
 the **AM020 cross-walk follow-up** to : per
 `docs/.md` §, 's "wash" finding
 (end-to-end max-abs 2.458 vs Padé baseline 2.303) is misdiagnosed
-in 's . The actual root cause is the bf16 recurrent-
+in . The actual root cause is the bf16 recurrent-
 state writeback between timesteps, not the multiplier-input
 narrowing.
 
@@ -22,7 +22,7 @@ narrowing.
 
 The AIE-ML / AIE2P bf16 multiplier accumulates in **FP32** (23
 mantissa bits, full single-precision). The MAC isn't the precision
-wall. 's cumulative drift to 2.458 max-abs is consistent with:
+wall. cumulative drift to 2.458 max-abs is consistent with:
 - 5 LSTMs × ~200 timesteps = ~1000 stateful steps
 - per step: h_t and c_t narrowed from FP32 accumulator → bf16 storage
   (8 mantissa bits) → re-loaded as bf16 input next step
@@ -39,15 +39,15 @@ and gate_acc.**
 
 | aspect | (lstm_cell_bf16) | (lstm_cell_bf16_acc) |
 |-----------------|----------------------------------|--------------------------------------|
-| h_state         | `bfloat16[96]`                   | `float[96]` (FP32 across timesteps) |
-| c_state         | `bfloat16[96]`                   | `float[96]` (FP32 across timesteps) |
-| gate_acc        | `bfloat16[4][96]`                | `float[4][96]` (FP32 per chunk)     |
-| matmul input    | bf16 | bf16 (unchanged — 8-bit mantissa OK) |
-| MAC accumulator | FP32 accfloat (silicon mandate)  | FP32 accfloat (unchanged)            |
-| activations     | bf16 hw tanh + sigmoid identity  | bf16 hw tanh + sigmoid identity       |
-| writeback       | h_t/c_t narrowed to bf16 store   | h_t/c_t stored as FP32              |
+| h_state | `bfloat16[96]` | `float[96]` (FP32 across timesteps) |
+| c_state | `bfloat16[96]` | `float[96]` (FP32 across timesteps) |
+| gate_acc | `bfloat16[4][96]` | `float[4][96]` (FP32 per chunk) |
+| matmul input | bf16 | bf16 (unchanged — 8-bit mantissa OK) |
+| MAC accumulator | FP32 accfloat (silicon mandate) | FP32 accfloat (unchanged) |
+| activations | bf16 hw tanh + sigmoid identity | bf16 hw tanh + sigmoid identity |
+| writeback | h_t/c_t narrowed to bf16 store | h_t/c_t stored as FP32 |
 | weight DMA/call | ~57 MB (half of FP32) | ~57 MB (unchanged) |
-| tile-mem buffers| 22.3 KiB (DMA) + ~2 KiB .bss     | 22.3 KiB (DMA) + ~3.7 KiB .bss      |
+| tile-mem buffers| 22.3 KiB (DMA) + ~2 KiB .bss | 22.3 KiB (DMA) + ~3.7 KiB .bss |
 
 Hardware delta: zero. The bf16 multiplier path (40× perf win) is
 preserved verbatim; the only change is the post-MAC store dtype for
@@ -75,7 +75,7 @@ real RQ4 findings — hardware supports it; toolchain doesn't expose it.
 
 ### Precision-equivalent fallback
 
-The `acc.to_vector<float>()` conversion path is **hardware-free** on
+The `acc.to_vector<float>` conversion path is **hardware-free** on
 AIE-ML / AIE2P (AM020 Ch. 4 p. 65 — the FP32 lane width matches the
 accumulator's 23 mantissa bits). Holding h, c as FP32 static arrays
 in tile DM preserves the same precision invariant as the BM register
@@ -87,16 +87,16 @@ DM round-trip per timestep. Functional precision is identical.
 ## Storage discipline (lstm_cell_bf16_acc.cc)
 
 ```c++
-static float h_state[HIDDEN];           // FP32 across timesteps
-static float c_state[HIDDEN];           // FP32 across timesteps
+static float h_state[HIDDEN]; // FP32 across timesteps
+static float c_state[HIDDEN]; // FP32 across timesteps
 static float gate_acc[N_GATES][HIDDEN]; // FP32 per-gate sum
-static bfloat16 bias_cache[768];        // bf16 (load-once; 8-bit mantissa OK)
+static bfloat16 bias_cache[768]; // bf16 (load-once; 8-bit mantissa OK)
 ```
 
 Per-step flow:
 
 1. **bf16 multiplier inputs**: `x_t` and `h_state` (the latter narrowed
-   from FP32 to bf16 via the `acc.to_vector<bfloat16>()` path).
+   from FP32 to bf16 via the `acc.to_vector<bfloat16>` path).
 2. **FP32 accumulator MAC**: `gate_acc[g][oc] += sum(bf16_mac)`.
 3. **FP32 state update**: `c_t = f * c_old + i * g` computed via
    accumulator; stored as FP32. `h_t = o * tanh(c_t)` same.
@@ -122,7 +122,7 @@ change). This is achieved by:
   current chunk's lane accumulator, writes FP32 back.
 
 The pattern that triggered was small bf16 stack arrays
-interleaved with large FP32 static arrays. 's pattern is
+interleaved with large FP32 static arrays. pattern is
 **uniform FP32 storage** for all state arrays — no mixed-precision
 stack temporaries.
 
@@ -135,9 +135,9 @@ Parsed from `build/aie_L334.mlir.prj/main_core_0_2.ld.script`:
 - `input_in_cons_buff_{0,1}`: 2 × 0xC0 = 384 B
 - subtotal (DMA buffers + stack): **22784 B = 22.3 KiB** (same as )
 - static `.bss` (h_state + c_state in FP32, gate_acc in FP32, bias_cache
-  in bf16): 0xf00 = **3840 B** (vs 's ~2 KiB at bf16 storage)
-- **total ≈ 26 KiB on a 64 KiB AIE2P tile budget** (vs 's 51 KiB FP32
-  scalar; vs 's ~24.5 KiB bf16-only)
+  in bf16): 0xf00 = **3840 B** (vs ~2 KiB at bf16 storage)
+- **total ≈ 26 KiB on a 64 KiB AIE2P tile budget** (vs 51 KiB FP32
+  scalar; vs ~24.5 KiB bf16-only)
 
 The 1.5 KiB increase in .bss is well within the 32 KiB slack 
 freed. doesn't reduce the slack budget for future fusion.
@@ -155,7 +155,7 @@ freed. doesn't reduce the slack budget for future fusion.
 
 The end-to-end test on real Dorado weights (vs PyTorch FP32 reference)
 is the load-bearing test. The cross-walk predicts ~10-100× improvement
-from 's 2.458 baseline; observed numbers either confirm or
+from 2.458 baseline; observed numbers either confirm or
 refute that prediction. Per the task brief: "If doesn't
 dramatically beat the bf16 baseline, the cross-walk's diagnosis is
 wrong and that itself is a real RQ4 finding worth documenting honestly."
@@ -164,11 +164,11 @@ wrong and that itself is a real RQ4 finding worth documenting honestly."
 
 - **AM-to-AM register-resident state**: requires an IRON
   lowering that exposes the AM020 Ch. 4 p. 67 primitive. Documented
-  in  as . Cycle-level optimization on top of
+  in as . Cycle-level optimization on top of
   's precision-equivalent fallback.
 - **Cascade-stream layer chaining**: requires IRON exposure
   of the cascade primitive (AM020 Ch. 4 p. 67). Documented in
    as . Cycle-level + cross-layer precision
-  optimization on top of 's per-cell FP32 state.
+  optimization on top of per-cell FP32 state.
 - ** / **: independent (NaN window in stem_L2 / weight DMA
   reduction). Not addressed by .

@@ -2,9 +2,9 @@
 
 This document records the design of
 `bionpu/kernels/basecalling/lstm_cell_bf16/` — the bf16 sibling of
-'s FP32 scalar `lstm_cell` kernel. 's scope is **one
+'s FP32 scalar `lstm_cell` kernel. scope is **one
 custom kernel driven by profile data** (B-M6); the profile data is
-'s  (specifically ****: the 3rd-order Padé
+'s (specifically ****: the 3rd-order Padé
 tanh approximation cumulatively drifts to end-to-end max-abs 2.303
 across the 5 LSTM × 200 timesteps).
 
@@ -18,13 +18,13 @@ nonlinearities change.**
 
 | aspect | (lstm_cell) | (lstm_cell_bf16) |
 |------------------|--------------------------|--------------------------------------|
-| precision        | FP32 scalar              | bf16 vector (lane=16)                |
-| tanh             | 3rd-order Padé (~3e-3)   | hardware `aie::tanh<bfloat16>` (ULP) |
-| sigmoid          | `0.5*(Padé tanh+1)`      | `0.5*(hw tanh+1)` (vectorised)       |
-| gate accumulator | fp32 static array        | bf16 static + fp32 mac accumulator   |
-| state (h, c)     | fp32 static              | bf16 static                          |
-| weight DMA/call  | ~110 MB                  | ~57 MB (half of FP32)                |
-| tile-mem buffers | 51 KiB                   | 22.3 KiB                             |
+| precision | FP32 scalar | bf16 vector (lane=16) |
+| tanh | 3rd-order Padé (~3e-3) | hardware `aie::tanh<bfloat16>` (ULP) |
+| sigmoid | `0.5*(Padé tanh+1)` | `0.5*(hw tanh+1)` (vectorised) |
+| gate accumulator | fp32 static array | bf16 static + fp32 mac accumulator |
+| state (h, c) | fp32 static | bf16 static |
+| weight DMA/call | ~110 MB | ~57 MB (half of FP32) |
+| tile-mem buffers | 51 KiB | 22.3 KiB |
 
 ## Hardware bf16 tanh — why it exists
 
@@ -44,7 +44,7 @@ weights are O(0.05) (extracted via `_load_pinned_model` on the
 synthetic seed), gates pre-nonlinearity are O(1.0), post-sigmoid
 gates are bounded to `[0, 1]`, post-tanh hidden is bounded to
 `[-1, 1]`. The bf16 quantisation noise (round-to-nearest-even on
-the FP32→bf16 cast) is ~5e-3 relative — comparable to 's Padé
+the FP32→bf16 cast) is ~5e-3 relative — comparable to Padé
 tanh error per call but **bounded per-call rather than systematically
 biased**, so it shouldn't cumulatively drift the way Padé does.
 
@@ -77,7 +77,7 @@ slabs:
 
 16 acquires per timestep × 334 = 5344 weight acquires per LSTM-layer
 call. Each chunk is `BIAS_LEN + WEIGHT_HALF_LEN` = 5376 bf16 = 10.5
-KiB on the wire (vs 's 21 KiB at FP32).
+KiB on the wire (vs 21 KiB at FP32).
 
 ## DMA-channel constraint: unchanged
 
@@ -96,9 +96,9 @@ Parsed from `build/aie_L334.mlir.prj/main_core_0_2.ld.script`:
 - subtotal: 23296 B
 - static `.bss` (h_state, c_state, gate_acc[4], bias_cache; all bf16):
   ~2 KiB
-- **total ≈ 25 KiB on a 64 KiB AIE2P tile** (vs 's 51 KiB)
+- **total ≈ 25 KiB on a 64 KiB AIE2P tile** (vs 51 KiB)
 
-This is **<50% of 's footprint** — bf16 frees substantial slack
+This is **<50% of footprint** — bf16 frees substantial slack
 that (follow-up) could spend on multi-cell pipelining /
 on-tile weight residency.
 
@@ -122,6 +122,6 @@ These are documented as `severity: cosmetic` deferral entries in
 - bf16 cell max-abs vs FP32 reference < 1e-2 per timestep (1 cell)
 - bf16 stack max-abs vs FP32 reference < 5e-2 per layer (5 cells)
 - end-to-end encoder bf16 max-abs vs FP32 reference: target < 1e-1,
-  accept < 5e-1 (vs 's 2.303 baseline)
-- bf16 max-abs MUST be strictly less than 's Padé baseline 2.303
+  accept < 5e-1 (vs 2.303 baseline)
+- bf16 max-abs MUST be strictly less than Padé baseline 2.303
   — if not, that's a real finding worth documenting honestly.

@@ -40,9 +40,9 @@ core-fn body.
 host (shim)
    │
    ▼
-tile (col, 0)  layer 0  ── cascade ──▶ tile (col, 1)  layer 1
+tile (col, 0) layer 0 ── cascade ──▶ tile (col, 1) layer 1
                                                    │
-                                                ── cascade ──▶ tile (col, 2)  layer 2
+                                                ── cascade ──▶ tile (col, 2) layer 2
                                                                             │
                                                                          ── cascade ──▶ ...
 ```

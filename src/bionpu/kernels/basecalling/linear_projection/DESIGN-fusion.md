@@ -12,7 +12,7 @@ Pre-cascade Dorado-`fast` measurements (`results/basecalling/b-m6/
 measurements.json`):
 
 ```
-linear_projection: 564 ms  /  1336 calls  =  ~422 µs / call
+linear_projection: 564 ms /  1336 calls =  ~422 µs / call
 ```
 
 Each call is a 96 × 64 GEMM (~6 k MACs). At AIE2P 50 TOPS that math
@@ -33,12 +33,12 @@ with the same shape pathology) becomes ~99 % of NPU encoder wall time.
 Inner loop (`core_body`):
 
 ```python
-for t in range_(L):                      # 334 timesteps
+for t in range_(L): # 334 timesteps
     elem_in = of_input.acquire(1)
-    for g in range_(N_OC_GROUPS):        # 4 output groups
-        elem_w   = of_weight.acquire(1)
+    for g in range_(N_OC_GROUPS): # 4 output groups
+        elem_w = of_weight.acquire(1)
         elem_out = of_output.acquire(1)
-        linear_fn(elem_in, elem_w, elem_out)   # ← 1336 total invocations
+        linear_fn(elem_in, elem_w, elem_out) # ← 1336 total invocations
         of_weight.release(1)
         of_output.release(1)
     of_input.release(1)
@@ -53,8 +53,8 @@ geometry:
 
 ```
 W = OUT_DIM × HIDDEN = 256 × 96 = 24576 elements
-  fp32:  98304 B  =   96 KiB   ✗ does not fit
-  bf16:  49152 B  =   48 KiB   ✓ fits with ~16 KiB headroom
+  fp32: 98304 B =   96 KiB ✗ does not fit
+  bf16: 49152 B =   48 KiB ✓ fits with ~16 KiB headroom
 ```
 
 Per-timestep working set: 96 inputs (384 B fp32 / 192 B bf16) + 256
@@ -75,10 +75,10 @@ Plan:
 
    ```python
    def core_body(of_input, of_weight, of_output, linear_fn):
-       elem_w_full = of_weight.acquire(1)            # 48 KiB once
-       for t in range_(L):                           # 334 timesteps
-           elem_in  = of_input.acquire(1)            # 96 bf16
-           elem_out = of_output.acquire(1)           # 256 bf16
+       elem_w_full = of_weight.acquire(1) # 48 KiB once
+       for t in range_(L): # 334 timesteps
+           elem_in = of_input.acquire(1) # 96 bf16
+           elem_out = of_output.acquire(1) # 256 bf16
            linear_fn(elem_in, elem_w_full, elem_out) # one call/ts
            of_input.release(1)
            of_output.release(1)
@@ -93,7 +93,7 @@ Plan:
 
    ```python
    def core_body(of_input, of_weight, of_output, linear_fn):
-       linear_fn(of_input, of_weight, of_output, L)  # one call/dispatch
+       linear_fn(of_input, of_weight, of_output, L) # one call/dispatch
    ```
 
    The kernel internally walks the fifos for L timesteps. Total kernel

@@ -23,7 +23,7 @@ in the meantime.
 - **XRT** installed at `/opt/xilinx/xrt`:
   ```sh
   source /opt/xilinx/xrt/setup.sh
-  xrt-smi examine    # must list the NPU device
+  xrt-smi examine # must list the NPU device
   ```
 - **`mlir-aie`** built; `aiecc` on `$PATH`. The recommended `mlir-aie`
   is the wheel-built `ironenv` — see the [opensensor/genetics
@@ -90,9 +90,9 @@ so end-to-end pipeline runs go through the per-kernel host runner:
 cd src/bionpu/kernels/crispr/pam_filter
 # After 'make NPU2=1':
 ./host_runner --xclbin build/final.xclbin \
-              --insts  build/insts.bin \
-              --in     <input.bin> \
-              --out    /tmp/npu_hits.tsv
+              --insts build/insts.bin \
+              --in <input.bin> \
+              --out /tmp/npu_hits.tsv
 bionpu verify crispr /tmp/npu_hits.tsv reference/crispr/casoffinder-chr22-10guides.tsv
 ```
 

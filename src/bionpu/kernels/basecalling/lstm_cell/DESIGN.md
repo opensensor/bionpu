@@ -17,7 +17,7 @@ alternating-direction pattern are implemented host-side as
 PyTorch state-dict layout (gate-major, ih before hh):
 - `weight_ih_l0`: `(4*96, 96) = (384, 96)` FP32 — gates `i, f, g, o`.
 - `weight_hh_l0`: `(4*96, 96) = (384, 96)` FP32 — same gate ordering.
-- `bias_ih_l0`,  `bias_hh_l0`: `(4*96,) = (384,)` FP32 each.
+- `bias_ih_l0`, `bias_hh_l0`: `(4*96,) = (384,)` FP32 each.
 
 Total params per layer: `4*(96*96 + 96*96) + 4*(96 + 96) = 74,496` FP32 =
 **291 KiB** of weights/biases per LSTM cell.
@@ -77,15 +77,15 @@ sigmoid/tanh nonlinearities, updates the static `h_state[96]` and
 
 Parsed from `build/aie_L334.mlir.prj/main_core_0_2.ld.script`:
 
-| Buffer                       | Size (B) | Notes                          |
+| Buffer | Size (B) | Notes |
 |------------------------------|---------:|---------------------------------|
-| stack                        |    1024 | crt0 stack                      |
-| `weight_in_cons_buff_0`      |   21504 | depth-2 weight chunk (5376 FP32) |
-| `weight_in_cons_buff_1`      |   21504 | ...                             |
-| `output_out_buff_{0,1}`      |   2×384 | depth-2 output (96 FP32)        |
-| `input_in_cons_buff_{0,1}`   |   2×384 | depth-2 input (96 FP32)         |
-| `.bss` (h_state, c_state, gate_acc, bias_cache) |  ~5400 | static state |
-| **total (≈)**                |  **51 KiB** | within 64 KiB budget    |
+| stack |    1024 | crt0 stack |
+| `weight_in_cons_buff_0` |   21504 | depth-2 weight chunk (5376 FP32) |
+| `weight_in_cons_buff_1` |   21504 | ... |
+| `output_out_buff_{0,1}` |   2×384 | depth-2 output (96 FP32) |
+| `input_in_cons_buff_{0,1}` |   2×384 | depth-2 input (96 FP32) |
+| `.bss` (h_state, c_state, gate_acc, bias_cache) | ~5400 | static state |
+| **total (≈)** |  **51 KiB** | within 64 KiB budget |
 
 Headroom: ~13 KiB for compiler scratch + alignment slack.
 
@@ -101,7 +101,7 @@ Per call:
 
 Measured wall-clock per call: **~1.77 seconds** (driven by the 110 MB
 weight DMA at ~70 MB/s effective sustained bandwidth — much of it
-sequential serialization). 's primary perf target is to drop the
+sequential serialization). primary perf target is to drop the
 weight DMA volume by two orders of magnitude with bf16 vector
 intrinsics + on-tile weight residency.
 

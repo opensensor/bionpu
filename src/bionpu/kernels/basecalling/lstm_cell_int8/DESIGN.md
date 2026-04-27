@@ -16,18 +16,18 @@ bidirectional=False)` cell over L=334 timesteps). Same DMA topology
 
 | aspect | (bf16) | (int8) |
 |---------------------|------------------------------|------------------------------------------|
-| input wire          | bf16                         | int8 (per-tensor symmetric)              |
-| output wire         | bf16                         | int8 (per-tensor symmetric)              |
-| weight wire         | bf16                         | int8 (per-channel symmetric)             |
-| bias wire           | bf16 (folded into prefix)    | fp32 (folded into prefix)                |
-| prefix per chunk    | 1536 B (768 bf16)            | 3136 B (784 fp32 padded for align)       |
-| weight slab/chunk   | 10752 B (HIDDEN×HALF_IN bf16)| 4608 B (HIDDEN×HALF_IN int8)             |
-| total chunk size    | 10752 B                      | 7744 B                                   |
-| MAC accumulator     | accfloat (FP32)              | acc32 (INT32)                            |
-| gate accumulator    | bf16 storage                 | INT32 storage                            |
-| recurrent state     | bf16 / FP32| **FP32**|
-| sigmoid / tanh      | hardware bf16                | hardware bf16 (via INT32→FP32→bf16 dequant)|
-| AM020 ops/tile/cyc  | 128 (bf16 + FP32 acc)        | 256 (INT8 path, AM020 Table 14)          |
+| input wire | bf16 | int8 (per-tensor symmetric) |
+| output wire | bf16 | int8 (per-tensor symmetric) |
+| weight wire | bf16 | int8 (per-channel symmetric) |
+| bias wire | bf16 (folded into prefix) | fp32 (folded into prefix) |
+| prefix per chunk | 1536 B (768 bf16) | 3136 B (784 fp32 padded for align) |
+| weight slab/chunk | 10752 B (HIDDEN×HALF_IN bf16)| 4608 B (HIDDEN×HALF_IN int8) |
+| total chunk size | 10752 B | 7744 B |
+| MAC accumulator | accfloat (FP32) | acc32 (INT32) |
+| gate accumulator | bf16 storage | INT32 storage |
+| recurrent state | bf16 / FP32| **FP32**|
+| sigmoid / tanh | hardware bf16 | hardware bf16 (via INT32→FP32→bf16 dequant)|
+| AM020 ops/tile/cyc | 128 (bf16 + FP32 acc) | 256 (INT8 path, AM020 Table 14) |
 
 ## Per-channel calibration: where it lives
 
@@ -53,13 +53,13 @@ FP32 multiply (`per_gate_scale_x[g]`), applied once per timestep at
 gate-finalization time.
 
 The cost is a single round-to-nearest step on the row rescale,
-producing small per-channel quantization noise. 's PASSPORT
+producing small per-channel quantization noise. PASSPORT
 records the achieved per-cell max-abs honestly. The test gate is
 < 0.1 per-cell vs bf16 reference on synthetic weights.
 
 ## Recurrent state precision: the lesson
 
-Per 's  entry , narrowing `h_t` / `c_t` from
+Per 's entry , narrowing `h_t` / `c_t` from
 FP32 accumulator output to a smaller storage type per timestep
 compounds quantization noise across 334 × 5 ≈ 1670 narrowings. 
 shipped at bf16 and measured 2.458 end-to-end max-abs on Dorado fast
@@ -116,7 +116,7 @@ Estimated from the bf16 baseline + per-element-size deltas:
   - `bias_cache[768]` (FP32): 3072 B
   - `per_gate_scale_*[4]` + `h_scale` + `y_scale`: 40 B
   - **subtotal**: ~5.4 KiB
-- **total ≈ 22 KiB on a 64 KiB AIE2P tile** (similar to 's
+- **total ≈ 22 KiB on a 64 KiB AIE2P tile** (similar to
   22.3 KiB — INT8 wire savings offset by FP32 bias slab)
 
 The actual numbers will be parsed from
@@ -128,7 +128,7 @@ updated post-canary.
 
 - **Multi-cell stack**: ships only the single-cell op
   `dorado_fast_lstm_cell_int8`. A 5-layer `lstm_stack_int8`
-  composite (sister to 's `lstm_stack_bf16`) is 's
+  composite (sister to `lstm_stack_bf16`) is 's
   scope — the §3.2 ratification sweep wires up the int8 stack
   through the encoder and measures end-to-end accuracy.
 - **Fork primitives**: uses existing IRON `Worker` +
@@ -137,9 +137,9 @@ updated post-canary.
    / 's CascadeFifo / AccumFifo are -cascade's
   surface.
 - **In-process dispatch**: ships the subprocess-based runner
-  (sister to 's pattern). closes the dispatch wall by
+  (sister to pattern). closes the dispatch wall by
   replacing subprocess calls with in-process pyxrt 3.14 calls;
-  's NPU op surface is wire-format-compatible with 's
+  's NPU op surface is wire-format-compatible with
   closure.
 
 ## Validation gates (per task brief)
@@ -160,6 +160,6 @@ updated post-canary.
 If INT8 quantization noise on Dorado's trained weights exceeds 0.1
 max-abs (likely per 's finding that bf16 multiplier-input
 narrowing already costs precision on Dorado weights), document the
-achieved bound honestly in PASSPORT.json and  entry
+achieved bound honestly in PASSPORT.json and entry
 . Do NOT relax the test to make it pass — the floor IS
 the publishable result per PRD §3 success criterion 3.

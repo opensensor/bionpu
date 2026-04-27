@@ -1,8 +1,8 @@
 # — PAM filter + threshold + sparse-emit (C-M5)
 
-CRISPR PRD §4.3 + plan . Builds on 's multi-tile dataflow by
+CRISPR PRD §4.3 + plan. Builds on multi-tile dataflow by
 adding **on-tile NGG PAM check at Tile A** (the filter-early path) and
-**on-tile threshold + sparse-emit at Tile Z** (replaces 's host-side
+**on-tile threshold + sparse-emit at Tile Z** (replaces the prior host-side
 filter). Output bytes are byte-equal to Cas-OFFinder's normalized
 canonical TSV (after `bionpu.data.canonical_sites.normalize`) for
 chr22 × 10 guides.
@@ -10,7 +10,7 @@ chr22 × 10 guides.
 ## Topology
 
 ```
-                      shim DMA in  ──guides──→ broadcast
+                      shim DMA in ──guides──→ broadcast
                           │
                           ↓
                       Tile A (PAM filter / dispatcher)
@@ -20,10 +20,10 @@ chr22 × 10 guides.
                           └─→ pam_meta (1 byte/window) ──→ Tile Z
                           │
                           ├─→ match_tile_0: guides[0:64]
-                          │     ↓ partial_0 (64 windows × 64 guides)
+                          │ ↓ partial_0 (64 windows × 64 guides)
                           │
                           ├─→ match_tile_1: guides[64:128]
-                          │     ↓ partial_1
+                          │ ↓ partial_1
                           │
                           └─→ Tile Z (threshold + sparse-emit)
                                 ↓ sparse_out (length-prefixed records)
@@ -39,14 +39,14 @@ Both variants ship from the same Python source and the same C++ object
 (`tile_a_filter.o`). They produce **byte-identical sparse hit-list
 output** (after normalization) on the same input. They differ in:
 
-| step                  | filter-early                    | filter-late                       |
+| step | filter-early | filter-late |
 |-----------------------|---------------------------------|-----------------------------------|
-| Tile A PAM check      | yes — drops 7/8 of windows      | no — passes everything through    |
-| match-tile work       | full (every window — see below) | full (every window)               |
-| Tile Z PAM check      | no (Tile A already did it)      | yes — re-checks via pam_meta byte |
-| Tile Z threshold      | yes                             | yes                               |
-| sparse output bytes   | identical                       | identical                         |
-| match-tile *useful* cycles | ~12.5% of windows         | 100% of windows (7/8 wasted)      |
+| Tile A PAM check | yes — drops 7/8 of windows | no — passes everything through |
+| match-tile work | full (every window — see below) | full (every window) |
+| Tile Z PAM check | no (Tile A already did it) | yes — re-checks via pam_meta byte |
+| Tile Z threshold | yes | yes |
+| sparse output bytes | identical | identical |
+| match-tile *useful* cycles | ~12.5% of windows | 100% of windows (7/8 wasted) |
 
 **Important v1 caveat (also documented in ``)**: the
 match-tile kernel does NOT yet branch on the pam_meta byte. Both
@@ -67,10 +67,10 @@ dominated by shim-DMA setup + the unchanged match-tile cycles).
 
 Per Tile-A input record (6 bytes total):
 
-| offset | bytes | content                                     |
+| offset | bytes | content |
 |--------|-------|---------------------------------------------|
 | 0 | 5 | 20-nt spacer, 2-bit packed (A=00,C=01,G=10,T=11) — same as / |
-| 5      | 1     | 3-nt PAM context: bits 1:0=pam[0], 3:2=pam[1], 5:4=pam[2], 7:6=padding=0 |
+| 5 | 1 | 3-nt PAM context: bits 1:0=pam[0], 3:2=pam[1], 5:4=pam[2], 7:6=padding=0 |
 
 The spacer encoding is **identical** to / — the match-tile
 kernel reads the first 5 bytes of each record exactly as it did before.
@@ -111,12 +111,12 @@ is unchanged from a single-pass run on the same density.
 
 8 bytes per surviving (guide, window) pair:
 
-| offset | bytes | content                              |
+| offset | bytes | content |
 |--------|-------|--------------------------------------|
-| 0      | 2     | window_idx (uint16, little-endian)   |
-| 2      | 1     | guide_idx (uint8, 0..127)            |
-| 3      | 1     | mismatches (uint8, 0..20)            |
-| 4      | 4     | reserved (zero — host stamps strand + chrom from window_idx) |
+| 0 | 2 | window_idx (uint16, little-endian) |
+| 2 | 1 | guide_idx (uint8, 0.127) |
+| 3 | 1 | mismatches (uint8, 0.20) |
+| 4 | 4 | reserved (zero — host stamps strand + chrom from window_idx) |
 
 Tile Z prefixes each ring slot with a **uint32 record count** at
 offset 0. The host reads this count after each chunk-DMA-out and
@@ -126,13 +126,13 @@ appends the records to its growing sparse hit list.
 
 Per `results/crispr/c-m5/measurements.json`:
 
-| tile          | resident / dbl-buf in / dbl-buf out      | total bytes | % of 64 KiB |
+| tile | resident / dbl-buf in / dbl-buf out | total bytes | % of 64 KiB |
 |---------------|-------------------------------------------|-------------|-------------|
-| Tile A        | — / 2*64*6 = 768 / 2*64*5 = 640 + 2*64*1 = 128 | **1536** | 2.3%   |
+| Tile A | — / 2*64*6 = 768 / 2*64*5 = 640 + 2*64*1 = 128 | **1536** | 2.3% |
 | match_0/1 | 640 / 640 / 8192 (unchanged from ) | **9472** | 14.4% |
-| Tile Z        | — / 2 partials × 16384 / sparse 4096 / pam_meta 256 | **20736** | 31.6%   |
+| Tile Z | — / 2 partials × 16384 / sparse 4096 / pam_meta 256 | **20736** | 31.6% |
 
-Peak (Tile Z) is **20.7 KiB**, *down* from 's 32 KiB joiner peak
+Peak (Tile Z) is **20.7 KiB**, *down* from 32 KiB joiner peak
 because we no longer hold the dense window-major output buffer —
 sparse emit replaces it.
 

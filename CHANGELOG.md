@@ -10,11 +10,11 @@ project-internal task IDs, and structured as a defensible asset.
 
 - **`bionpu.verify`** — byte-equality harness with documented public
   API, frozen and tested before extraction:
-  - `compare_against_cas_offinder()` for CRISPR off-target hits TSVs
+  - `compare_against_cas_offinder` for CRISPR off-target hits TSVs
     (sorts by canonical key, normalises line endings, computes
     SHA-256 over the canonical wire form, reports first-N
     divergences with chrom/position/strand).
-  - `compare_against_dorado()` for Nanopore basecaller FASTQs
+  - `compare_against_dorado` for Nanopore basecaller FASTQs
     (sorts by `read_id`, normalises CRLF, field-level divergence
     diagnostics distinguishing `read_id` / sequence / quality /
     header mismatches).

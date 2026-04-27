@@ -77,7 +77,7 @@ metrics:
   - name: memory_vram_peak
     unit: "bytes"
     scope: ["both"]
-    formula: "torch.cuda.max_memory_allocated(device) at end_of_window minus baseline at start_of_window; reset via torch.cuda.reset_peak_memory_stats() before window starts"
+    formula: "torch.cuda.max_memory_allocated(device) at end_of_window minus baseline at start_of_window; reset via torch.cuda.reset_peak_memory_stats before window starts"
   - name: memory_tile_used_bytes
     unit: "bytes"
     scope: ["both"]
@@ -89,9 +89,9 @@ metrics:
 
 This document fixes every metric unit and computation rule that the bench
 harness, the energy readers, the basecalling track, and the
-CRISPR track must conform to. It exists to discharge  §4.2's
+CRISPR track must conform to. It exists to discharge §4.2's
 requirement that cross-track numbers be comparable, and to neutralize the
-"apples-to-oranges measurements" risk row in the  risk table.
+"apples-to-oranges measurements" risk row in the risk table.
 
 If a number is reported in this repo without conforming to this file, the
 writeup pipeline MUST refuse to render it.
@@ -103,21 +103,21 @@ reading covers, per device.
 
 ## Quick reference table
 
-| Metric                   | Unit               | Formula (numerator / denominator)                                                                 | Basecalling | CRISPR |
+| Metric | Unit | Formula (numerator / denominator) | Basecalling | CRISPR |
 |--------------------------|--------------------|---------------------------------------------------------------------------------------------------|:-----------:|:------:|
-| Throughput (signal)      | `samples/sec`      | raw_signal_samples_processed / wall_clock_seconds                                                 | yes         |        |
-| Throughput (bases)       | `bp/sec`           | total_emitted_bases_in_FASTQ / wall_clock_seconds                                                 | yes         |        |
-| Throughput (guides)      | `guides/sec`       | candidate_guides_fully_scanned / wall_clock_seconds                                               |             | yes    |
-| Throughput (sites)       | `sites/sec`        | candidate_sites_scored / wall_clock_seconds                                                       |             | yes    |
-| Accuracy (basecall)      | `pp` (modal acc.)  | mode of per-read alignment identity (minimap2 → GRCh38, paftools samstats)                        | yes         |        |
-| Indel rate               | ratio              | (CIGAR I + CIGAR D) / CIGAR M                                                                     | yes         |        |
-| Accuracy (CRISPR)        | boolean            | set-equality after `bionpu.data.canonical_sites.normalize`                                        |             | yes    |
-| Energy (basecalling)     | `J/Mbp`            | ΔJoules / (bases_emitted / 1e6)                                                                   | yes         |        |
-| Energy (CRISPR)          | `J/(guide·genome)` | ΔJoules / (n_guides × n_haploid_bp_scanned)                                                       |             | yes    |
-| Latency p50/p95/p99/max  | `ms`               | nearest-rank percentile of per-chunk wall-clock                                                   | yes         | yes    |
-| Memory RSS               | `bytes`            | max VmRSS sampled over window                                                                     | yes         | yes    |
-| VRAM peak                | `bytes`            | `torch.cuda.max_memory_allocated` at end - reset baseline at start                                | yes         | yes    |
-| Tile memory used         | `bytes`            | static IRON/Peano tile allocation, summed across active tiles                                     | yes         | yes    |
+| Throughput (signal) | `samples/sec` | raw_signal_samples_processed / wall_clock_seconds | yes |        |
+| Throughput (bases) | `bp/sec` | total_emitted_bases_in_FASTQ / wall_clock_seconds | yes |        |
+| Throughput (guides) | `guides/sec` | candidate_guides_fully_scanned / wall_clock_seconds |             | yes |
+| Throughput (sites) | `sites/sec` | candidate_sites_scored / wall_clock_seconds |             | yes |
+| Accuracy (basecall) | `pp` (modal acc.) | mode of per-read alignment identity (minimap2 → GRCh38, paftools samstats) | yes |        |
+| Indel rate | ratio | (CIGAR I + CIGAR D) / CIGAR M | yes |        |
+| Accuracy (CRISPR) | boolean | set-equality after `bionpu.data.canonical_sites.normalize` |             | yes |
+| Energy (basecalling) | `J/Mbp` | ΔJoules / (bases_emitted / 1e6) | yes |        |
+| Energy (CRISPR) | `J/(guide·genome)` | ΔJoules / (n_guides × n_haploid_bp_scanned) |             | yes |
+| Latency p50/p95/p99/max | `ms` | nearest-rank percentile of per-chunk wall-clock | yes | yes |
+| Memory RSS | `bytes` | max VmRSS sampled over window | yes | yes |
+| VRAM peak | `bytes` | `torch.cuda.max_memory_allocated` at end - reset baseline at start | yes | yes |
+| Tile memory used | `bytes` | static IRON/Peano tile allocation, summed across active tiles | yes | yes |
 
 ---
 
@@ -125,7 +125,7 @@ reading covers, per device.
 
 Throughput is always **work-units per wall-clock second** measured inside the
 harness's timed-run wrapper. The wrapper records two timestamps —
-`t_start` and `t_end` — using `time.monotonic_ns()` and persists both into
+`t_start` and `t_end` — using `time.monotonic_ns` and persists both into
 `measurements.json` so any consumer can recompute the rate.
 
 ### 1.1 `samples/sec` (basecalling)
@@ -251,7 +251,7 @@ energy can be recomputed from the raw counter samples post-hoc.
   exact value used so a reviewer can reproduce.
 - **PRD CRISPR §3.4 evaluation:** the NPU figure must be lower than the GPU
   figure to claim the energy thesis. Otherwise the negative result is
-  reported per  §3.4.
+  reported per §3.4.
 
 ---
 
@@ -266,7 +266,7 @@ of millisecond floats per run.
 **Nearest-rank.** Given N samples sorted ascending and percentile p ∈ (0, 1):
 
 ```
-index = ceil(p * N) - 1     # 0-indexed
+index = ceil(p * N) - 1 # 0-indexed
 percentile_value = sorted_samples[index]
 ```
 
@@ -305,7 +305,7 @@ is reported separately so the consumer notices.
 ### 5.2 `VRAM_peak`
 
 - **Source:** `torch.cuda.max_memory_allocated(device)`.
-- **Reset:** `torch.cuda.reset_peak_memory_stats()` is called at `t_start`.
+- **Reset:** `torch.cuda.reset_peak_memory_stats` is called at `t_start`.
 - **Reported value:** the value at `t_end` minus the value at `t_start`,
   in bytes.
 - **Caveat:** this counts only PyTorch-managed allocations. Non-Torch CUDA

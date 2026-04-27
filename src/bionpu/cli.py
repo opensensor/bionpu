@@ -37,6 +37,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import pathlib
 import sys
 
 from . import __version__
@@ -78,6 +79,62 @@ def _cmd_verify_basecalling(args: argparse.Namespace) -> int:
         f"verify basecalling: {args.npu_fastq} vs {args.ref_fastq}", result
     ))
     return 0 if result.equal else 1
+
+
+def _cmd_scan(args: argparse.Namespace) -> int:
+    """Run a CRISPR off-target scan and emit a canonical TSV.
+
+    v0.1: pure-CPU implementation via :mod:`bionpu.scan`. NPU dispatch
+    is v0.2 scope; passing ``--device npu`` exits with a clear pointer.
+    """
+    if args.device == "npu":
+        print(
+            "bionpu scan --device npu: NPU dispatch is v0.2 scope. The "
+            "kernels at src/bionpu/kernels/crispr/ are buildable via "
+            "'make NPU2=1' and runnable through the per-kernel host_runner; "
+            "what's missing is the unified scan driver. v0.1 ships the "
+            "CPU path (--device cpu, the default) which produces output "
+            "byte-equal to the NPU path's canonical TSV.",
+            file=sys.stderr,
+        )
+        return 2
+
+    from .data.canonical_sites import normalize, write_tsv
+    from .scan import cpu_scan, parse_guides, read_fasta
+
+    chrom, seq = read_fasta(args.target)
+    guides = parse_guides(args.guides)
+
+    print(
+        f"bionpu scan: chrom={chrom!r}, seq={len(seq):,} nt, "
+        f"guides={len(guides)}, max_mismatches={args.max_mismatches}",
+        file=sys.stderr,
+    )
+    rows = cpu_scan(
+        chrom=chrom,
+        seq=seq,
+        guides=guides,
+        pam_template=args.pam,
+        max_mismatches=args.max_mismatches,
+    )
+    rows = normalize(rows)
+    out_path = pathlib.Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    write_tsv(out_path, rows)
+    print(
+        f"bionpu scan: wrote {len(rows)} hits to {out_path}",
+        file=sys.stderr,
+    )
+
+    if args.verify:
+        from .verify.crispr import compare_against_cas_offinder
+
+        result = compare_against_cas_offinder(out_path, args.verify)
+        print(_format_result(
+            f"verify crispr: {out_path} vs {args.verify}", result
+        ))
+        return 0 if result.equal else 1
+    return 0
 
 
 def _cmd_not_implemented(args: argparse.Namespace) -> int:
@@ -125,9 +182,60 @@ def _build_parser() -> argparse.ArgumentParser:
     p_v_bc.add_argument("--max-divergences", type=int, default=16)
     p_v_bc.set_defaults(func=_cmd_verify_basecalling)
 
+    # scan
+    p_scan = sub.add_parser(
+        "scan",
+        help="CRISPR off-target scan (CPU in v0.1; NPU is v0.2 scope).",
+    )
+    p_scan.add_argument(
+        "--target",
+        required=True,
+        help="FASTA file with the target sequence (single record).",
+    )
+    p_scan.add_argument(
+        "--guides",
+        required=True,
+        help=(
+            "Comma-separated list of 20-nt ACGT spacers, OR a path to a "
+            "guide-list file (one spacer per line; `id:spacer` allowed; "
+            "`#` comments OK)."
+        ),
+    )
+    p_scan.add_argument(
+        "--out",
+        required=True,
+        help="Output canonical TSV path.",
+    )
+    p_scan.add_argument(
+        "--pam",
+        default="NGG",
+        help="PAM template (only NGG supported in v0.1).",
+    )
+    p_scan.add_argument(
+        "--max-mismatches",
+        type=int,
+        default=4,
+        help="Maximum spacer mismatches.",
+    )
+    p_scan.add_argument(
+        "--device",
+        choices=["cpu", "npu"],
+        default="cpu",
+        help="Compute device. v0.1 ships --device cpu; --device npu is v0.2 scope.",
+    )
+    p_scan.add_argument(
+        "--verify",
+        default=None,
+        help=(
+            "If supplied, compare the scan output byte-equally against this "
+            "reference TSV (via bionpu.verify.crispr). Exits 0 on equality, "
+            "1 on divergence."
+        ),
+    )
+    p_scan.set_defaults(func=_cmd_scan)
+
     # placeholders — scope for v0.2
     for name, help_text in (
-        ("scan", "CRISPR off-target scan (v0.2 scope)"),
         ("basecall", "Nanopore basecalling (v0.2 scope)"),
         ("bench", "Energy + timing harness (v0.2 scope)"),
     ):

@@ -17,7 +17,7 @@ devices:
     includes: ["all P-cores", "all E-cores (if present)", "L3 cache / uncore on Zen 5 package"]
     excludes: ["DRAM (no separate amd-rapl-msr DRAM domain on Strix as of writing)", "discrete GPU", "NPU subdomain", "platform IO / PCIe rails outside the SoC package"]
     sampling_rate_hz: ">=10 (energy counter is monotonic; harness samples at start and end of integration window plus one mid-run sample for monotonicity check)"
-    source: "/sys/class/powercap/amd-rapl-msr:0/energy_uj  (or /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj on systems where amd-rapl exposes the same hierarchy)"
+    source: "/sys/class/powercap/amd-rapl-msr:0/energy_uj (or /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj on systems where amd-rapl exposes the same hierarchy)"
     fallback_source: "/sys/class/hwmon/hwmon*/energy*_input from amd_energy if amd-rapl-msr unavailable"
     units_native: "microjoules (uJ); harness divides by 1e6 for joules"
     counter_wraparound: "64-bit on Zen 5; harness still records both endpoints to detect wraparound for safety"
@@ -40,7 +40,7 @@ devices:
     includes: ["AIE compute tiles in the active hardware-context partition (firmware-internal estimate; not a sense-resistor reading)"]
     excludes: ["host SoC package (CPU; covered by RAPL rail)", "host DRAM", "Radeon iGPU on the same package", "platform IO / PCIe lanes outside the AIE partition"]
     sampling_rate_hz: "10 (XrtReader default; xrt-smi invocation costs ~40 ms wall-clock per call which caps polling at ~25 Hz before xrt-smi overhead dominates)"
-    source: "xrt-smi examine -r platform  (parsed via regex `^Estimated Power\\s*:\\s*([0-9.]+)\\s*Watt` on the text-format output; identical figure available in JSON at devices[0].platforms[0].electrical.power_consumption_watts)"
+    source: "xrt-smi examine -r platform (parsed via regex `^Estimated Power\\s*:\\s*([0-9.]+)\\s*Watt` on the text-format output; identical figure available in JSON at devices[0].platforms[0].electrical.power_consumption_watts)"
     fallback_source: "no driver-integrated cumulative-energy counter on amdxdna 2.23.0; no amdxdna sysfs hwmon power node — verified by enumerating /sys/class/hwmon/hwmon*/name and the PCI accel0 device. Trapezoidal integration of xrt-smi instantaneous power is the only path."
     units_native: "watts (instantaneous power; harness trapezoidal-integrates over [start, stop) window to joules)"
     known_issues: ["Estimated Power is a firmware-internal estimate, NOT a sense-resistor reading; AMD does not publish the estimation algorithm. Calibration against a system-wall-power measurement (e.g. hardware power-meter on the laptop AC input minus baseline) is recommended for any externally-cited absolute number, but for cross-device J/Mbp comparison the relative scale is the comparable quantity.", "When no hardware context is loaded, the firmware floors the reading near 0 W (typically 0.001-0.003 W noise floor). Idle-baseline measurements taken with no hardware context loaded therefore under-represent leakage power; sanity-gate idle baselines should keep an XRT context open if absolute idle leakage matters.", "Reading is per-AIE-partition; on a host that runs multiple concurrent NPU workloads (currently impossible — amdxdna 2.23.0 doesn't ship multi-context scheduling on Strix) the per-partition figures would need to be summed."]
@@ -65,17 +65,17 @@ Companion: [`UNITS.md`](./UNITS.md) for the metric formulas themselves.
 
 ## Side-by-side: CPU vs GPU vs NPU
 
-| Field             | CPU (RAPL on Zen 5 / Strix)                                                                  | GPU (`nvidia-smi`)                                                          | NPU (`xrt-smi`)                                                                              |
+| Field | CPU (RAPL on Zen 5 / Strix) | GPU (`nvidia-smi`) | NPU (`xrt-smi`) |
 |-------------------|----------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
 | Rail | Package energy | Whole-board | AIE compute-tile partition rail (§3, characterized in ) |
-| Cores             | yes (P-cores + E-cores)                                                                       | yes (compute cores)                                                         | yes (AIE compute tiles in active partition)                                                  |
-| Uncore / fabric   | yes (Zen 5 package includes L3 + uncore)                                                      | n/a (board-level reading)                                                   | no (host SoC fabric is on a different rail; reading is per-AIE-partition)                    |
-| On-device memory  | **excludes** DRAM (no AMD DRAM domain in mainline)                                            | **includes** GDDR/HBM                                                       | partial — AIE tile-local memory is on-die in the partition; system DRAM/host pools not included |
-| IO / PCIe         | excludes platform IO outside the package                                                      | includes board-side PCIe; excludes host-side                                | excludes (AIE partition only)                                                                |
-| Sampling rate     | ≥10 Hz (counter is monotonic; harness reads start + mid + end)                                 | ~1 Hz driver-reported (10 Hz harness poll fallback)                         | 10 Hz harness poll (xrt-smi invocation ~40 ms; trapezoidal integration)                      |
-| Sysfs / cmd path  | `/sys/class/powercap/amd-rapl-msr:0/energy_uj`                                                | `nvidia-smi --query-gpu=power.draw,total_energy_consumption --format=csv`   | `xrt-smi examine -r platform`  (no amdxdna sysfs power node on driver 2.23.0)                |
-| Native unit       | microjoules                                                                                    | watts (power.draw); millijoules (total_energy_consumption)                  | watts (firmware-estimated instantaneous power)                                               |
-| Known issue       | AMD RAPL may require kernel patch on Strix; if absent, mark UNAVAILABLE — never fabricate     | 1 Hz under-resolves bursty workloads; prefer driver-integrated counter      | "Estimated Power" is a firmware estimate (not sense-resistor); absolute number not calibrated against wall-power |
+| Cores | yes (P-cores + E-cores) | yes (compute cores) | yes (AIE compute tiles in active partition) |
+| Uncore / fabric | yes (Zen 5 package includes L3 + uncore) | n/a (board-level reading) | no (host SoC fabric is on a different rail; reading is per-AIE-partition) |
+| On-device memory | **excludes** DRAM (no AMD DRAM domain in mainline) | **includes** GDDR/HBM | partial — AIE tile-local memory is on-die in the partition; system DRAM/host pools not included |
+| IO / PCIe | excludes platform IO outside the package | includes board-side PCIe; excludes host-side | excludes (AIE partition only) |
+| Sampling rate | ≥10 Hz (counter is monotonic; harness reads start + mid + end) | ~1 Hz driver-reported (10 Hz harness poll fallback) | 10 Hz harness poll (xrt-smi invocation ~40 ms; trapezoidal integration) |
+| Sysfs / cmd path | `/sys/class/powercap/amd-rapl-msr:0/energy_uj` | `nvidia-smi --query-gpu=power.draw,total_energy_consumption --format=csv` | `xrt-smi examine -r platform` (no amdxdna sysfs power node on driver 2.23.0) |
+| Native unit | microjoules | watts (power.draw); millijoules (total_energy_consumption) | watts (firmware-estimated instantaneous power) |
+| Known issue | AMD RAPL may require kernel patch on Strix; if absent, mark UNAVAILABLE — never fabricate | 1 Hz under-resolves bursty workloads; prefer driver-integrated counter | "Estimated Power" is a firmware estimate (not sense-resistor); absolute number not calibrated against wall-power |
 
 ---
 
@@ -109,7 +109,7 @@ Fallback path if `amd-rapl-msr` is unavailable (kernel without the AMD MSR
 RAPL driver):
 
 ```
-/sys/class/hwmon/hwmon*/energy*_input    # via amd_energy module
+/sys/class/hwmon/hwmon*/energy*_input # via amd_energy module
 ```
 
 The harness probes `amd-rapl-msr` first, falls back to `amd_energy`, and if
@@ -124,7 +124,7 @@ unavailable.
 AMD RAPL surfaces have been gated behind specific kernel commits and may
 return zero, `-EIO`, or simply not exist on stock Ubuntu 26.04 kernels. The
 bring-up agent has not yet characterized this surface on the target laptop
-(see `state/`). 's validation gate uses a `stress-ng --cpu 8 --timeout
+(see `state/`). validation gate uses a `stress-ng --cpu 8 --timeout
 10s` workload as a sanity check: if CPU energy under load is not strictly
 greater than CPU energy under `sleep 10`, the reader is broken and 
 blocks. In that case, this document grows a note in the
@@ -191,13 +191,13 @@ section:
    partition per NPU and one NPU.
 2. **Native unit?** Watts (instantaneous; firmware-internal estimate,
    not a sense-resistor reading). xrt-smi 2.23 prints
-   `Estimated Power          : 0.412 Watts` in the human-readable
+   `Estimated Power : 0.412 Watts` in the human-readable
    format and `power_consumption_watts: "0.412"` in the JSON
    variant under `devices[0].platforms[0].electrical`.
 3. **Update rate?** The reading appears to update at ~5-10 Hz at the
    firmware level. The bottleneck for the harness is xrt-smi
    invocation overhead (~40 ms per call), so the harness polls at
-   10 Hz, matching 's `NvidiaSmiReader` trapezoidal-fallback rate.
+   10 Hz, matching `NvidiaSmiReader` trapezoidal-fallback rate.
 4. **Driver-integrated counter?** No. `amdxdna` 2.23.0 does NOT
    expose a cumulative joule counter analogous to NVML's
    `total_energy_consumption`. The harness trapezoidal-integrates the
@@ -261,9 +261,9 @@ hwmon probe order) without changing `XrtReader`'s public surface.
 `bionpu/bench/energy/xrt.py::XrtReader` mirrors 's
 `NvidiaSmiReader.METHOD_TRAPEZOIDAL` path:
 
-- `start()` takes one eager sample and spawns a daemon thread that
+- `start` takes one eager sample and spawns a daemon thread that
   polls every 100 ms (10 Hz default).
-- `stop()` joins the thread, takes one final sample, then
+- `stop` joins the thread, takes one final sample, then
   trapezoidal-integrates the (t_monotonic, watts) samples to joules.
 - Constructor probes for xrt-smi + a parseable `Estimated Power`
   line; raises `XrtUnavailableError` on failure.
@@ -377,7 +377,7 @@ The kernel does expose `/sys/class/powercap/intel-rapl:0/energy_uj`
 (via the `intel_rapl_msr` driver, which on AMD Zen 5 routes the AMD
 package counter through the historical "intel-rapl" path), but stock
 Ubuntu 26.04 ships it mode `0400 root:root` due to the upstream RAPL
-side-channel mitigation. `RaplReader()` correctly raises
+side-channel mitigation. `RaplReader` correctly raises
 `RaplUnavailableError`; `auto_reader("cpu")` falls back to
 `RaplStub` and the harness records `energy_source="stub"`. Sanity
 gate (`stress-ng`) was therefore not run — there is no readable
@@ -460,7 +460,7 @@ only `dev`, `device`, `power` (runtime-PM), `subsystem`, `uevent`).
 `bionpu/bench/energy/xrt.py::XrtReader` mirrors 's
 `NvidiaSmiReader.METHOD_TRAPEZOIDAL`: 10 Hz daemon-thread poller of
 `xrt-smi examine -r platform`, trapezoidal-integrating the (t, watts)
-samples to joules at `stop()`. There is no driver-integrated
+samples to joules at `stop`. There is no driver-integrated
 cumulative-energy counter on amdxdna 2.23.0 (no NVML
 `total_energy_consumption` analogue), so the trapezoidal path is the
 only one offered.

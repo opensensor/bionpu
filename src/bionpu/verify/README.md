@@ -39,10 +39,10 @@ result = compare_against_dorado(
     npu_fastq="results/reads_npu.fastq",
     ref_fastq="reference/basecalling/reads_dorado_reference.fastq",
 )
-print(f"NPU SHA-256:       {result.npu_sha256}")
+print(f"NPU SHA-256: {result.npu_sha256}")
 print(f"Reference SHA-256: {result.ref_sha256}")
-print(f"Records compared:  {result.record_count}")
-print(f"Equal:             {result.equal}")
+print(f"Records compared: {result.record_count}")
+print(f"Equal: {result.equal}")
 ```
 
 Both comparators return a :class:`VerifyResult` (see

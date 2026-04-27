@@ -9,17 +9,17 @@ p. 74), not a compute tile.
 
 ## Files
 
-| name                  | role |
+| name | role |
 |-----------------------|------|
-| `__init__.py`         | Public Python surface (`CrisprMatchMultiTileMemtile`). |
-| `multitile_memtile.py`| IRON lowering (4-into-1 via `outC.prod().join(...)`). |
-| `match_kernel.cc`     | AIE2P compute kernel (single `crispr_match_memtile_match` symbol). |
-| `runner.cpp`          | C++ host runner (CXXABI 1.3.15, g++-15). |
-| `Makefile`            | Build orchestration (`NPU2=1` required for AIE2P). |
-| `CMakeLists.txt`      | Alternate host-runner build (CMake; same output). |
-| `MANIFEST.md`         | This file. |
-| `DESIGN.md`           | Full AM020 cross-walk rationale. |
-| ``           | Toolchain-gap report. |
+| `__init__.py` | Public Python surface (`CrisprMatchMultiTileMemtile`). |
+| `multitile_memtile.py`| IRON lowering (4-into-1 via `outC.prod.join(...)`). |
+| `match_kernel.cc` | AIE2P compute kernel (single `crispr_match_memtile_match` symbol). |
+| `runner.cpp` | C++ host runner (CXXABI 1.3.15, g++-15). |
+| `Makefile` | Build orchestration (`NPU2=1` required for AIE2P). |
+| `CMakeLists.txt` | Alternate host-runner build (CMake; same output). |
+| `MANIFEST.md` | This file. |
+| `DESIGN.md` | Full AM020 cross-walk rationale. |
+| `` | Toolchain-gap report. |
 
 ## Vendored artifacts
 
@@ -36,14 +36,14 @@ that directory's `MANIFEST.md` for the sha256s and rebuild instructions.
                                     │ guides (broadcast)
                                     │ windows (broadcast)
                   ┌─────────┬───────┼───────┬─────────┐
-                  ↓         ↓       ↓       ↓         ↓
-              match_0   match_1  match_2  match_3
-              (32 g.)   (32 g.)  (32 g.)  (32 g.)
-                  │         │       │         │
-                  │         │       │         │
+                  ↓ ↓       ↓ ↓         ↓
+              match_0 match_1 match_2 match_3
+              (32 g.) (32 g.) (32 g.) (32 g.)
+                  │ │       │ │
+                  │ │       │ │
                   └─────────┴──┬────┴─────────┘
                                ↓
-                  [memtile: outC = outC.prod().join(offsets, ...)]
+                  [memtile: outC = outC.prod.join(offsets, ...)]
                                │
                                │ joined (n_windows × N_GUIDES)
                                ↓
@@ -51,7 +51,7 @@ that directory's `MANIFEST.md` for the sha256s and rebuild instructions.
 ```
 
 Each match tile MM2S streams its `(64 windows × 32 guides) = 2048 B`
-partial into a separate memtile S2MM channel (channels 0..3 — the
+partial into a separate memtile S2MM channel (channels 0.3 — the
 east/west-capable ones per AM020). Memtile reorganizes the 4 partials
 into a single contiguous `(64 windows × 128 guides) = 8192 B` window-
 major buffer using 5D address generation (AM020 Ch. 5 p. 71). Memtile
@@ -63,40 +63,40 @@ fabric-side.
 AIE2P compute tile: 64 KiB DM cap (per AM020 Table 14, AIE-ML number
 verified empirically on AIE2P via ).
 
-Per match tile (Tiles match_0..match_3, all identical):
+Per match tile (Tiles match_0.match_3, all identical):
 
-| component                          | bytes     |
+| component | bytes |
 |------------------------------------|-----------|
-| guides full batch (resident)       | 640       |
-| windows chunk dbl-buf              | 640       |
-| partial out dbl-buf (64 × 32 × 2)  | 4096      |
-| **subtotal**                       | **5376**  |
-| % of 64 KiB cap                    | **8.2%**  |
+| guides full batch (resident) | 640 |
+| windows chunk dbl-buf | 640 |
+| partial out dbl-buf (64 × 32 × 2) | 4096 |
+| **subtotal** | **5376** |
+| % of 64 KiB cap | **8.2%** |
 
 Per memtile (the new "joiner" — fabric-side, 512 KiB cap per AM020 Ch. 5):
 
-| component                            | bytes      |
+| component | bytes |
 |--------------------------------------|------------|
-| 4 partials × 2 dbl-buf × 64 × 32     | 16384      |
-| 1 joined × 2 dbl-buf × 64 × 128      | 16384      |
-| **subtotal**                         | **32768**  |
-| % of 512 KiB cap                     | **6.25%**  |
+| 4 partials × 2 dbl-buf × 64 × 32 | 16384 |
+| 1 joined × 2 dbl-buf × 64 × 128 | 16384 |
+| **subtotal** | **32768** |
+| % of 512 KiB cap | **6.25%** |
 
 The per-match-tile footprint is ~half 's (5376 B vs 9472 B) because
 each tile carries a narrower 32-guide slice. The memtile footprint is
-identical to 's joiner-tile footprint (the work is the same; only
+identical to joiner-tile footprint (the work is the same; only
 the location moved from compute tile to memtile).
 
 ## ObjectFifo summary
 
-| FIFO       | producer     | consumer(s)                           | depth | per-elem bytes |
+| FIFO | producer | consumer(s) | depth | per-elem bytes |
 |------------|--------------|---------------------------------------|-------|----------------|
-| `guides`   | shim         | match_0, match_1, match_2, match_3    | 1     | 640            |
-| `windows`  | shim         | match_0, match_1, match_2, match_3    | 2     | 320            |
-| `outC`     | match_0..3   | memtile (joined) → shim               | 2     | 8192 (joined)  |
-| `memC0..3` | match_<i>    | memtile (per-tile slot of `outC`)     | 2     | 2048           |
+| `guides` | shim | match_0, match_1, match_2, match_3 | 1 | 640 |
+| `windows` | shim | match_0, match_1, match_2, match_3 | 2 | 320 |
+| `outC` | match_0.3 | memtile (joined) → shim | 2 | 8192 (joined) |
+| `memC0.3` | match_<i> | memtile (per-tile slot of `outC`) | 2 | 2048 |
 
-`outC.prod().join([0, 32, 64, 96], obj_types=[partial_chunk_ty]*4, ...)`
+`outC.prod.join([0, 32, 64, 96], obj_types=[partial_chunk_ty]*4, ...)`
 declares the memtile-aggregated FIFO; IRON lowers each per-tile producer
 (`memC<i>`) into a memtile S2MM channel with an offset into the joined
 buffer.
@@ -114,9 +114,9 @@ make NPU2=1 clean
 make NPU2=1 all
 
 # Vendor:
-cp build/final.xclbin              <repo>/bionpu/dispatch/_npu_artifacts/crispr_match_multitile_memtile/final.xclbin
-cp build/insts.bin                  <repo>/bionpu/dispatch/_npu_artifacts/crispr_match_multitile_memtile/insts.bin
-cp crispr_match_multitile_memtile   <repo>/bionpu/dispatch/_npu_artifacts/crispr_match_multitile_memtile/host_runner
+cp build/final.xclbin <repo>/bionpu/dispatch/_npu_artifacts/crispr_match_multitile_memtile/final.xclbin
+cp build/insts.bin <repo>/bionpu/dispatch/_npu_artifacts/crispr_match_multitile_memtile/insts.bin
+cp crispr_match_multitile_memtile <repo>/bionpu/dispatch/_npu_artifacts/crispr_match_multitile_memtile/host_runner
 ```
 
 Then update sha256 rows in the vendored MANIFEST.md.

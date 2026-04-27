@@ -33,7 +33,7 @@ The pruning is **structural** (real zeros where the N:M pattern says
 they go); the fork's BD-emit pass at AIEDmaToNpu.cpp:655 currently
 writes ``Enable_Compression = 0`` unconditionally so the wire DMA
 volume equals the dense total in the active build. Documented as
- in the kernel's gaps.yaml; weight-DMA-volume reduction
+ in the kernel's ; weight-DMA-volume reduction
 becomes Phase 3 future-work pending the BD-emit pass closure.
 
 The accuracy contract is independent of the wire-DMA-volume goal:

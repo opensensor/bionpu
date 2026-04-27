@@ -50,7 +50,6 @@
 # (since the accumulator-to-FP32-store path is lossless on AIE-ML/AIE2P
 # per AM020 Ch. 4 p. 65). This **is the toolchain gap** the task
 # brief calls out as a likely real RQ4 finding; documented in
-# `gaps.yaml`.
 
 import argparse
 import sys

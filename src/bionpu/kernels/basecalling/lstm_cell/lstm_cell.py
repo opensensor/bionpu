@@ -29,9 +29,9 @@
 # AIE2P (verified 2026-04-25 against `mlir-aie@979629649`). The closest
 # patterns are the matrix-multiplication examples (no recurrent state) and
 # the SiLU/RMSNorm/LayerNorm (no per-timestep weight reuse). Per the
-# umbrella PRD §4.4 ("LSTM is the bottleneck and the research target for
+#  §4.4 ("LSTM is the bottleneck and the research target for
 # "), this lowering is the load-bearing first version. It is FP32
-# scalar — bf16 vector intrinsics arrive in . See `gaps.yaml` for the
+# scalar — bf16 vector intrinsics arrive in . See `` for the
 # `expressibility` entry filed against this absence.
 #
 # # Tile-memory walkthrough
@@ -121,7 +121,7 @@ def my_dorado_fast_lstm_cell(dev, L: int):
     the weight stream** as a 768-FP32 prefix on the first weight chunk
     only — the kernel reads them once and caches them in static memory.
     All subsequent kernel calls receive a 0-bias placeholder buffer
-    that they ignore. (See `gaps.yaml` for the IRON DMA-
+    that they ignore. (See `` for the IRON DMA-
     channel-count blocker that drove this fold.)
     """
     # Tile-resident types

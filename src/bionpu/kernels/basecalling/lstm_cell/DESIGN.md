@@ -40,7 +40,7 @@ into a static `bias_cache[768]` array and skips the prefix on every
 subsequent call. This costs `(L * 4 * 4) * 768 = 16,400` FP32 of
 host-side bloat per LSTM call (~64 KB) — negligible.
 
-See `gaps.yaml` for the upstream bug we'd file against IRON
+See `` for the upstream bug we'd file against IRON
 to lift the per-fifo channel allocation; the workaround is documented
 there too.
 
@@ -132,5 +132,5 @@ We don't ship it for because:
   recurrent state propagation. Adapting them to an LSTM cell is non-
   trivial — gate accumulators and h/c need to flow between tiles
   per timestep, which IRON's ObjectFifo-driven dataflow doesn't
-  natively support without inter-tile fifos. See `gaps.yaml`
+  natively support without inter-tile fifos. See ``
    for the absent IRON RNN/recurrent-multi-tile pattern.

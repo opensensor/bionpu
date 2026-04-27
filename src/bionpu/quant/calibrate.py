@@ -23,7 +23,7 @@ runs the quantizer and exposes the strategy enum).
 Design notes
 ------------
 
-* Per umbrella PRD §4.3: post-training calibration only at v1. AWQ-style
+* Per  §4.3: post-training calibration only at v1. AWQ-style
   hooks for transformers are stubbed (:class:`AWQCalibrator`) and raise
   :class:`NotImplementedError` with a message naming the LSTM-CRF case
   so a future agent doesn't accidentally route the LSTM Dorado model

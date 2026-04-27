@@ -3,7 +3,7 @@
 # that every metric below has unit + formula + scope + percentile_method where
 # applicable). Do not remove keys; add new metrics by appending entries.
 spec_version: "1.0.0"
-spec_purpose: "Lock measurement units before any track measures anything (umbrella PRD §4.2; risk row 'apples-to-oranges measurements')."
+spec_purpose: "Lock measurement units before any track measures anything ( §4.2; risk row 'apples-to-oranges measurements')."
 generated: "2026-04-25"
 owner: ""
 consumed_by: ["", "", "", "", "", ""]
@@ -89,9 +89,9 @@ metrics:
 
 This document fixes every metric unit and computation rule that the bench
 harness, the energy readers, the basecalling track, and the
-CRISPR track must conform to. It exists to discharge umbrella PRD §4.2's
+CRISPR track must conform to. It exists to discharge  §4.2's
 requirement that cross-track numbers be comparable, and to neutralize the
-"apples-to-oranges measurements" risk row in the umbrella PRD risk table.
+"apples-to-oranges measurements" risk row in the  risk table.
 
 If a number is reported in this repo without conforming to this file, the
 writeup pipeline MUST refuse to render it.
@@ -251,7 +251,7 @@ energy can be recomputed from the raw counter samples post-hoc.
   exact value used so a reviewer can reproduce.
 - **PRD CRISPR §3.4 evaluation:** the NPU figure must be lower than the GPU
   figure to claim the energy thesis. Otherwise the negative result is
-  reported per umbrella PRD §3.4.
+  reported per  §3.4.
 
 ---
 

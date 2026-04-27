@@ -15,7 +15,7 @@
 
 """Public dataset fetcher framework.
 
-Per umbrella PRD §4.4: each public dataset has a fetcher with checksum
+Per  §4.4: each public dataset has a fetcher with checksum
 verification, license/citation in code, and a manifest entry. Network
 failures must record URL + HTTP status + retry guidance.
 

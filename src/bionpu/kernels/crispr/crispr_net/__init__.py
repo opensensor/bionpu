@@ -49,7 +49,7 @@ What "NPU dispatch" means here in v1:
   the per-element numerical envelope is identical (same bf16 round-to-
   nearest-even, same `aie::tanh<bfloat16>`-equivalent on host) but
   there's no host-runner roundtrip per call. This is documented as
-   in the gaps.yaml (the IRON pattern for compiling
+   in the  (the IRON pattern for compiling
   shape-parametric LSTM kernels at multiple T isn't exposed in v1).
 
 * The Conv1D portion (kernel=5, in_ch=7, out_ch=10) is similarly

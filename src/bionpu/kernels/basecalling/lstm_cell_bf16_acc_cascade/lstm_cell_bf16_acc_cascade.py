@@ -33,8 +33,8 @@
 #     load-bearing primitive for the LSTM stack is AccumFifo (FP32 state),
 #     but importing both keeps the contract honest with the task brief.
 #
-# **Followup G (Fix C) refactor — 2026-04-26**:
-# Per the silicon-validated Followup E Stage 1 prescription, the per-tile
+# ** (Fix C) refactor — 2026-04-26**:
+# Per the silicon-validated  prescription, the per-tile
 # kernel functions must emit `vmov mcd` / `vmov scd` cascade-port
 # intrinsics UNCONDITIONALLY (no peano-emitted `jnz` around them). The
 # kernel side splits each role into 8 extern "C" functions
@@ -73,7 +73,7 @@
 #     (lowers to ``aie.objectfifo.link`` with ``dst_offsets``). Reduces
 #     the host BO count from the original 7 (1 in + 5 wb + 1 out) to
 #     3 (1 in + 1 wb_consolidated + 1 out), fitting the AIE2P 5-slot
-# kernel ABI cap. See in gaps.yaml + the upstream
+# kernel ABI cap. See in  + the upstream
 #     ``programming_examples/basic/matrix_multiplication/cascade/cascade.py``
 #     pattern reference.
 #   - output ObjectFifo at row 6: bf16 (L=334) × 96 lanes
@@ -122,7 +122,7 @@ def my_dorado_fast_lstm_stack_bf16_acc_cascade(
 
     The emit pass:
     1. Constructs eight role-specific Kernel objects bound to
-       ``lstm_layer_cascade.o`` symbols (Followup G Fix C; was three).
+       ``lstm_layer_cascade.o`` symbols ( Fix C; was three).
     2. Constructs the 5 vertically-adjacent CoreTile placements.
     3. Builds the 4 inter-row AccumFifos (FP32 cascade hand-off).
     4. Builds the input ObjectFifo (terminating at row 2) and output
@@ -131,7 +131,7 @@ def my_dorado_fast_lstm_stack_bf16_acc_cascade(
     5. Builds 5 Workers, one per row, with per-role core_fns wiring
        the appropriate ObjectFifos + AccumFifo handles. Per-call kernel
        selection is now STATIC (build-time Python conditional on the
-       (g, chunk) index) — Followup G's Fix C invariant.
+       (g, chunk) index) — 's Fix C invariant.
     6. Builds the Runtime fill/drain sequence for input + 5 weight
        buffers + output.
     7. Resolves the Program.
@@ -194,13 +194,13 @@ def my_dorado_fast_lstm_stack_bf16_acc_cascade(
     ]
     per_layer_chunk_offsets = [i * chunk_len for i in range(N_LAYERS)]
 
-    # ---- Per-role Kernel declarations (Followup G Fix C: 8 kernels) ----
+    # ---- Per-role Kernel declarations ( Fix C: 8 kernels) ----
     #
     # Each role used to be a single monolithic kernel (FIRST `_put_only`,
     # MIDDLE `_put_get`, LAST `_get_only`) with cascade put/get gated by
     # `(g==3,chunk_idx==3)` / `(g==0,chunk_idx==0)` runtime branches. That
     # pattern wedged the AIE2P firmware-side cascade-port watchdog
-    #. Followup E silicon-validated that splitting into
+    #.  silicon-validated that splitting into
     # cascade-presence-specific functions (and emitting cascade ops
     # unconditionally inside any function that contains them) lifts the
     # wedge. Fix C achieves this WITHOUT the per-layer L1 / memtile
@@ -266,7 +266,7 @@ def my_dorado_fast_lstm_stack_bf16_acc_cascade(
     # rows 2..5 = CoreTiles). The original DESIGN.md assumed rows 2..6
     # (5-deep), which is silicon-infeasible per
     # ``aie.iron.device.NPU2`` validation: rows = 6 (indices 0..5).
-    # Filed as (gaps.yaml).
+    # Filed as ().
     #
     # Cascade-direction constraint (AIELowerCascadeFlows.cpp): source
     # tile must be South of OR West of the destination tile. So the
@@ -346,7 +346,7 @@ def my_dorado_fast_lstm_stack_bf16_acc_cascade(
     # Output (LAST cascade core → shim):
     of_output = ObjectFifo(out_step_ty, name="output_out", depth=2)
 
-    # ---- Per-role core_fn factories (Followup G Fix C: static call-site selection) ----
+    # ---- Per-role core_fn factories ( Fix C: static call-site selection) ----
     #
     # Each core_fn's outer `for t in range_(L_)` is a runtime SCF loop
     # (compiled to MLIR's scf.for). The inner `for g in range(N_GATES):
@@ -364,7 +364,7 @@ def my_dorado_fast_lstm_stack_bf16_acc_cascade(
     #     intrinsic UNCONDITIONALLY at function entry/exit (no `jnz`
     #     around them in the per-tile ELF).
     #
-    # This achieves Followup E's silicon-validated invariant ("0 jnz
+    # This achieves 's silicon-validated invariant ("0 jnz
     # around vmov mcd / vmov scd in any function on any tile") for the
     # production LSTM kernel, without the L1 / memtile capacity wall
     # that Fix B production hit.

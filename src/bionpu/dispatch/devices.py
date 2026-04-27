@@ -15,7 +15,7 @@
 
 """Device enum + tensor-placement helper for the dispatch layer.
 
-Per umbrella PRD §4.1: "Tensor.to(device) where device is cpu | gpu | npu".
+Per  §4.1: "Tensor.to(device) where device is cpu | gpu | npu".
 
 This module is the *thin* device-selection wrapper. There is no graph
 rewriting and no lazy-mode here — those are explicitly out of scope for

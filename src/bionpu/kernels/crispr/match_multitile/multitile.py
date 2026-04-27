@@ -116,7 +116,7 @@ N_WINDOWS = 4096
 #
 # Why 2 (not 4 — the original PRD §4.2 sketch): AIE2P compute tiles have
 # only 2 input + 2 output DMA channels each (verified empirically — see
-# `gaps.yaml` ). A 4-match-tile + 1-joiner topology asks the
+# `` ). A 4-match-tile + 1-joiner topology asks the
 # joiner to consume 4 input DMA streams, blowing the budget. Two match
 # tiles + one join tile fits cleanly: joiner gets 2 input partials + 1
 # guides broadcast (3 input flows; the `guides` ObjectFifo is a *broadcast*

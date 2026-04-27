@@ -13,7 +13,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Cascade-stream IRON topology helper (T7-IRON, AM020 Ch. 4 p. 67).
+"""Cascade-stream IRON topology helper (, AM020 Ch. 4 p. 67).
 
 Module purpose
 --------------
@@ -56,7 +56,7 @@ What it does NOT do
   horizontal on AIE-ML; AIE2P inheritance is **assumed-but-unverified**
   (``docs/.md`` flags this as a chip-generation
   caveat). On AIE2P we have only verified vertical (column-wise);
-  horizontal cascade was not measured in T7-IRON's investigation.
+  horizontal cascade was not measured in 's investigation.
 - It does not fix the IRON "Worker is single-tile, single-call"
   abstraction limit for non-cascade-stream multi-tile patterns
   (e.g. AM-to-AM register move within a tile, variable-rate
@@ -83,7 +83,7 @@ rebuild, because:
 
 The remaining engineering work (authoring the C++ kernel variants for
 the LSTM use case, building the xclbin, hooking up the host runner)
-is **kernel-author scope**, not toolchain scope. The "T7-IRON
+is **kernel-author scope**, not toolchain scope. The "
 extension path is viable" finding lets that engineering proceed
 without first taking on a wheel rebuild.
 

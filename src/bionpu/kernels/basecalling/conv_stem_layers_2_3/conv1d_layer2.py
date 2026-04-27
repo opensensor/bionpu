@@ -99,7 +99,7 @@ def my_dorado_fast_conv_stem_layer2(dev, T: int, T_chunk: int):
 
     # Single-buffered signal (depth=1) to fit 64 KiB tile budget; output
     # depth=2 to allow ping-pong (the v1=depth=1 path produced a 9-position
-    # NaN window at positions 43..51 of every chunk; see gaps.yaml
+    # NaN window at positions 43..51 of every chunk; see 
     # ).
     of_signal = ObjectFifo(sig_chunk_ty, name="signal_in", depth=1)
     of_wb = ObjectFifo(wb_ty, name="wb_in")

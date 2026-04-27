@@ -33,7 +33,7 @@
 # 930e23c7 — the BD-emit pass DOES now emit
 # `aie.enable_compression = true` on the compute-tile (0,2) S2MM
 # BDs for SparseFifo-decorated channels (silicon-PASS by T5's
-# rebuild + ratification, see gaps.yaml:: closure_ref).
+# rebuild + ratification, see :: closure_ref).
 # However: the cross-module guard at the same fork SHA
 # unconditionally SUPPRESSES the bit on shim and memtile BDs (AM029
 # documents the bit only for compute-tile MEMORY_MODULE; memtile
@@ -59,7 +59,7 @@
 # the wire). Wire-savings goal needs fork-side primitive work to
 # plumb memtile-side compression at the correct bit field, which
 # is OUT OF SCOPE for the followup-pass agents per task
-# instructions. See gaps.yaml:: closure_ref's "followup
+# instructions. See :: closure_ref's "followup
 # Item 2 addendum" for the full decision tree narrative.
 
 import argparse

@@ -15,7 +15,7 @@
 
 """Device dispatch (CPU / GPU / NPU) for bionpu — + .
 
-Per umbrella PRD §4.1: a thin device-selection wrapper. Public surface:
+Per  §4.1: a thin device-selection wrapper. Public surface:
 
 - ``Device`` — `Literal["cpu", "gpu", "npu"]`.
 - ``to_device(tensor, device)`` — moves a tensor to the named device.
@@ -40,7 +40,7 @@ Per umbrella PRD §4.1: a thin device-selection wrapper. Public surface:
      :data:`bionpu.dispatch.npu.NPU_OPS` and the registered
      :class:`NpuOp` runs with the keyword arguments. This is the v1
      contract for "the NPU runs this kernel" — pre-built xclbins +
-     registered-op lookup table per umbrella PRD §4.1.
+     registered-op lookup table per  §4.1.
 
   :func:`bionpu.dispatch.npu.register_npu_op`.
 
@@ -141,7 +141,7 @@ def dispatch(
        is ``"npu"``. The string is looked up in :data:`NPU_OPS`
        (raises ``KeyError`` for unknown ops) and the registered
        :class:`NpuOp` is invoked with the keyword arguments. The v1
-       contract per umbrella PRD §4.1: pre-built xclbins + a lookup
+       contract per  §4.1: pre-built xclbins + a lookup
        table; no on-the-fly compile.
 
        For convenience, when ``op`` is a string AND the chosen device
@@ -217,7 +217,7 @@ def dispatch(
                 f"dispatch(op={op!r}, device={chosen!r}): string ops are "
                 f"NPU-only in v1. Use a callable for cpu/gpu paths and "
                 f'dispatch(op="...", device="npu", ...) for the NPU '
-                f"registered-op path. (umbrella PRD §4.1.)"
+                f"registered-op path. ( §4.1.)"
             )
         npu_op = lookup_npu_op(op)
         # The NpuOp contract is keyword-only — args are NOT forwarded.

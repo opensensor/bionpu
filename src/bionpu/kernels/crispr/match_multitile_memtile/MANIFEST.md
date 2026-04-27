@@ -19,7 +19,7 @@ p. 74), not a compute tile.
 | `CMakeLists.txt`      | Alternate host-runner build (CMake; same output). |
 | `MANIFEST.md`         | This file. |
 | `DESIGN.md`           | Full AM020 cross-walk rationale. |
-| `gaps.yaml`           | Toolchain-gap report. |
+| ``           | Toolchain-gap report. |
 
 ## Vendored artifacts
 
@@ -105,9 +105,9 @@ buffer.
 
 ```bash
 source /opt/xilinx/xrt/setup.sh
-source ~/xdna-bringup/ironenv/bin/activate
-export MLIR_AIE_DIR=~/xdna-bringup/mlir-aie
-export PEANO_INSTALL_DIR=~/xdna-bringup/ironenv/lib/python3.11/site-packages/llvm-aie
+source <ironenv>/bin/activate
+export MLIR_AIE_DIR=<xdna-bringup>/mlir-aie
+export PEANO_INSTALL_DIR=<ironenv>/lib/python3.11/site-packages/llvm-aie
 
 cd <repo>/bionpu/kernels/crispr/match_multitile_memtile
 make NPU2=1 clean

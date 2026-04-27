@@ -1,7 +1,7 @@
 # linear_projection — call-fusion design (post-cascade speedup lever)
 
 **Status (2026-04-26):** sketch, not implemented. Filed as part of
-`bionpu/kernels/basecalling/conv_stem_layers_2_3/gaps.yaml` .
+`bionpu/kernels/basecalling/conv_stem_layers_2_3/` .
 This document describes what the kernel *should* look like to deliver
 the post-cascade encoder throughput we need; the next concrete step is
 to build it and silicon-test against the existing artifact.
@@ -147,7 +147,7 @@ the kernel-internal-fifo-walk pattern needs separate validation.
    loop). Same validation; expected wall time in low-ms.
 4. Update `results/basecalling/b-m6/measurements.json` with the new
    per-block latency for the chosen stage; the gap entry 
-   in `conv_stem_layers_2_3/gaps.yaml` flips from `severity: performance`
+   in `conv_stem_layers_2_3/` flips from `severity: performance`
    to `severity: workaround` or `severity: closed` based on outcome.
 
 ## Out of scope for this kernel

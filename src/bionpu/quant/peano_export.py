@@ -35,7 +35,7 @@ deliverable. The function signature is fixed here so:
 Implementation notes for whoever picks up 
 ----------------------------------------------
 
-The pipeline (per umbrella PRD §4.3 + the bring-up agent's
+The pipeline (per  §4.3 + the bring-up agent's
 PEANO_INSTALL_DIR convention) is:
 
 1. Parse the ONNX graph; map each op node to an IRON

@@ -17,7 +17,7 @@ C-M5 writeup can compare work distribution head-to-head.
 | `CMakeLists.txt`  | Optional CMake target for IDE integration.                                                 |
 | `__init__.py`     | Python `NpuOp` registration: `crispr_pam_filter_early` + `crispr_pam_filter_late`.         |
 | `DESIGN.md`       | Topology, byte layouts, strand handling, gaps surfaced.                                    |
-| `gaps.yaml` | toolchain-gap report for . |
+| `` | toolchain-gap report for . |
 | `MANIFEST.md`     | This file.                                                                                  |
 
 ## Pinned shape
@@ -73,15 +73,15 @@ smaller sparse-emit ring slot.
   - amdxdna 2.23.0
   - NPU firmware 1.1.2.64
   - Architecture `aie2p` (6×8 = 48 tiles)
-  - `~/xdna-bringup/ironenv` with Python 3.11.15, mlir-aie, llvm-aie
+  - `<ironenv>` with Python 3.11.15, mlir-aie, llvm-aie
 
 ## How to rebuild
 
 ```bash
 source /opt/xilinx/xrt/setup.sh
-source ~/xdna-bringup/ironenv/bin/activate
-export MLIR_AIE_DIR=~/xdna-bringup/mlir-aie
-export PEANO_INSTALL_DIR=~/xdna-bringup/ironenv/lib/python3.11/site-packages/llvm-aie
+source <ironenv>/bin/activate
+export MLIR_AIE_DIR=<xdna-bringup>/mlir-aie
+export PEANO_INSTALL_DIR=<ironenv>/lib/python3.11/site-packages/llvm-aie
 
 cd <repo>/bionpu/kernels/crispr/pam_filter
 make NPU2=1 clean

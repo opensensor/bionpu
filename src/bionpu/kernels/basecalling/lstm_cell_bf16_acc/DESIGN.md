@@ -6,7 +6,7 @@ sibling of 's bf16 `lstm_cell_bf16` kernel. 's scope is
 the **AM020 cross-walk follow-up** to : per
 `docs/.md` §, 's "wash" finding
 (end-to-end max-abs 2.458 vs Padé baseline 2.303) is misdiagnosed
-in 's gaps.yaml. The actual root cause is the bf16 recurrent-
+in 's . The actual root cause is the bf16 recurrent-
 state writeback between timesteps, not the multiplier-input
 narrowing.
 
@@ -70,7 +70,7 @@ function with persistent state expressed via static C++ storage in
 the kernel object. Inter-tile communication is via ObjectFifo (DMA-
 mediated), not via cascade stream.
 
-This is documented as **** + **** in `gaps.yaml`:
+This is documented as **** + **** in ``:
 real RQ4 findings — hardware supports it; toolchain doesn't expose it.
 
 ### Precision-equivalent fallback
@@ -164,11 +164,11 @@ wrong and that itself is a real RQ4 finding worth documenting honestly."
 
 - **AM-to-AM register-resident state**: requires an IRON
   lowering that exposes the AM020 Ch. 4 p. 67 primitive. Documented
-  in gaps.yaml as . Cycle-level optimization on top of
+  in  as . Cycle-level optimization on top of
   's precision-equivalent fallback.
 - **Cascade-stream layer chaining**: requires IRON exposure
   of the cascade primitive (AM020 Ch. 4 p. 67). Documented in
-  gaps.yaml as . Cycle-level + cross-layer precision
+   as . Cycle-level + cross-layer precision
   optimization on top of 's per-cell FP32 state.
 - ** / **: independent (NaN window in stem_L2 / weight DMA
   reduction). Not addressed by .

@@ -127,7 +127,7 @@ extern "C" {
 // pam=0" branch in the match kernel itself. For we keep the
 // match kernel verbatim from and let the host accumulate the
 // "windows actually examined" count from the pam_meta stream. This is
-// the v1 trade-off documented in DESIGN.md and gaps.yaml.)
+// the v1 trade-off documented in DESIGN.md and .)
 void crispr_pam_filter_tile_a_early(uint8_t* __restrict windows_in,
                                      uint8_t* __restrict windows_out,
                                      uint8_t* __restrict pam_meta,
@@ -181,7 +181,7 @@ void crispr_pam_filter_tile_a_late(uint8_t* __restrict windows_in,
 // 2 match tiles ≈ 2.6 M scalar byte-ops per launch on a single AIE2P core.
 // Combined with 's static-rate ObjectFifo wasting work on
 // PAM-failing windows, this is contributor (2) to the ~5.8 s/launch
-// kernel-time floor (gaps.yaml ).
+// kernel-time floor ( ).
 //
 // Strategy: vectorise across the 64 local guides. The guides arrive in
 // AoS layout (`guides[g_global*5 + b]`); per-window we need byte-position-

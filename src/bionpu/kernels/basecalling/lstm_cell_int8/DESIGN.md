@@ -59,7 +59,7 @@ records the achieved per-cell max-abs honestly. The test gate is
 
 ## Recurrent state precision: the lesson
 
-Per 's gaps.yaml entry , narrowing `h_t` / `c_t` from
+Per 's  entry , narrowing `h_t` / `c_t` from
 FP32 accumulator output to a smaller storage type per timestep
 compounds quantization noise across 334 × 5 ≈ 1670 narrowings. 
 shipped at bf16 and measured 2.458 end-to-end max-abs on Dorado fast
@@ -160,6 +160,6 @@ updated post-canary.
 If INT8 quantization noise on Dorado's trained weights exceeds 0.1
 max-abs (likely per 's finding that bf16 multiplier-input
 narrowing already costs precision on Dorado weights), document the
-achieved bound honestly in PASSPORT.json and gaps.yaml entry
+achieved bound honestly in PASSPORT.json and  entry
 . Do NOT relax the test to make it pass — the floor IS
 the publishable result per PRD §3 success criterion 3.

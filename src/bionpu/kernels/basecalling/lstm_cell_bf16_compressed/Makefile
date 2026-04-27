@@ -14,7 +14,7 @@
 # attributes are honoured by the IR but ignored by the BD layer) and
 # the resulting xclbin runs with dense-equivalent wire DMA. The pruned
 # weights still propagate as exact zeros so the *math* IS sparse.
-# See gaps.yaml::.
+# See ::.
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 ##===----------------------------------------------------------------------===##

@@ -16,9 +16,9 @@
 #
 # Invocation (from this directory):
 #   source /opt/xilinx/xrt/setup.sh
-#   source ~/xdna-bringup/ironenv/bin/activate
-#   export MLIR_AIE_DIR=~/xdna-bringup/mlir-aie
-#   export PEANO_INSTALL_DIR=~/xdna-bringup/ironenv/lib/python3.11/site-packages/llvm-aie
+#   source <ironenv>/bin/activate
+#   export MLIR_AIE_DIR=<xdna-bringup>/mlir-aie
+#   export PEANO_INSTALL_DIR=<ironenv>/lib/python3.11/site-packages/llvm-aie
 #   make NPU2=1 all
 #
 # `NPU2=1` is required (AIE2P).

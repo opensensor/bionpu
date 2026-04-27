@@ -48,7 +48,7 @@ output** (after normalization) on the same input. They differ in:
 | sparse output bytes   | identical                       | identical                         |
 | match-tile *useful* cycles | ~12.5% of windows         | 100% of windows (7/8 wasted)      |
 
-**Important v1 caveat (also documented in `gaps.yaml`)**: the
+**Important v1 caveat (also documented in ``)**: the
 match-tile kernel does NOT yet branch on the pam_meta byte. Both
 variants therefore pay the same match-tile *cycle* cost; what changes
 is which windows produce *meaningful* match-count output. The
@@ -150,7 +150,7 @@ produces ~15 K records out of a worst-case 4096 × 128 = 524 288 cells.
 
 ## §7 — Toolchain gaps surfaced
 
-See `gaps.yaml`. Key entries:
+See ``. Key entries:
 
 * — IRON has no first-class "stream-conditional forward"
   pattern. We work around by always forwarding a fixed-size window

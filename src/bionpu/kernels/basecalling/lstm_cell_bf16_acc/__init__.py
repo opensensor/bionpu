@@ -24,7 +24,7 @@ recurrent state (h, c, gate_acc) is held at FP32 between timesteps.
 
 Per the AM020 cross-walk (`docs/.md` §):
 's end-to-end max-abs of 2.458 was diagnosed in 's
-gaps.yaml as "bf16 cast quant noise on Dorado fast's
+ as "bf16 cast quant noise on Dorado fast's
 trained-large weights"; the AM020 read corrects this — the actual
 wall is the **recurrent-state writeback** at bf16 width. Each
 timestep narrows h_t / c_t from FP32 accumulator (23 mantissa bits;
@@ -46,7 +46,7 @@ layer does NOT expose either. The C++ kernel falls back to FP32
 tile-DM static storage to preserve the same precision invariant —
 the accumulator-to-FP32-store conversion is hardware-free per AM020
 Ch. 4 p. 65 ("Floating-Point Vector Unit"). This is documented in
-``gaps.yaml`` as a real RQ4 finding: hardware supports it; toolchain
+```` as a real RQ4 finding: hardware supports it; toolchain
 doesn't expose it.
 
 Op contract (FP32 in, FP32 out — keeps the encoder's FP32 interface):

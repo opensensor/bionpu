@@ -15,7 +15,7 @@
 
 """NPU dispatch backend — in-process pyxrt 3.14.
 
-Per the umbrella PRD §4.1 v1-thin contract, this module ships a
+Per the  §4.1 v1-thin contract, this module ships a
 **registered-op lookup table** plus a thin XRT-driven runner. There is
 register their own ops via the same pattern — they extend
 :data:`NPU_OPS` from their track-side modules.

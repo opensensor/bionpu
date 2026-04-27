@@ -4,7 +4,7 @@ This document records the design of
 `bionpu/kernels/basecalling/lstm_cell_bf16/` — the bf16 sibling of
 's FP32 scalar `lstm_cell` kernel. 's scope is **one
 custom kernel driven by profile data** (B-M6); the profile data is
-'s gaps.yaml (specifically ****: the 3rd-order Padé
+'s  (specifically ****: the 3rd-order Padé
 tanh approximation cumulatively drifts to end-to-end max-abs 2.303
 across the 5 LSTM × 200 timesteps).
 
@@ -115,7 +115,7 @@ on-tile weight residency.
   against the bf16 baseline this task produces.
 
 These are documented as `severity: cosmetic` deferral entries in
-`gaps.yaml` so future agents see the surface preserved.
+`` so future agents see the surface preserved.
 
 ## Validation gates (per task brief)
 

@@ -15,7 +15,7 @@
 
 """Measured-latency profile table.
 
-Per umbrella PRD §4.1: "A profile table populated by the benchmarking
+Per  §4.1: "A profile table populated by the benchmarking
 harness — measured latency for each (op, shape, device) tuple — that the
 dispatcher consults at compile time."
 
@@ -90,7 +90,7 @@ class ProfileTable:
     Lookups are exact-match on `(op, input_shape, output_shape, device)`.
     There is deliberately no fuzzy matching; if shapes differ even by
     one dim, treat it as "no measurement, fall back to CPU". v1 keeps
-    it thin (umbrella PRD §7).
+    it thin ( §7).
     """
 
     SCHEMA_VERSION = 1

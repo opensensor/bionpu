@@ -54,7 +54,7 @@ void dorado_fast_conv_stem_layer1_fp32(float *restrict signal_padded,
 
   // The scalar inner loop is intentionally simple for v1. AIE2P has bf16
   // vector intrinsics that would materially accelerate this (
-  // research target); the scalar path is correct-first per umbrella PRD
+  // research target); the scalar path is correct-first per 
   // §4.1's "v1-thin" mandate.
   AIE_PREPARE_FOR_PIPELINING
   AIE_LOOP_MIN_ITERATION_COUNT(8)

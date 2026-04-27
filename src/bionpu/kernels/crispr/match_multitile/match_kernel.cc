@@ -107,7 +107,7 @@ void crispr_match_multitile_match(uint8_t* __restrict guides,
 //
 // (Originally designed for 4 partials per CRISPR PRD §4.2 sketch; reduced
 // to 2 due to AIE2P's 2-input-DMA-channels-per-tile budget — see
-// gaps.yaml . The kernel scales to N_MATCH_TILES if a memtile
+//  . The kernel scales to N_MATCH_TILES if a memtile
 // aggregation stage is added in front of the joiner; left for .)
 void crispr_match_multitile_join(uint8_t* __restrict p0,
                                   uint8_t* __restrict p1,

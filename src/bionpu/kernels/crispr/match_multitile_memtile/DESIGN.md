@@ -11,7 +11,7 @@ joiner topology with:
 ```
 
 That's filed as in `bionpu/kernels/crispr/match_multitile/
-gaps.yaml`. Original interpretation: hardware silicon ceiling (compute
+`. Original interpretation: hardware silicon ceiling (compute
 tile = 2 input DMA channels per AM020 Ch. 2 p. 27). That's correct as a
 **compute-tile** statement.
 
@@ -129,4 +129,4 @@ AM020 documents AIE-ML (= AIE2). Our chip is AIE2P. Per the cross-walk's
   compute-tile 4D. IRON's `.join()` operator abstracts this; we
   don't directly invoke 5D primitives. If the IRON lowering for
   `.join()` doesn't fully exploit 5D (e.g. only emits 4D access
-  patterns), that's filed as a gap entry in `gaps.yaml`.
+  patterns), that's filed as a gap entry in ``.

@@ -108,7 +108,7 @@ N_WINDOWS = 4096
 
 # Fan-out: 2 match tiles × 64 guides each. (Original PRD §4.2 sketch was 4
 # tiles × 32 guides; reduced after hitting the AIE2P 2-input-DMA-channels
-# limit on the joiner — see gaps.yaml .)
+# limit on the joiner — see  .)
 N_MATCH_TILES = 2
 GUIDES_PER_TILE = N_GUIDES // N_MATCH_TILES  # 64
 

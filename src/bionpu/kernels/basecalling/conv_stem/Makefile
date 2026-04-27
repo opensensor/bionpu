@@ -10,9 +10,9 @@
 #
 # Required env (from CLAUDE.md / task brief):
 #   source /opt/xilinx/xrt/setup.sh
-#   source ~/xdna-bringup/ironenv/bin/activate
-#   export MLIR_AIE_DIR=~/xdna-bringup/mlir-aie
-#   export PEANO_INSTALL_DIR=~/xdna-bringup/ironenv/lib/python3.11/site-packages/llvm-aie
+#   source <ironenv>/bin/activate
+#   export MLIR_AIE_DIR=<xdna-bringup>/mlir-aie
+#   export PEANO_INSTALL_DIR=<ironenv>/lib/python3.11/site-packages/llvm-aie
 #
 # Targets:
 #   build/final_T${time}.xclbin   - vendored to bionpu/dispatch/_npu_artifacts

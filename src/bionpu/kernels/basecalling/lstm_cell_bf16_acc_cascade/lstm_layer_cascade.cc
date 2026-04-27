@@ -96,7 +96,7 @@ load_h_as_bf16(const float *restrict src) {
 //
 // Internal branches in this helper (init at (t==0,g==0,chunk==0); gate
 // seed at chunk==0; h_path on chunks 2/3) do NOT involve cascade
-// intrinsics, so per Followup E's silicon-validated invariant they do
+// intrinsics, so per 's silicon-validated invariant they do
 // NOT trigger the AIE2P firmware-side cascade-port watchdog.
 
 static inline void
@@ -241,10 +241,10 @@ lstm_final_chunk_state_update() {
 // FP32 (accfloat) per word. To cascade HIDDEN=96 floats per timestep
 // we issue HIDDEN_VECS=6 puts (or gets) at a final-chunk boundary.
 //
-// **Followup G note (Fix C invariant)**: these helpers MUST NOT be
+// ** note (Fix C invariant)**: these helpers MUST NOT be
 // called from a runtime-conditional context in any extern "C" caller
 // — they emit `vmov mcd` / `vmov scd` cascade-port intrinsics which
-// the AIE2P firmware's cascade-port watchdog (Followup C/E hypothesis,
+// the AIE2P firmware's cascade-port watchdog (/E hypothesis,
 // silicon-confirmed) requires to be unconditional within their
 // containing function.
 

@@ -251,7 +251,7 @@ int main(int argc, char **argv) {
               << "): " << theoretical_compressed_bytes << std::endl;
     // The measured wire bytes today equal the dense bytes — the
     // BD-emit pass currently writes Enable_Compression=0
-    // unconditionally. See gaps.yaml::.
+    // unconditionally. See ::.
     std::cout << "DMA measured wire bytes: " << dense_weight_bytes
               << " (degraded: BD-emit pass not yet plumbed)"
               << std::endl;

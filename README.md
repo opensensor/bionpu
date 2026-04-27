@@ -76,13 +76,21 @@ tests/                  pytest suite
 
 ## Status
 
-This is the v0.1 release of `bionpu` as a public asset. Active
-development happens upstream in opensensor's wider AMD-XDNA stack;
-this repo is a reproducible snapshot suitable for evaluation,
-verification, and external collaboration.
+This repository is the public release of work that's developed
+internally; the public version ships the kernels, dispatch infrastructure,
+verification harness, energy methodology, and the bench module. See
+[`docs/STATUS.md`](docs/STATUS.md) for the per-subsystem state — what
+runs end-to-end vs what's an extracted module that needs a driver
+script to drive it on hardware.
 
-See the [v0.1 release notes](https://github.com/opensensor/bionpu/releases/tag/v0.1)
-for the headline benchmark numbers.
+The headline contribution as of v0.1 is the byte-equality harness
+(`bionpu.verify`) — see [`src/bionpu/verify/README.md`](src/bionpu/verify/README.md).
+The energy methodology that backs every `J/Mbp` number we publish is
+in [`docs/ENERGY_METHODOLOGY.md`](docs/ENERGY_METHODOLOGY.md).
+
+Pre-computed benchmark results across multiple chromosomes are
+v0.2 scope and not yet committed; the methodology and reproduction
+scripts are in place so other hosts can produce comparable numbers.
 
 ## License
 

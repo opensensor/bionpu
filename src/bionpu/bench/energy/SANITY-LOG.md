@@ -376,7 +376,7 @@ external reviewer asks.
 
 ```
 source /opt/xilinx/xrt/setup.sh
-source ~/xdna-bringup/ironenv/bin/activate
+source <ironenv>/bin/activate
 pytest tests/test_t44_xrt_energy.py -m "not npu" -q       # all GREEN (fast)
 pytest tests/test_t44_xrt_energy.py -m npu -q             # all GREEN (10-20 s)
 python -m bionpu bench --all --device npu --iters 3       # writes results/u-m2/measurements.json

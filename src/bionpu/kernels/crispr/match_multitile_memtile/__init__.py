@@ -176,7 +176,7 @@ assert TILE_MEMORY_BYTES < _AIE2P_DM_BUDGET_BYTES, (
 )
 
 # Sanity: memtile fits AIE-ML's 512 KiB cap (AM020 Ch. 5 p. 74).
-# AIE2P's memtile size is unverified at this layer — see gaps.yaml.
+# AIE2P's memtile size is unverified at this layer — see .
 _AIEML_MEMTILE_BUDGET_BYTES = 512 * 1024
 assert MEMTILE_MEMORY_BYTES < _AIEML_MEMTILE_BUDGET_BYTES, (
     f"memtile memory {MEMTILE_MEMORY_BYTES} >= AIE-ML memtile cap "

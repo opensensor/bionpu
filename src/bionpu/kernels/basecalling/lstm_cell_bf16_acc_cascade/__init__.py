@@ -38,11 +38,11 @@ Cross-walk's strong prediction (per task brief ):
   narrowing is the actual wall. Weight scaling becomes Phase 3's surface
 .
 
-Both outcomes are publishable per the umbrella PRD §RQ4 protocol; the
+Both outcomes are publishable per the  §RQ4 protocol; the
 verdict is recorded in
 ``results/basecalling/b-m6d-cascade/measurements.json``.
 
-**Toolchain finding (T7-IRON resolution)**: Phase 1's
+**Toolchain finding ( resolution)**: Phase 1's
 ``cascade_stream.py`` was a placement-only wrapper; the cascade ops
 were declarative but the IRON Worker placement pass had to infer them
 from vertical adjacency. Phase 2's AccumFifo emits ``aie.cascade_flow``

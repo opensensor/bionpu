@@ -18,13 +18,13 @@
 Python (``aie.iron``) layer.
 
 This module sits **above** the installed wheel under
-``~/xdna-bringup/ironenv/lib/python3.11/site-packages/mlir_aie``. It does
+``<ironenv>/lib/python3.11/site-packages/mlir_aie``. It does
 not fork the wheel; it re-uses ``aie.iron.{Worker,ObjectFifo,Program,
 Runtime,Kernel}`` and the lower-level ``aie.dialects.aie`` op-builders,
 adding small helpers that compose those primitives into the dataflow
 patterns that AM020 documents but IRON doesn't expose directly.
 
-Surface (T7-IRON):
+Surface ():
 
 - :func:`cascade_stream_chain` — declarative IRON topology helper for
   AM020 Ch. 4 p. 67 cascade-stream chaining of N CoreTile workers

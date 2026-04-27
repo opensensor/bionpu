@@ -61,10 +61,26 @@ committed source on a clean clone.
 # Install (editable):
 pip install -e .
 
-# CRISPR scan against chr22 with byte-equality vs cas-offinder:
-bionpu scan --target chr22 --guides GUIDES.txt --verify
+# CRISPR scan on the CPU path (pure numpy; no NPU required):
+bionpu scan --target chr22.fa --guides GUIDES.txt \
+            --out /tmp/cpu_hits.tsv --device cpu
+
+# Same scan on the NPU path. When the kernel artifacts are not built,
+# the kernel's host-emulation fallback produces output byte-equal to
+# the silicon path. When the artifacts are built (make NPU2=1 in the
+# kernel directory), dispatches to AIE2P silicon.
+bionpu scan --target chr22.fa --guides GUIDES.txt \
+            --out /tmp/npu_hits.tsv --device npu \
+            --verify reference/crispr/casoffinder-chr22-canonical.tsv
+# → result EQUAL on byte-equality (exit 0) or DIVERGENT (exit 1).
+
+# Or compare the two paths against each other to demonstrate they
+# produce bit-identical output:
+bionpu verify crispr /tmp/cpu_hits.tsv /tmp/npu_hits.tsv
 
 # Basecall a pod5 file with byte-equality vs Dorado reference:
+# (basecall is v0.2+ scope; the kernels are extracted but the
+# streaming-pipeline driver is not yet wired)
 bionpu basecall --pod5 reads.pod5 --verify
 ```
 

@@ -84,39 +84,59 @@ def _cmd_verify_basecalling(args: argparse.Namespace) -> int:
 def _cmd_scan(args: argparse.Namespace) -> int:
     """Run a CRISPR off-target scan and emit a canonical TSV.
 
-    v0.1: pure-CPU implementation via :mod:`bionpu.scan`. NPU dispatch
-    is v0.2 scope; passing ``--device npu`` exits with a clear pointer.
+    v0.1: pure-CPU implementation via :func:`bionpu.scan.cpu_scan`.
+    v0.2: NPU implementation via :func:`bionpu.scan.npu_scan` (PAM-filter
+    kernel dispatched through :mod:`bionpu.dispatch`). The NPU path
+    requires the kernel artifacts to be built — see the
+    :class:`bionpu.dispatch.npu.NpuArtifactsMissingError` message
+    if they are not.
     """
-    if args.device == "npu":
-        print(
-            "bionpu scan --device npu: NPU dispatch is v0.2 scope. The "
-            "kernels at src/bionpu/kernels/crispr/ are buildable via "
-            "'make NPU2=1' and runnable through the per-kernel host_runner; "
-            "what's missing is the unified scan driver. v0.1 ships the "
-            "CPU path (--device cpu, the default) which produces output "
-            "byte-equal to the NPU path's canonical TSV.",
-            file=sys.stderr,
-        )
-        return 2
-
     from .data.canonical_sites import normalize, write_tsv
-    from .scan import cpu_scan, parse_guides, read_fasta
+    from .scan import cpu_scan, npu_scan, parse_guides, read_fasta
 
     chrom, seq = read_fasta(args.target)
     guides = parse_guides(args.guides)
 
     print(
-        f"bionpu scan: chrom={chrom!r}, seq={len(seq):,} nt, "
+        f"bionpu scan [{args.device}]: chrom={chrom!r}, seq={len(seq):,} nt, "
         f"guides={len(guides)}, max_mismatches={args.max_mismatches}",
         file=sys.stderr,
     )
-    rows = cpu_scan(
-        chrom=chrom,
-        seq=seq,
-        guides=guides,
-        pam_template=args.pam,
-        max_mismatches=args.max_mismatches,
-    )
+
+    if args.device == "npu":
+        from .dispatch.npu import NpuArtifactsMissingError
+        try:
+            rows = npu_scan(
+                chrom=chrom,
+                seq=seq,
+                guides=guides,
+                pam_template=args.pam,
+                max_mismatches=args.max_mismatches,
+                op_name=args.op,
+            )
+        except NpuArtifactsMissingError as exc:
+            print(
+                f"bionpu scan --device npu: kernel artifacts missing.\n"
+                f"  {exc}\n"
+                f"\n"
+                f"Build the kernel:\n"
+                f"  cd src/bionpu/kernels/crispr/pam_filter && make NPU2=1\n"
+                f"\n"
+                f"Then either copy the produced build/{{early,late}}/final.xclbin\n"
+                f"and insts.bin into bionpu/dispatch/_npu_artifacts/ or set\n"
+                f"BIONPU_KERNEL_ARTIFACTS_DIR to the directory containing them.",
+                file=sys.stderr,
+            )
+            return 3
+    else:
+        rows = cpu_scan(
+            chrom=chrom,
+            seq=seq,
+            guides=guides,
+            pam_template=args.pam,
+            max_mismatches=args.max_mismatches,
+        )
+
     rows = normalize(rows)
     out_path = pathlib.Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -221,7 +241,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--device",
         choices=["cpu", "npu"],
         default="cpu",
-        help="Compute device. v0.1 ships --device cpu; --device npu is v0.2 scope.",
+        help="Compute device. cpu = pure-numpy fallback; npu = AIE2P PAM-filter kernel.",
+    )
+    p_scan.add_argument(
+        "--op",
+        default="crispr_pam_filter_early",
+        choices=["crispr_pam_filter_early", "crispr_pam_filter_late"],
+        help=(
+            "NPU op variant (only meaningful with --device npu). "
+            "filter-early is the production path; filter-late is a "
+            "comparison artifact with the same output bytes but "
+            "different on-tile work distribution."
+        ),
     )
     p_scan.add_argument(
         "--verify",

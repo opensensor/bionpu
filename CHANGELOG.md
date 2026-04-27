@@ -70,12 +70,24 @@ project-internal task IDs, and structured as a defensible asset.
 
 [Xilinx/mlir-aie #3039]: https://github.com/Xilinx/mlir-aie/pull/3039
 
+### Added (post-shell, in-progress toward v0.2)
+
+- **`bionpu scan --device npu`** — full driver wired. The PAM-filter
+  + threshold + sparse-emit kernel is dispatched through
+  `bionpu.dispatch.lookup_npu_op` once per chunk; the kernel's
+  host-emulation fallback runs when the AIE2P artifacts are absent
+  (so the command works on any host, no NPU required for a CI demo).
+  CPU and NPU paths produce byte-equal canonical TSVs on the same
+  input; this is now locked in by
+  `tests/test_scan.py::test_cpu_and_npu_paths_byte_equal_on_*`.
+
 ### Deferred to v0.2
 
-- End-to-end driver scripts for `bionpu scan` / `bionpu basecall`
-  (kernels are extracted and individually buildable; what's missing
-  is the top-level Python that ties scan input → NPU dispatch →
-  output → verify into one CLI invocation).
+- End-to-end driver scripts for `bionpu basecall` (the basecalling
+  kernels are extracted and individually buildable; what's missing is
+  the streaming pipeline driver that ties pod5 → chunker → NPU
+  dispatch → stitcher → decoder → FASTQ → verify into one CLI
+  invocation).
 
 - Pre-computed `benchmarks/results/{crispr,basecalling}/*.json`
   snapshots for chr1 / chr19 / chr22 / a representative pod5.

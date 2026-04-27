@@ -136,3 +136,80 @@ def test_pam_other_than_ngg_raises() -> None:
             guides=[GuideSpec(spacer="A" * 20, guide_id="g")],
             pam_template="NAG",
         )
+
+
+# ---------------------------------------------------------------------------
+# CPU ↔ NPU cross-equivalence — locks in the byte-equality contract.
+#
+# When the kernel artefacts are not present, the NPU op falls back to the
+# kernel's host-emulation path, which produces output byte-equal to the
+# real NPU dispatch by construction (same arithmetic). The CPU and NPU
+# paths therefore must produce byte-equal canonical TSVs on the same
+# input — this is the load-bearing v0.2 claim.
+# ---------------------------------------------------------------------------
+
+import random
+
+
+def _seeded_target_with_known_matches() -> tuple[str, list[GuideSpec]]:
+    """Build a synthetic target seeded with one perfect-match and one
+    1-mismatch hit on the forward strand for a single guide."""
+    random.seed(2026)
+    bases = "ACGT"
+    guide = "AAACCCGGGTTTACGTACGT"
+    prefix = "".join(random.choice(bases) for _ in range(100))
+    mid = "".join(random.choice(bases) for _ in range(200))
+    suffix = "".join(random.choice(bases) for _ in range(2000))
+    seq = (
+        prefix
+        + guide + "AGG"  # exact match + AGG (NGG) at position 100
+        + mid
+        + "AAACCCGGGTTTACGTACGA" + "CGG"  # 1 mismatch at last spacer position
+        + suffix
+    )
+    return seq, [GuideSpec(spacer=guide, guide_id="g_seeded")]
+
+
+def test_cpu_and_npu_paths_byte_equal_on_seeded_target() -> None:
+    """The headline contract: cpu_scan and npu_scan produce byte-equal output."""
+    from bionpu.scan import npu_scan
+    from bionpu.data.canonical_sites import normalize, serialize_canonical
+
+    seq, guides = _seeded_target_with_known_matches()
+    cpu_rows = normalize(cpu_scan(
+        chrom="chr_seeded", seq=seq, guides=guides, max_mismatches=4,
+    ))
+    npu_rows = normalize(npu_scan(
+        chrom="chr_seeded", seq=seq, guides=guides, max_mismatches=4,
+    ))
+    cpu_blob = serialize_canonical(cpu_rows)
+    npu_blob = serialize_canonical(npu_rows)
+    assert cpu_blob == npu_blob, (
+        f"CPU and NPU paths diverged.\n"
+        f"CPU bytes: {len(cpu_blob)}, NPU bytes: {len(npu_blob)}\n"
+        f"--- CPU ---\n{cpu_blob.decode()}\n--- NPU ---\n{npu_blob.decode()}"
+    )
+    # Should have at least the seeded perfect + 1-mismatch match.
+    assert len(cpu_rows) >= 2
+
+
+def test_cpu_and_npu_paths_byte_equal_on_random_target() -> None:
+    """Same byte-equality contract on a random sequence (no seeded matches).
+
+    Looser threshold so we get hits in random data; this exercises the
+    code path with many small mismatches per row.
+    """
+    from bionpu.scan import npu_scan
+    from bionpu.data.canonical_sites import normalize, serialize_canonical
+
+    random.seed(1234)
+    bases = "ACGT"
+    seq = "".join(random.choice(bases) for _ in range(5000))
+    guides = [GuideSpec(spacer="A" * 20, guide_id="g_polyA")]
+    cpu_rows = normalize(cpu_scan(
+        chrom="chr_rand", seq=seq, guides=guides, max_mismatches=10,
+    ))
+    npu_rows = normalize(npu_scan(
+        chrom="chr_rand", seq=seq, guides=guides, max_mismatches=10,
+    ))
+    assert serialize_canonical(cpu_rows) == serialize_canonical(npu_rows)

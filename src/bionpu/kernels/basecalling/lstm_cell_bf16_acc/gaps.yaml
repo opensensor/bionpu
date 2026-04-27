@@ -1,0 +1,57 @@
+schema_version: "1.0.0"
+# files entries here even though the aggregator de-duplicates
+# by task_id and 's gaps.yaml at
+# `bionpu/kernels/basecalling/lstm_cell_bf16/gaps.yaml` is discovered
+# first (alphabetic sort before `_acc`). The aggregator's first-seen
+# semantics will hide these from the rendered umbrella summary while
+# preserving them on disk for downstream readers (and for the next
+# re-aggregation that incorporates the new task_id ""
+# entries below). Gap-id range G- is reserved for 
+# findings.
+task_id: ""
+kernel_name: "dorado_fast_lstm_cell_bf16_acc"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T12:30:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+gaps:
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "Accumulator-to-accumulator (AM-to-AM) register move primitive for cross-timestep recurrent state persistence in IRON"
+    attempted: "Per AM020 Ch. 4 p. 67 ('Register Move Functionality'), AIE-ML / AIE2P CoreTile supports a 512-bit accumulator-to-accumulator register move in one cycle. The cross-walk's recommended design persists h, c in BM accumulator registers (1024-bit) across timesteps via this primitive, narrowing to bf16 only at matmul-input boundaries. The IRON layer was inspected for an exposed `Worker.persist_accumulator(...)` / `acc.move(...)` / equivalent API; none was found."
+    failed_with: null
+    root_cause: "IRON ObjectFifo + Worker abstraction models per-tile compute as a stateless function; persistent on-tile state is exposed only via static C++ storage in the kernel object (the path uses for h/c at bf16, and that uses at FP32 — see lstm_cell_bf16_acc.cc). The hardware-level accumulator-register persistence and AM-to-AM register move primitive (AM020 Ch. 4 p. 67) are not surfaced in IRON's lowering. A lower-level IRON-RT or hand-coded MLIR path would expose the primitive directly; not viable for v1."
+    workaround: "Hold h, c, gate_acc as **FP32 static arrays** in tile DM (not bf16). The accumulator-to-FP32-store conversion (`acc.to_vector<float>`) is hardware-free per AM020 Ch. 4 p. 65 ('Floating-Point Vector Unit'), so the precision invariant — 23 mantissa bits across timesteps — is preserved. The functional difference vs the AM-register-resident path is purely cycle-level (an extra DM round-trip per timestep); the precision is identical. measures this fallback path's accuracy and uses it as the load-bearing baseline."
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "Cascade stream (inter-tile 512-bit accumulator transfer) for layer-N→layer-N+1 LSTM state in IRON"
+    attempted: "Per AM020 Ch. 4 p. 67 ('Cascade stream connects the AIE-MLs in a chain and allows the AIE-MLs to transfer an accumulator register (512-bit) from one to the next'), the AIE-ML grid supports vertical AND horizontal cascade (AM020 Appendix A p. 80, Figure 45) at 512 bits per cycle with no precision loss. The cross-walk's design cascade-streams the layer-N output BM accumulator state into layer-N+1's input. The IRON lowering was inspected for a `cascade_in` / `cascade_out` / equivalent API on Worker; none surfaces this primitive on AIE2P."
+    failed_with: null
+    root_cause: "Same root cause as : IRON's Worker/ObjectFifo abstraction is per-tile; inter-tile communication is via ObjectFifo (DMA-mediated), not via the hardware cascade stream. A lower-level lowering would expose the cascade primitive directly."
+    workaround: "Composite op `lstm_stack_bf16_acc` chains 5 cells via host-side dispatch (each cell's bf16 output is read back to host, host-side flips for alternating-direction Bonito pattern, fed back as bf16 input to the next cell). The inter-layer boundary loses one bf16 round-trip per layer (5 narrowings end-to-end) — small compared to the within-layer recurrence (~1000 narrowings for 's all-bf16 path). The per-layer-FP32-state preservation **within** each cell is the dominant precision win delivers; cross-layer FP32-via-cascade is the deferred follow-up."
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"
+  - id: ""
+    category: "tooling"
+    op_or_pattern: "passport.schema.json `precision` enum lacks `mixed-fp32-state` / `bfloat16-mixed`"
+    attempted: "Setting `precision: \"mixed-fp32-state\"` (or any non-int variant) in PASSPORT.json for the kernel."
+    failed_with: "jsonschema.exceptions.ValidationError: 'mixed-fp32-state' is not one of ['int8', 'int16']"
+    root_cause: "'s passport.schema.json was authored before explored bf16 / mixed precision; the precision enum is `[int8, int16]` only. Same root cause as 's . Per task brief is forbidden from modifying 's schema."
+    workaround: "Use `precision: \"int16\"` (the closest legal 16-bit value) and document the actual datatype discipline in `accuracy_metrics.precision_actual` and `accuracy_metrics.{matmul_input, matmul_accumulator, h_c_storage}` keys. will revisit when extending the schema for the INT8 sweep."
+    upstream_issue: null
+    blocks: []
+    severity: "cosmetic"
+  - id: ""
+    category: "performance"
+    op_or_pattern: " mixed-precision LSTM cell: numerical floor on synthetic Gaussian weights"
+    attempted: "Per the cross-walk's predicted bound (`docs/.md` 'Recommended ' section): per-cell max-abs vs FP32 reference < 1e-3 on synthetic random weights (predicted: FP32 accumulator + bf16 multiplier inputs hits this on most LSTMs). Measured: per-cell global max-abs 5.15e-2 on synthetic seed 20260425 (vs 's 5.35e-2 on the same seed — marginal improvement)."
+    failed_with: null
+    root_cause: "On synthetic Gaussian random weights, per-cell drift is dominated by the **bf16 multiplier-input narrowing** at matmul time, not by the recurrent-state writeback. Each ~96-tap dot product accumulates ~sqrt(96)·8e-3 = ~8e-2 of bf16 quant noise before the activation; this is the same ceiling hits because the multiplier-input narrowing is unchanged in the mixed-precision design. The cross-walk's predicted 100× improvement materializes only when the recurrent-state narrowing is the dominant drift contributor — true for **trained** weights with strong inter-step correlation, but NOT for the i.i.d. Gaussian synthetic seed used in canary 1."
+    workaround: "Per-cell synthetic weight bound is recorded as a finding (5.15e-2 single-cell vs 's 5.35e-2 single-cell on the same seed — confirms multiplier-input drift, not state-writeback drift, dominates on synthetic Gaussian weights). The load-bearing test is the **end-to-end encoder on real Dorado fast weights**, where measured 2.458 max-abs and the cross-walk predicts ~10-100× improvement. 's encoder canary is the falsifiable test for the cross-walk's prediction."
+    upstream_issue: null
+    blocks: []
+    severity: "cosmetic"

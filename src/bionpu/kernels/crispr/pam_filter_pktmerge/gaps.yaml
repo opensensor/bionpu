@@ -1,0 +1,434 @@
+# gaps.yaml — toolchain-gap report (PAM-filter pktMerge retrofit).
+# Schema: bionpu/report/gaps.schema.json (v1.0.0).
+# Convention: bionpu/kernels/GAPS-CONVENTION.md.
+
+schema_version: "1.0.0"
+task_id: ""
+kernel_name: "crispr_pam_filter_pktmerge"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T16:21:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+
+gaps:
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "PacketFifo integration with iron.Program.resolve_program() tile-collection walk"
+    attempted: |
+       attempted to wire the variable-rate PacketFifo edge directly
+      into the live IRON Program (Tile A → match tiles via pktMerge in
+      fabric, with a 1-bit valid header gating the merge). The fork's
+       PacketFifo lands the API surface + packetflow lowering
+      correctly (`tests/test_iron_packet_fifo.py` all green) — the
+      class accepts the canonical filter-early construction with
+      `header_dtype="uint8"`, `merge_strategy="round-robin"`,
+      `keep_pkt_header=False` (finish-on-TLAST). Constructed the
+      topology, wired Worker.fn_args with PacketFifoHandle returned
+      from `pf.prod(0)` / `pf.cons(i)`, and called
+      `Program(dev, rt).resolve_program()`.
+    failed_with: |
+      AttributeError: 'Tile' object has no attribute 'tile'
+      File "iron/program.py", line 81 in device_body:
+        all_tiles.extend([e.tile for e in f.all_of_endpoints()])
+    root_cause: |
+      `iron/program.py`'s tile-collection walk does
+      `[e.tile for e in fifo.all_of_endpoints()]` expecting
+      endpoint-typed objects (each carrying a `.tile` attribute), but
+      `PacketFifoHandle.all_of_endpoints()` returns Tile objects
+      directly (per the fork's `python/iron/packet.py` line 813-822).
+      ObjectFifo wraps producers/consumers in
+      `ObjectFifoEndpoint` objects which DO carry `.tile`; PacketFifo
+      treats producers/consumers as Tiles directly because the
+      packetflow lowering is per-(producer-tile, consumer-tile)
+      routing entry, not per-endpoint-pair like ObjectFifo's shared-
+      memory + lock model. Closing this requires either:
+        (a) modifying the fork's `iron/program.py` to special-case
+            Tile-typed endpoints (or wrap them at collection time);
+        (b) modifying the fork's `iron/packet.py` to wrap the Tile
+            list in synthetic endpoint objects with `.tile`;
+        (c) a deeper refactor unifying the endpoint shape across
+            ObjectFifo / PacketFifo / CascadeFifo / AccumFifo.
+      All three are upstream lifts beyond 's "OUTER REPO ONLY"
+      scope per the Phase 2 plan entry.
+    workaround: |
+      The retrofit ships in two layers:
+        1. **Live IRON Program** (`pam_filter_pktmerge.py`'s
+           `crispr_pam_filter_pktmerge` function): the byte-equal
+           twin of filter-early. Uses the same ObjectFifo
+           wiring uses; produces a buildable xclbin that runs
+           on AIE2P silicon (verified — `test_dispatch_smoke_pktmerge`
+           PASS, ~6.14 s per 4096-window launch). Output is byte-
+           identical to 's filter-early + filter-late on the
+           same input by construction (same arithmetic, same chunk
+           geometry).
+        2. **PacketFifo topology declaration** (`pktmerge_topology()`
+           helper): the canonical topology constructed at
+           API-surface level. Ratifies that the fork's 
+           PacketFifo class accepts the canonical filter-early
+           construction. Documents the silicon-level wiring target;
+            tracks replacing the ObjectFifo data path.
+
+      Throughput verdict (recorded in
+      `results/crispr/c-m5-pktmerge/measurements.json`): the live-
+      program ratio vs filter-early is ~1.00× (same xclbin
+      arithmetic; pktMerge fabric filtering not in effect on the
+      live path). The cross-walk's predicted ~7/8 reduction stays
+      a falsifiable claim — testable once replaces the
+      ObjectFifo `windows_out` edge with a packetized stream path.
+      Honest-deviation reporting per Phase 2 plan: predicted vs
+      actual + verdict + root cause.
+
+      **CLOSED 2026-04-26**: fork-side PacketFifo resolve now uses the
+      live Worker endpoint tiles recorded on `PacketFifoHandle`, not
+      the constructor Tile objects. `tests/test_iron_packet_fifo.py::
+      test_packet_fifo_resolve_emits_packet_flow` covers the minimal
+      resolve case. The CRISPR live generator no longer emits PacketFifo
+      as a sidecar because that was proven to be the wrong integration
+      shape; see .
+    upstream_issue: null
+    status: "closed"
+    closed_by_fork_branch: "feature/-fifohandle-fix"
+    closed_by_fork_commit: "local follow-up: PacketFifo.resolve live endpoint tiles"
+    blocks: []
+    severity: "workaround"
+
+  - id: ""
+    category: "resource-conflict"
+    op_or_pattern: "PacketFifo packetflow sidecar coexisting with ObjectFifo byte-equal data path"
+    attempted: |
+      Enabled the retired `BIONPU_T33_LIVE_PACKETFLOW=1` path and rebuilt
+      the CRISPR pktmerge artifact with `make NPU2=1 all`. The generator
+      resolved and emitted packetflow MLIR, proving was no
+      longer the blocker, but the packetflow was only a sidecar.
+    failed_with: |
+      aiecc routing failure:
+
+        'aie.connect' op ; connecting (South: 3) to (DMA: 0) on
+        TileID(0, 3) targets same dst as another connect op; existing
+        destinations: (North: 5), (DMA: 0)
+
+      The failing MLIR has both the byte-equal ObjectFifo route and the
+      opt-in PacketFifo route live at once.
+    root_cause: |
+      The current pktmerge live program still moves `windows_out`
+      through ObjectFifo so the existing C++ match kernels can consume
+      memrefs. Adding PacketFifo as a sidecar packetflow consumes the
+      same limited match-tile stream/DMA destinations already occupied
+      by ObjectFifo routes for guides/windows. On the two-match-tile
+      topology there is no spare destination channel for a sidecar
+      PacketFifo without changing the real data path.
+
+      Follow-up correction (2026-04-26): the valid/drop header model was
+      also wrong for the current fork. PacketFifo packet IDs are assigned
+      per producer by the packetflow lowering, not per packet. Therefore
+      CRISPR cannot emit invalid windows with PACKET_ID_INVALID and rely
+      on fabric-side drop. The implementable replacement contract is:
+      Tile A emits only PAM-passing windows, and each valid packet carries
+      original window_idx + spacer bytes so sparse output coordinates stay
+      stable after variable-rate compaction.
+    workaround: |
+      Remove the sidecar from the live CRISPR generator. Keep PacketFifo
+      coverage in the fork-level minimal tests and keep
+      `pktmerge_topology()` as a topology/API declaration. The replacement
+      path is now `DIRECT_STREAM=1`: it removes the fixed-rate `windows_out`
+      payload path, emits explicit core-to-core stream routes, and uses
+      packetized stream kernel symbols instead of threading an unused
+      PacketFifo handle beside ObjectFifo traffic. The corrected ABI is
+      encoded in `pktmerge_replacement_contract()` and
+      `tests/test_pam_filter_pktmerge_npu.py::
+      test_pktmerge_replacement_contract_skips_invalid_windows`.
+
+      **CLOSED 2026-04-26**: the live sidecar packetflow path is retired.
+      `tests/test_pam_filter_pktmerge_npu.py::
+      test_generator_does_not_emit_sidecar_packetflow` guards against
+      reintroducing it. Remaining work is not "make the sidecar route";
+      it is "promote and time the replacement stream data path".
+    upstream_issue: null
+    status: "closed"
+    blocks: []
+    severity: "blocker"
+
+  - id: ""
+    category: "backend-lowering"
+    op_or_pattern: "Pure MLIR aie.put_stream / aie.get_stream packet loops"
+    attempted: |
+      Re-authored the CRISPR packetized replacement path to bypass ADF C++
+      stream pointers and lower packet transfers directly to MLIR
+      `aie.put_stream` / `aie.get_stream`. Tested i32, i64, and i128 stream
+      word forms on AIE2P.
+    failed_with: |
+      The i32 form verifies only when stream ops are emitted directly under
+      `aie.core`, which forced full unrolling of the per-packet transfer
+      loops. The 4096-window direct-stream program generated about 153k
+      lines of MLIR, 12,288 `aie.put_stream` ops, and 24,576
+      `aie.get_stream` ops.
+
+      The i64 form fails verifier:
+
+        'aie.put_stream' op operand #1 must be 32-bit float or 32-bit
+        signless integer or 128-bit signless integer, but got 'i64'
+
+      The i128 form verifies and routes, but full AIE2P lowering fails
+      because the backend tries to call wide stream intrinsics that are not
+      declared in this Peano/LLVM-AIE stack:
+
+        llvm.aie2p.put.wms
+        llvm.aie2p.get.wss
+    root_cause: |
+      The AIE dialect stream ops are not a good loop-level abstraction in
+      this stack. The legal 32-bit form lowers to available AIE2P backend
+      intrinsics (`llvm.aie2p.put.ms` / `llvm.aie2p.get.ss`) but forces
+      in-core unrolling when emitted from Python MLIR construction. The
+      wider forms either are illegal (`i64`) or reach missing AIE2P wide
+      intrinsic declarations (`i128`).
+    workaround: |
+      Move the per-packet stream loops into Peano C++ and keep IRON/MLIR
+      responsible only for compact chunk loops plus explicit core stream
+      routes. `tile_a_pktmerge.cc` now uses `<aie2p/aie2p_streams.h>` and
+      the 32-bit AIE2P intrinsics directly:
+
+        crispr_pam_filter_tile_a_pktmerge_stream_i32
+        crispr_match_multitile_match_packetized_stream_i32
+
+      This avoids `<adf.h>`, `input_stream<>`, `output_stream<>`,
+      `readincr`, and `writeincr`. `DIRECT_STREAM=1` now emits a 166-line
+      `build/aie.mlir` with zero `aie.put_stream` and zero `aie.get_stream`
+      ops, verifies with `aie-opt --verify-diagnostics`, routes with
+      pathfinder, and builds `build/final.xclbin` successfully.
+    upstream_issue: null
+    status: "closed"
+    blocks: []
+    severity: "workaround"
+
+  - id: ""
+    category: "silicon-ratification"
+    op_or_pattern: "Promotion and timing of DIRECT_STREAM packetized replacement"
+    attempted: |
+      Built the opt-in `DIRECT_STREAM=1` replacement xclbin after moving the
+      stream loops into Peano C++ intrinsics. Verified the compact generated
+      MLIR shape, `aie-opt --verify-diagnostics`, pathfinder routing, Peano
+      object compilation, and full `build/final.xclbin` generation.
+    failed_with: null
+    root_cause: |
+      The packetized replacement path is now buildable but has not yet been
+      promoted to the default vendored dispatch artifact or measured on the
+      CRISPR NPU throughput tests. The default `crispr_pam_filter_pktmerge`
+      artifact therefore remains the byte-equal filter-early twin.
+    workaround: |
+      Treat `DIRECT_STREAM=1` as the silicon timing candidate. A separate
+      artifact slot now exists at
+      `bionpu/dispatch/_npu_artifacts/crispr_pam_filter_pktmerge_direct_stream/`
+      and is registered as `crispr_pam_filter_pktmerge_direct_stream`.
+      Targeted byte-equality canaries pass on silicon:
+
+        * random fixture: 0 NPU hits == 0 host hits, ~0.83 ms
+          after persistent-worker fix;
+        * one valid window total: 128 NPU hits == 128 host hits, ~1.3 ms;
+        * one valid window per chunk: 8192 NPU hits == 8192 host hits,
+          ~0.52 ms after persistent-worker fix.
+
+      Full serial throughput comparison now runs. The random empty-hit
+      fixture is byte-equal but slightly slower than filter-early
+      (~0.91x early/direct). The one-valid-window-per-chunk fixture is
+      byte-equal and faster than filter-early (~1.45x early/direct).
+      This is a positive timing signal, but still below the original 4-8x
+      envelope and needs broader fixture coverage before promotion.
+    upstream_issue: null
+    status: "open"
+    blocks:
+      - "CRISPR 4-8x pktMerge speedup"
+    severity: "blocker"
+
+  - id: ""
+    category: "runtime-protocol"
+    op_or_pattern: "Direct-stream chunks with zero valid packets"
+    attempted: |
+      Ran the direct-stream artifact on a deterministic one-valid-window
+      fixture: one NGG perfect-match window in chunk 0 and no valid windows
+      in the remaining chunks.
+    failed_with: |
+      Before the sentinel fix, the run returned no records after roughly
+      90 s even though host expected 128 hits. A later comparative run
+      triggered an amdxdna TDR while still executing the direct-stream
+      host_runner:
+
+        aie2_tdr_work: Device isn't making progress... timeout 30
+    root_cause: |
+      The direct-stream route needs a regular per-chunk stream receive
+      protocol. When Tile A emitted no packet words for zero-valid chunks
+      and match tiles skipped `get_ss_int()` because the sideband count was
+      zero, sparse valid chunks could be lost and the runtime could stop
+      making progress.
+    workaround: |
+      Closed 2026-04-26 by emitting one sentinel packet for empty chunks:
+      `window_idx == UINT32_MAX`, spacer words zero, sideband count one.
+      Match tiles consume the sentinel normally, and Tile Z skips sentinel
+      records before threshold/emit. The focused NPU regression
+      `tests/test_pam_filter_pktmerge_npu.py::
+      test_direct_stream_npu_one_valid_window_byte_equal_to_host` now
+      passes: 128 NPU hits == 128 host hits, ~1.3 ms.
+    upstream_issue: null
+    status: "closed"
+    blocks: []
+    severity: "blocker"
+
+  - id: ""
+    category: "runtime-protocol"
+    op_or_pattern: "Direct-stream artifact repeated host_runner iterations"
+    attempted: |
+      Ran the serial throughput comparison requested for the direct-stream
+      replacement against filter-early using the same synthetic random
+      fixture and `n_iters=3, warmup=1`.
+    failed_with: |
+      The direct-stream host_runner did not return from the first compared
+      call and the driver reported a TDR:
+
+        aie2_tdr_work: Device isn't making progress... timeout 30
+        Dumping ctx ctx.89013.1
+        fence: unsignaled
+        out_fence: unsignaled
+
+      The process was:
+
+        crispr_pam_filter_pktmerge_direct_stream/host_runner
+        --iters 3 --warmup 1
+    root_cause: |
+      The direct-stream workers were created with `while_true=False`, so the
+      first host_runner iteration could complete but the worker cores did not
+      persist for later runtime launches in the same loaded context. The
+      default CRISPR programs use persistent workers, which is why their
+      host_runner iteration loop is reusable.
+    workaround: |
+      Closed 2026-04-26 by removing `while_true=False` from the direct-stream
+      Tile A, match-tile, and Tile Z workers. The rebuilt direct-stream xclbin
+      passes the original repro with `n_iters=3, warmup=1`:
+
+        * random fixture: 0 NPU hits == 0 host hits, avg ~832 us;
+        * serial compare vs filter-early: direct ~827 us, early ~752 us,
+          byte-equal, ratio early/direct ~0.91x;
+        * one-valid-window-per-chunk compare: direct ~516 us, early ~748 us,
+          byte-equal, ratio early/direct ~1.45x.
+    upstream_issue: null
+    status: "closed"
+    blocks: []
+    severity: "blocker"
+
+  - id: ""
+    category: "runtime-protocol"
+    op_or_pattern: "Direct-stream single Core:0 fanout under dense valid-window traffic"
+    attempted: |
+      Ran a direct-stream benchmark matrix to separate sentinel-only overhead,
+      valid-window stream/match traffic, and sparse emit traffic. Each case
+      used the vendored `crispr_pam_filter_pktmerge_direct_stream` artifact
+      against filter-early with `n_iters=3, warmup=1`.
+
+      Completed rows:
+
+        * nohit, 0 valid/chunk: direct ~292 us, early ~687 us,
+          ratio early/direct ~2.35x, byte-equal;
+        * nohit, 1 valid/chunk: direct ~326 us, early ~670 us,
+          ratio early/direct ~2.06x, byte-equal;
+        * nohit, 4 valid/chunk: direct ~769 us, early ~690 us,
+          ratio early/direct ~0.90x, byte-equal.
+
+      The next denser nohit row (`16 valid/chunk`) TDR'd.
+    failed_with: |
+      amdxdna TDR while executing the direct-stream host_runner:
+
+        aie2_tdr_work: Device isn't making progress... timeout 30
+        Dumping ctx ctx.92621.1
+        JOB[0] fence: unsignaled
+        JOB[0] out_fence: unsignaled
+
+      The Python wrapper then raised `subprocess.TimeoutExpired` for the
+      direct-stream host_runner after 120 seconds.
+    root_cause: |
+      Open. The single Tile-A `put_ms` stream is routed as a Core:0 fanout to
+      both match tiles. That route is correct and fast for sentinel-only and
+      extremely sparse traffic, but it becomes slower around four valid
+      windows per 64-window chunk and stalls/TDRs at denser traffic.
+
+      The current Peano AIE2P C++ stream helper exposes `put_ms` /
+      `get_ss_int` only for the single master/slave stream; it does not expose
+      a stream-port argument that would let Tile A duplicate packet words onto
+      two independent explicit streams. Therefore the obvious "replace fanout
+      with two independent streams" experiment is blocked at this ABI layer.
+    workaround: |
+      Treat the current direct-stream path as a sparse-PAM candidate only. Do
+      not promote it as the default CRISPR path until dense valid-window
+      traffic is handled.
+
+      Follow-up implemented 2026-04-26: `COMPACT_PACKETS=1` replaces the
+      direct stream fanout with a counted compact-packet ObjectFifo and
+      registers the separate `crispr_pam_filter_pktmerge_compact_packets`
+      artifact. The first version used `memref<97xi64>` and three logical
+      words per valid window. A second ABI pass moved the local window index
+      into the high byte of the second spacer word, shrinking the packet FIFO
+      to `memref<65xi64>` and compact partials to 65 bytes/record without
+      adding a Tile A output FIFO. This path passes build, verify, route, and
+      live-NPU canaries. In the no-hit density matrix it remains byte-equal
+      and does not TDR at 16 valid/chunk:
+
+        * 0 valid/chunk: compact ~171 us, early ~724 us,
+          ratio early/compact ~4.25x;
+        * 1 valid/chunk: compact ~240 us, early ~680 us,
+          ratio early/compact ~2.84x;
+        * 4 valid/chunk: compact ~704 us, early ~683 us,
+          ratio early/compact ~0.97x;
+        * 16 valid/chunk: compact ~2553 us, early ~1857 us,
+          ratio early/compact ~0.73x.
+
+      This is the better robust route, but not yet a default-promotion result:
+      sparse chunks speed up, dense PAM-pass chunks remain slower than
+      filter-early.
+
+      Remaining candidate experiments:
+
+        * use packet headers / packet-switched routes if the backend supports
+          explicit destination IDs from Peano C++;
+        * reduce dense-valid per-record work in the compact match/emit path;
+        * split the work into two Tile-A producer phases/artifacts, one per
+          match tile, if the toolchain can expose separate master streams.
+    upstream_issue: null
+    status: "open"
+    blocks:
+      - "CRISPR direct-stream dense-valid throughput"
+      - "CRISPR 4-8x pktMerge speedup"
+    severity: "blocker"
+
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "Synthetic-fixture byte-equality is trivially the equality of two empty sets"
+    attempted: |
+       + 's NPU byte-equality tests use a random ACGT
+      synthetic fixture (`_build_random_fixture(seed=20260425)`)
+      — random 20nt guides + random 4096-window stream. The
+      assertion is that the NPU and host-emulation outputs match
+      as a set. Both produce **empty** hit sets on this fixture
+      because random guides and random windows have very few
+      mismatches ≤ 4 out of 20 (binomial probability ≈ 4.7e-5 per
+      cell × 4096×128 ≈ 24 expected hits, but PAM filtering drops
+      ~93.6% of windows; final expectation ≈ 1.5 hits).
+    failed_with: null
+    root_cause: |
+      The synthetic fixture is too random to exercise the threshold
+      gate. 's load-bearing byte-equality test runs on chr22 ×
+      10 guides which has 31524 real Cas-OFFinder records; the
+      synthetic fixture is a smoke test only. inherits the
+      same fixture pattern and the same caveat — verified above
+      (`# pktmerge: n_records=0  # filter_early: n_records=0`).
+    workaround: |
+      The chr22 × 10 guides byte-equality test in
+      `tests/test_t62_pam_filter_npu.py::test_chr22_10guides_filter_early_byte_equal_to_casoffinder_npu`
+      is the load-bearing live-NPU byte-equality gate; 's
+      pktmerge variant inherits byte-equality with by
+      construction (same xclbin arithmetic on the live IRON path
+      per ), so the chr22 × 10 guides gate covers 
+      transitively. The synthetic-fixture NPU byte-equality tests
+      remain useful as smoke/regression detection but should not
+      be read as the load-bearing correctness gate. Documented
+      explicitly in `tests/test_pam_filter_pktmerge_npu.py` test
+      docstrings.
+    upstream_issue: null
+    blocks: []
+    severity: "cosmetic"

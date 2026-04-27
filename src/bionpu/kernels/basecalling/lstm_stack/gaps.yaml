@@ -1,0 +1,8 @@
+schema_version: "1.0.0"
+task_id: ""
+kernel_name: "dorado_fast_lstm_stack"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T04:35:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+gaps: []

@@ -1,0 +1,24 @@
+{
+  "accuracy_metrics": {
+    "fp32_max_abs_error_npu_vs_ort": 3.815e-06,
+    "int8_max_abs_error_vs_fp32": 0.37294340133667,
+    "int8_mean_abs_error_vs_fp32": 0.04046124219894409,
+    "int8_relative_max_error_vs_fp32": 0.007546157110482454,
+    "tile_memory_used_bytes": 29024.0
+  },
+  "calibration_data_id": "synthetic_seed20260425_n1_T2000",
+  "degradation_vs_fp32": {
+    "int8_max_abs_error_vs_fp32": 0.37294340133667,
+    "int8_mean_abs_error_vs_fp32": 0.04046124219894409
+  },
+  "generated_at_iso8601": "2026-04-25T07:42:01Z",
+  "hardware_signature": "x86_64;Ryzen-AI-9-HX-370;npu=AIE2P;6x8",
+  "host": "matteius-ProArt-P16-H7606WI",
+  "model_name": "dorado_fast_conv_stem_layer1",
+  "model_sha256_fp32": "221d331abb873a165e3489d2261436277cf424a98b12134e06da16e2bcf4a82d",
+  "model_sha256_quant": "1bc95d7f9a94b8954f526fd996ff081de34db3795de113aee9ce771b4367bc66",
+  "n_samples": 1,
+  "precision": "int8",
+  "schema_version": "1.0.0",
+  "strategy": "per_channel"
+}

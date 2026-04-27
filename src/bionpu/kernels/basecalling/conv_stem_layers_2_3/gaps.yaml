@@ -1,0 +1,147 @@
+schema_version: "1.0.0"
+task_id: ""
+# ships four kernel directories (conv_stem_layers_2_3, lstm_cell,
+# lstm_stack, linear_projection). The aggregator de-duplicates by
+# task_id (one gaps.yaml per task), and walks `bionpu/kernels/`
+# alphabetically. So this file (under conv_stem_layers_2_3 — first
+# alphabetically) carries the consolidated gap list. The other
+# three directories ship empty `gaps: []` files for "reported clean"
+# semantics so their kernels are visible to the aggregator.
+kernel_name: "dorado_fast_t51_kernels_consolidated"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T04:35:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+gaps:
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "Single-tile LSTM kernel with 3 input ObjectFifos (input, weight, bias) on AIE2P"
+    attempted: "IRON lowering with input_in / weight_in / bias_in / output_out fifos"
+    failed_with: "tile requires 3 input/1 output DMA channels, but only 2 input/2 output available"
+    root_cause: "AIE2P CoreTile has 2 input + 2 output DMA channels; IRON allocates one per ObjectFifo end. Three input fifos exceeds the channel count."
+    workaround: "Folded the bias slab (768 FP32) as a prefix on every weight chunk; the kernel caches biases on (t==0, g==0, chunk==0) into a static array and skips the prefix on subsequent calls. Costs ~64 KB host-side bloat per LSTM-layer call (negligible)."
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"
+  - id: ""
+    category: "correctness"
+    op_or_pattern: "Conv1d(in=16, out=16, kernel=5, stride=1, padding=2) — multi-channel scalar FP32 chunked dataflow (conv_stem_layer2)"
+    attempted: "Direct port of 's conv_stem_layer1 chunked pattern to multi-channel input (16 ic instead of 1). depth=1 signal + depth=2 output ping-pong fifos to fit 64 KiB budget."
+    failed_with: "Output buffer contains 9 NaN values per chunk at fixed positions [43..51] (relative to chunk start), repeating across all 10 chunks and all 16 output channels. Non-NaN positions also drift ~2% from CPU reference (e.g. 0.96 vs 0.98 expected, suggesting ~2 of 16 input channels' contributions are dropped)."
+    # Phase 2 / evidence (state/stem-l2-nan-trace-20260425T192349Z.json):
+    # cross-Python-version repro (3.11/upstream + 3.14/fork both produce
+    # byte-identical insts.bin and the same 9-NaN window), Peano-emitted
+    # disassembly (kernel auto-vectorizes scalar FP32 into bf16 emulation
+    # with 4-bank BM accumulator spill+reload), and AM020 Appendix A p. 79:
+    # 'Native FP32 (supported through emulation using bfloat16) — Removed
+    # in AIE-ML' (AIE2P inherits). Phase 2 fix-surface inventory enumerated
+    # 5 candidate kernel-source workarounds and rejected them all; loop
+    # reorder was the only one marked 'untested'.
+    # Closure 2026-04-25 (T2 / swarm/T2-conv1d-fp32 branch): the loop
+    # reorder candidate WAS viable. Rewrote conv1d_layer2.cc from
+    # (oc-outer, t-outer, ic-inner, k-fully-unrolled scalar reduction)
+    # to (oc-outer, init-out=bias, ic-outer, k-outer, t-inner-vectorisable
+    # weight-stationary FMA). The new shape lifts the FP32 accumulator out
+    # of the BM register file (where the spill+reload mis-lowering lived)
+    # and into tile memory (out_row[t] is the loop-carried accumulator).
+    # Peano sees 5 separate clean 1D strided vector-FMA loops per (oc, ic)
+    # pair instead of a per-(oc, t) BM-pressured scalar reduction.
+    # Silicon validation: 0 NaN, 0 Inf, max-abs vs CPU = 3.34e-6 (FP32
+    # round-off territory; encoder stem_L2 now runs on NPU not
+    # cpu_fallback). insts.bin md5 unchanged (host control flow same);
+    # only the AIE-tile .o differs. ~5% NPU-time slowdown
+    # (175.7ms -> 184.9ms per chunk-set) — acceptable cost for correctness.
+    root_cause: "Peano's auto-vectorization of the scalar FP32 inner loop emitted bf16-emulated vector ops (BM 4-bank accumulator + per-iter stack spill+reload) because AIE2P has no native FP32 vector path (AM020 Appendix A; .md ). The original kernel built a per-(oc, t) FP32 scalar `s` reduction across (16 ic) x (5 k) = 80 multiply-adds — Peano held the running sum in BM, spilled all 4 banks per per-channel iteration, and at a bf16 vector-lane boundary inside the T_chunk=200 inner loop the spill+reload sequence mis-lowered, producing 9 NaN values per chunk at fixed offsets [43..51]. The bug was reproducible across both the upstream Python 3.11 / mlir-aie@9796296 build and the Phase-2 fork Python 3.14 / mlir-aie@70ca8eb1 build with byte-identical insts.bin (the AIE-tile .o lowering was the only delta), confirming it was a Peano backend / mlir-aie LLVM-lowering miscompile rather than a build-environment artifact."
+    workaround: "Loop-nest rewrite in conv1d_layer2.cc (committed 2026-04-25 on branch swarm/T2-conv1d-fp32). New shape: outer oc -> initialise out_row[0..T_chunk]=bias (separate vectorisable t-loop) -> outer ic -> outer k (5 explicit weight-stationary t-loops, one per kernel position) -> inner-`t` strided FMA `out_row[t] += sig_row[t+k] * w_scalar`. Each inner-t loop is now a clean 1D strided vector-FMA (no per-(oc,t) scalar reduction for Peano to fold into BM-spill emulation); the FP32 accumulator is the memory-resident out_row[t] not the BM register file, so the spill miscompile cannot trigger. Test gate: tests/test_t51_conv_stem_layer2_correctness.py asserts (a) the kernel source contains the post-fix loop nest sentinels (regression guard), (b) numpy reference matches torch.nn.functional.conv1d, (c) silicon output is NaN-free + matches CPU reference within 5e-4 (achieved 7e-7). Encoder stem_L2 device flips from 'cpu_fallback' to 'npu' (max-abs vs CPU 3.34e-6). The deferred bf16 vector-intrinsics rewrite remains a future optimisation path for performance, not correctness."
+    upstream_issue: null
+    blocks: [""]
+    severity: "blocker"
+    status: "closed"
+    closure_ref:
+      fork_repo: "https://github.com/matteius/genetics"
+      fork_branch: "swarm/T2-conv1d-fp32"
+      summary: "Loop-nest rewrite in conv1d_layer2.cc moves the FP32 accumulator from the BM register file (where Peano's bf16-emulation spill miscompile produced the 9-NaN window at [43..51]) into tile memory (out_row[t]), turning the inner work into 5 weight-stationary 1D strided vector-FMA loops. Silicon evidence: 0 NaN (was 1440), max-abs vs CPU 3.34e-6, encoder stem_L2 device flips cpu_fallback -> npu. Detailed evidence + alternative-path narrative: state/swarm/t2/closure-evidence-.json. Test gate: tests/test_t51_conv_stem_layer2_correctness.py."
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "Multi-tile recurrent kernel (LSTM cell sharded across N AIE2P tiles)"
+    attempted: "Considered (not built) for v1 — would distribute the 291 KiB weight footprint and reduce per-call DMA volume from 110 MB to ~291 KiB."
+    failed_with: null
+    root_cause: "mlir-aie/programming_examples/ ships no recurrent / RNN multi-tile pattern (verified against mlir-aie@979629649). The matrix_multiplication/whole_array/ example targets GEMM with no per-step state propagation — adapting it to an LSTM cell requires inter-tile fifos for h/c state, which IRON's ObjectFifo dataflow doesn't natively support."
+    workaround: "Single-tile v1 with weight streaming (110 MB DMA per call). Per-call latency ~1.77 s; not on the validation gate (per-block FP32 max-abs error is the gate)."
+    upstream_issue: null
+    blocks: [""]
+    severity: "workaround"
+  - id: ""
+    category: "performance"
+    op_or_pattern: "scalar tanh / sigmoid in Peano AIE2P FP32 kernel"
+    attempted: "3rd-order Padé tanh approximation in scalar_tanh_padé(); sigmoid via 0.5*(tanh(0.5x)+1) identity. Avoids stdlib <cmath> dependency (newlib bits unsupported on AIE2P)."
+    failed_with: null
+    root_cause: "AIE2P has aie::tanh<bfloat16> vector intrinsic (used in aie_kernels/aie2p/silu.cc) but no scalar FP32 tanh in v1 IRON bindings. v1 path uses Padé approximation with ~3e-3 max error on [-3, 3]."
+    workaround: "Padé approximation. Per-block LSTM max-abs drift vs CPU reference is ~1e-1 to ~1e0 (cumulative); the v1 path FAILS the 1e-4 task-brief gate but ships per the 'document achieved bound honestly' clause. will replace with bf16 vector tanh; expected to bring drift to the 1e-4 range."
+    upstream_issue: null
+    blocks: ["", ""]
+    severity: "workaround"
+  - id: ""
+    category: "performance"
+    op_or_pattern: "Conv1d(in=16, out=96, kernel=19, stride=6, padding=9) — large weight + large input on a single tile (conv_stem_layer3)"
+    attempted: "IRON lowering with full output tensor on tile. Total weight 117 KiB, input 126 KiB, output 125 KiB — none individually fit in 64 KiB."
+    failed_with: null
+    root_cause: "Single-tile data memory budget (64 KiB) cannot hold any of the three full tensors. Multi-tile sharding for stride-6 Conv1d is non-trivial."
+    workaround: "Chunked along output time axis with T_chunk_out=1 + sharded along output channels into 6 OC groups of 16 each. 6 OC groups × 334 timesteps = 2004 kernel calls per layer-3 invocation. Host materialises T_OUT repetitions of the 6-OC-group weight cycle (~37 MB of host-side data per call); BD-level repeat patterns would eliminate this bloat in a future revision."
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"
+  - id: ""
+    category: "performance"
+    op_or_pattern: "Per-call setup overhead dominates wall time on small-tensor encoder ops (linear_projection, conv_stem_layers_2_3). After the LSTM cascade unblock these ops become the encoder bottleneck — call fusion on them is the next post-cascade speedup lever."
+    attempted: |
+      Direct measurement on results/basecalling/b-m6/measurements.json
+      (bf16, n_iters=1, warmup=0):
+
+        linear_projection : 564 ms / 1336 calls = ~422 µs/call
+        stem_L3 (layer3)  : 661 ms / 2004 calls = ~330 µs/call
+        stem_L1 (layer1)  :  12 ms /   ~ calls  = (single-call shape; baseline)
+        LSTM L_n          :  45 ms /  one-tile-call-per-ts pre-cascade
+
+      For comparison, the AccumFifo token-order microtest (no math)
+      runs 5-tile horizontal cascade at 334 production-shaped
+      timesteps in 1.14 ms — i.e. the cascade infrastructure
+      processes 334 timesteps end-to-end for less wall time than
+      one stem_L3 chunk pays in setup overhead. The math budget on
+      either op (96×64 GEMM per call for linear_projection;
+      16×16 conv1d slab for stem_L3) is sub-microsecond at
+      AIE2P 50 TOPS; the rest is per-call setup, weight acquire,
+      output BD release, and kernel-call frame.
+    failed_with: null
+    root_cause: |
+      Same call-count-bound pattern that motivated the LSTM cascade
+      rebuild, applied to the rest of the encoder:
+
+      - linear_projection: T_LSTM × N_OC_GROUPS = 334 × 4 = 1336
+        kernel calls per dispatch. Weight is 96×256 = 24576 fp32
+        elements (96 KiB) — does NOT fit a single AIE2P tile L1 at
+        fp32, but fits cleanly at bf16 (48 KiB).
+      - conv_stem_layer3: 6 OC groups × 334 timesteps = 2004 calls
+        per dispatch (already documented at ). Weight
+        117 KiB at fp32 does not fit; fits at bf16.
+
+      Once the LSTM cascade lands, the encoder wall-time shape
+      becomes ~few-ms LSTM cascade + ~1.2 s stem+linear_projection.
+      Cascade alone does not produce a competitive throughput
+      number — it relocates the bottleneck.
+    workaround: |
+      None landed. The fusion design for linear_projection is
+      sketched at
+      ``bionpu/kernels/basecalling/linear_projection/DESIGN-fusion.md``:
+      a streaming-style kernel that acquires the full bf16 weight
+      slab once at start, then loops over T_LSTM timesteps × 4 OC
+      groups internally on a single tile call. Estimated 1336 → 1
+      kernel call per dispatch.
+
+      Equivalent fusion for conv_stem_layer3 has not yet been
+      sketched; the larger weight footprint (117 KiB fp32 / ~58 KiB
+      bf16) and stride-6 input access pattern likely require a
+      multi-tile shard rather than a single-tile streaming kernel.
+    upstream_issue: null
+    blocks: [""]
+    severity: "blocker"

@@ -1,0 +1,21 @@
+{
+  "accuracy_metrics": {
+    "int8_max_abs_per_cell_vs_bf16_pending_canary": 0.0,
+    "int8_max_abs_end_to_end_vs_fp32_pending_canary": 0.0,
+    "tile_memory_used_bytes": 16480
+  },
+  "calibration_data_id": "synthetic_seed20260425_n1_L334_int8_per_channel",
+  "degradation_vs_fp32": {
+    "int8_pending_canary": 0.0
+  },
+  "generated_at_iso8601": "2026-04-25T20:30:00Z",
+  "hardware_signature": "x86_64;Ryzen-AI-9-HX-370;npu=AIE2P;6x8",
+  "host": "matteius-ProArt-P16-H7606WI",
+  "model_name": "dorado_fast_lstm_cell_int8",
+  "model_sha256_fp32": "22019ee59525e698f11bbc832622db668bc316e6117e5a69555a9a7bdd339cc0",
+  "model_sha256_quant": "d75b548efdc368a876fc624e418bf8096ed4cc14a70483264197128a9ba062e8",
+  "n_samples": 1,
+  "precision": "int8",
+  "schema_version": "1.0.0",
+  "strategy": "per_channel"
+}

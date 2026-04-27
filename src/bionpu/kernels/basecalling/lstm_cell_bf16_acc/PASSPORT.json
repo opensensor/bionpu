@@ -1,0 +1,22 @@
+{
+  "accuracy_metrics": {
+    "max_abs_error_npu_vs_cpu_per_cell_synthetic": 0.05151,
+    "max_abs_error_npu_vs_cpu_5stack_synthetic": 0.002974,
+    "max_abs_error_npu_vs_cpu_encoder_dorado": 2.076,
+    "tile_memory_used_bytes": 22784
+  },
+  "calibration_data_id": "synthetic_seed20260425_n1_L334_bf16_acc_state",
+  "degradation_vs_fp32": {
+    "encoder_max_abs_vs_t64a_baseline_ratio": 0.844
+  },
+  "generated_at_iso8601": "2026-04-25T12:30:00Z",
+  "hardware_signature": "x86_64;Ryzen-AI-9-HX-370;npu=AIE2P;6x8",
+  "host": "matteius-ProArt-P16-H7606WI",
+  "model_name": "dorado_fast_lstm_cell_bf16_acc",
+  "model_sha256_fp32": "22019ee59525e698f11bbc832622db668bc316e6117e5a69555a9a7bdd339cc0",
+  "model_sha256_quant": "47fa60b54dd5d6cf80c47df819bd9ca349be11deee412cbcb10c900df6add351",
+  "n_samples": 1,
+  "precision": "int16",
+  "schema_version": "1.0.0",
+  "strategy": "per_channel"
+}

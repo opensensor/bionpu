@@ -1,0 +1,1244 @@
+# gaps.yaml — T7-IRON cascade-stream kernel design + investigation surface.
+# Schema: bionpu/report/gaps.schema.json (v1.0.0).
+# Convention: bionpu/kernels/GAPS-CONVENTION.md.
+#
+# This is the aggregator-visible gap report for T7-IRON
+# (the IRON investigation; mapped to to satisfy the
+# schema's `^T\d+\.\d+$` pattern).
+#
+# Per the T7-IRON brief's gaps.yaml rule:
+#   - Cascade-stream prototype path was VIABLE → addressed (no new
+#     gap surfaced for cascade); silicon-level kernel-author hand-off
+#     is documented at DESIGN.md and recorded as deferred-engineering
+#     in measurements.json (results/basecalling/b-m6d-cascade/).
+#   - Variable-rate / pktMerge ObjectFifo path was NOT VIABLE as a
+#     pure Python extension above the wheel → SINGLE architectural
+#     blocker entry below per brief.
+#
+# This kernel directory is the silicon-level engineering hand-off
+# for the cascade variant. The Python-side toolchain finding lives
+# at bionpu/iron_extensions/INVENTORY.md (the load-bearing
+# investigation artifact) + cascade_stream.py (the prototype).
+# The single gap recorded here is the architectural blocker the
+# investigation surfaced — the variable-rate ObjectFifo case where
+# the extension path is NOT viable and a wheel rebuild OR direct
+# dialect-level bypass is required.
+#
+# Gap-id range: G- ( reserves 2xx for IRON
+# investigation findings).
+
+schema_version: "1.0.0"
+task_id: ""
+kernel_name: "dorado_fast_lstm_cell_bf16_acc_cascade"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T23:34:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+
+gaps:
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "Variable-rate / packet-switched-merge ObjectFifo (pktMerge) for filter-early cycle savings in IRON"
+    attempted: |
+      The cross-walk's deferred- design needs three AM020-documented
+      hardware primitives: (1) packet-switched merge N:1 (AM020 Ch. 2
+      Figure 17 'pktMerge'), (2) S2MM finish-on-TLAST (AM020 Ch. 2
+      Tile DMA Controller p. 27), (3) memtile out-of-order BD
+      processing on packet header (AM020 Ch. 5 p. 74).
+
+      The IRON ObjectFifo class (786 LoC at
+      aie.iron.dataflow.objectfifo) was inspected for hooks to either
+      of these. Constructor flags exposed: dims_to_stream,
+      dims_from_stream_per_cons, plio, pad_dimensions, depth, name.
+      None touch packet-switched / variable-rate / TLAST primitives.
+      ObjectFifo lowers to aie.dialects.aie.object_fifo which is
+      hard-coded to fixed-stride rectangle dataflow.
+
+      The MLIR-dialect packet-flow ops (aie.packet_flow,
+      aie.packet_source, aie.packet_dest, aie.packet_rules) ARE
+      exported by aie.dialects._aie_ops_gen.py (verified via grep).
+      However, IRON's resolution machinery in Worker.__init__
+      (worker.py:85-116) only registers ObjectFifoHandle instances
+      from fn_args — there is no equivalent for packet-flow handles,
+      so a pure-extension PacketFifo-style class cannot reach the
+      placement pass cleanly without re-implementing IRON's
+      Resolvable / Worker.fn_args / Program.resolve_program glue.
+
+      Filed under this kernel directory (the cascade engineering
+      hand-off) because this is the gap the aggregator can see;
+      bionpu/iron_extensions/ is outside the aggregator's default
+      search paths. The full surface map of the investigation lives
+      at bionpu/iron_extensions/INVENTORY.md.
+    failed_with: null
+    root_cause: |
+      Pure subclass / composition extension above the wheel cannot
+      teach Worker about non-ObjectFifoHandle dataflow handles
+      without re-implementing IRON's resolution pipeline. That
+      re-implementation is architecturally a partial fork of IRON
+      Python, not a clean extension. A wheel-source-rebuild (forking
+      mlir-aie source) is the cleaner path: add
+      aie/iron/dataflow/packetfifo.py as a sibling of objectfifo.py,
+      wire the resolution glue into Program.resolve_program(), and
+      either reuse or extend the existing
+      --aie-objectfifo-stateful-transform MLIR pass to lower
+      packet-switched ObjectFifos through the packet routing fabric.
+      AM020 confirms the silicon supports this; the gap is genuinely
+      toolchain.
+    workaround: |
+      Two viable interim paths, neither is 'extension above the wheel':
+
+      (1) Forked mlir-aie source rebuild. Estimated 10-20 days
+          end-to-end (new IRON class + integration + MLIR pass + tests
+          + the eventual upstreaming PR). High regression surface for
+          non-cascade ObjectFifo users. Reward: unlocks the
+          cross-walk's filter-early cycle-savings prediction for 
+          properly + the deferred- finish-on-TLAST
+          sparse-emit path.
+      (2) Direct dialect-level lowering bypassing IRON entirely.
+          aie.dialects.aie placed-style API supports the packet-flow
+          ops today. Estimated ~3-5 days for a non-IRON-style Python
+          lowering of 's filter-early variant; the cost is
+          forgoing IRON's Worker/ObjectFifo ergonomics for that one
+          kernel.
+
+      Recommendation: defer until 's RQ4 writeup decides whether
+      the variable-rate ObjectFifo's silicon-level demonstration is
+      publication-load-bearing. Current v1 (filter-late) is
+      shipping and adequate for the writeup's 'IRON wall is partially
+      penetrable' narrative.
+    upstream_issue: null
+    blocks:
+      - ""
+    severity: "blocker"
+    status: "closed-pending-orchestrator-wheel-rebuild"
+    closure_ref:
+      fork_repo: "https://github.com/opensensor/mlir-aie"
+      fork_branch: "feature/-variable-rate-fifo"
+      fork_commit: "02cef1591e4658b93d20d8acb6dcc3db09d0b45e"
+      summary: |
+         lands aie.iron.VariableRateFifo, the
+        single-producer / conditional-forward half of the
+        cross-walk's deferred- design. The complementary N:1
+        multi-producer fan-in half is closed by aie.iron.PacketFifo
+. Both primitives are usable from
+        IRON Python today (subclasses of ObjectFifo /
+        ObjectFifoHandle); together they provide the IRON-level
+        variable-rate dataflow surface the T7-IRON investigation
+        identified as the missing primitive.
+
+        Architecturally: VariableRateFifo keeps ObjectFifo's
+        shared-memory + lock runtime and opts out of the LCM-based
+        loop-unrolling assumption via a discardable marker
+        (aie.variable_rate = true) consumed by
+        AIEObjectFifoStatefulTransformPass. PacketFifo lowers to
+        aie.packetflow ops on the AXI stream-switch fabric. The
+        two coexist in the same aie.device body without
+        interference. See
+        third_party/mlir-aie/python/iron/VARIABLE_RATE_DESIGN.md
+        for the full design rationale + tradeoffs (memory
+        back-pressure, lock semantics, interaction with split-fifo
+        + memtile paths, interaction with SparseFifo + PacketFifo).
+
+        Lit tests under
+        third_party/mlir-aie/test/objectFifo-stateful-transform/
+        verify both behaviors. Regression-protect: full
+        objectFifo-stateful-transform suite (40+ tests) PASS,
+        including the load-bearing
+        non_adjacency_test_AIE2.mlir / plio_test.mlir /
+        repeat_count_test.mlir / sparse_fifo_split_attr_propagation.mlir.
+
+        Status flips to ``closed`` once T9  ratifies the
+        silicon-level cycle-time win on the CRISPR PAM-filter
+        kernel via the dynamic-fifo integration.
+
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "AccumFifoHandle.all_of_endpoints — fork primitive ships without Program.resolve_program-compatible endpoint discovery"
+    attempted: |
+       attempted to lower a 5-tile cascade-stream LSTM stack via
+      the fork's first-class IRON primitive aie.iron.AccumFifo.
+      Program.resolve_program walks every fifo handle in worker.fn_args
+      and calls handle.all_of_endpoints() to populate the device's
+      tile-resolution set. AccumFifoHandle inherits all_of_endpoints()
+      from ObjectFifoHandle but does not set self._object_fifo (it
+      bypasses ObjectFifoHandle.__init__ to avoid the memref-typed
+      constraints), so the inherited implementation raises
+      AttributeError: 'AccumFifoHandle' object has no attribute
+      '_object_fifo'.
+    failed_with: |
+      Stack trace at silicon-test build attempt (2026-04-25):
+        File "aie/iron/program.py", line 81, in device_body
+          all_tiles.extend([e.tile for e in f.all_of_endpoints()])
+        File "aie/iron/dataflow/objectfifo.py", line 479, in all_of_endpoints
+          return self._object_fifo._get_endpoint(...)
+      AttributeError: 'AccumFifoHandle' object has no attribute '_object_fifo'
+    root_cause: |
+      Fork-side incomplete primitive integration. AccumFifoHandle's
+      override-and-bypass pattern was correct for the acquire/release
+      semantics (cascade has no ObjectFifo depth/dims), but did not
+      account for Program.resolve_program's downstream introspection.
+      A fix requires either (a) AccumFifoHandle.__init__ sets
+      self._object_fifo to a compatible shim object exposing
+      _get_endpoint, OR (b) AccumFifoHandle overrides all_of_endpoints
+      to return [ObjectFifoEndpoint(tile)] directly. Both paths are
+      ~20 LoC fork edits.
+    workaround: |
+      Outer-repo monkey-patch in 's IRON Python topology:
+      bind a per-handle all_of_endpoints lambda that returns
+      [ObjectFifoEndpoint(prod_tile), ObjectFifoEndpoint(cons_tile)]
+      for each AccumFifo's prod() and cons() handles. Implemented at
+      bionpu/kernels/basecalling/lstm_cell_bf16_acc_cascade/
+      lstm_cell_bf16_acc_cascade.py. Validated end-to-end: MLIR
+      emits cleanly with correct aie.cascade_flow ops between tiles.
+
+      **CLOSED 2026-04-25 (pending orchestrator wheel rebuild)**: fork
+      PR ``feature/-fifohandle-fix`` lands the upstream fix
+      (AccumFifoHandle now overrides ``all_of_endpoints()`` to return
+      endpoint-typed objects directly so ``Program.resolve_program``'s
+      tile-collection walk no longer trips on the missing
+      ``_object_fifo`` field). The outer-repo monkey-patch in
+      ``lstm_cell_bf16_acc_cascade.py`` has been removed in the same
+      commit cycle. Status flips to ``closed`` once the orchestrator
+      rebuilds the wheel and the bumped submodule lands on outer-repo
+      main; 's outer-repo tests then re-run cleanly without the
+      workaround. See fork commit on
+      ``feature/-fifohandle-fix`` for the upstream fix.
+    upstream_issue: null
+    status: "closed-pending-orchestrator-wheel-rebuild"
+    closed_by_fork_branch: "feature/-fifohandle-fix"
+    closed_by_fork_commit: "9446d21ed8bf0be32bf925728138b4333f24763d"
+    blocks: []
+    severity: "workaround"
+
+  - id: ""
+    category: "device_geometry"
+    op_or_pattern: "5-tile vertical cascade chain on AIE2P (DESIGN.md original 5-deep column)"
+    attempted: |
+      's DESIGN.md specified 5 vertically-adjacent CoreTiles in
+      column 0, rows 2..6, for the 5-layer Bonito LSTM stack. On AIE2P
+      (Strix, NPU2 device class) aie.iron.device.NPU2 reports
+      rows = 6 (indices 0..5), with row 0 = ShimTile, row 1 = MemTile,
+      and rows 2..5 = CoreTiles. A column has only **4 CoreTiles**,
+      not 5. The original DESIGN.md was derived from AM020 Ch. 1 p. 6
+      which describes a generic AIE-ML 6-row layout including a 5th
+      CoreTile row that AIE2P / NPU2 does not surface in its
+      target-model rows() override.
+    failed_with: |
+      ValueError: Coordinates (0, 6) are out of range for device
+      (8 cols x 6 rows)
+    root_cause: |
+      AIE2P device geometry: row 6 does not exist on Strix; the
+      device has only 4 CoreTile rows per column (rows 2..5 inclusive).
+      DESIGN.md's 5-row vertical chain assumed the 5-row AIE-ML layout.
+    workaround: |
+      Pivot to a 4+1 column-spanning layout: 4 CoreTiles in column 0
+      (rows 5,4,3,2 — chain runs upward to satisfy the cascade-flow
+      "source must be South-of OR West-of destination" direction
+      constraint enforced by AIELowerCascadeFlows.cpp:63), plus a
+      horizontal hop into column 1 row 2 for layer 4. AccumFifo
+      raises a UserWarning that horizontal cascade was not measured
+      in T7-IRON's investigation, but AM020 Appendix A p. 80 Figure
+      45 confirms it is supported. 's lstm_cell_bf16_acc_cascade.py
+      uses this 4+1 layout. **MLIR emits cleanly + aiecc lowers
+      successfully** through to a working xclbin.
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"
+
+  - id: ""
+    category: "abi"
+    op_or_pattern: "AIE2P kernel ABI buffer-slot cap (5 bo* slots) limits multi-tile xclbin per-tile dataflow"
+    attempted: |
+      's 5-layer cascade design needs **7 host-visible buffers**
+      per kernel invocation: 1 input (to layer 0's row), 5 separate
+      per-layer weight buffers, and 1 output (from layer 4's row).
+      The IRON Python topology emits 7 ObjectFifos in the runtime
+      sequence; aiecc lowers them all to valid aie.dma_configure_task_for
+      ops in the runtime sequence body (verified in
+      build/aie_L334.mlir.prj/input_with_addresses.mlir).
+
+      The lowered xclbin's ps-kernel JSON, however, exposes only
+      **5 buffer slots** (bo0..bo4) plus opcode + instr + ninstr.
+      The host's xrt::kernel(opcode, bo_instr, ninstr, *bos) ABI
+      saturates at 5 user-supplied BOs per call. Passing 7 BOs hits a
+      vector-out-of-range exception inside the host runner / XRT
+      kernel-call expansion.
+    failed_with: |
+      terminate called after throwing an instance of 'std::out_of_range'
+        what():  vector::_M_range_check: __n (which is 8) >= this->size() (which is 8)
+    root_cause: |
+      AIE2P's NPU programmable-launch ABI hardcodes 5 buffer-object
+      slots per kernel call (matches the C++ xrt_test_wrapper.h
+      convention of `(opcode, bo_instr, ninstr, in1, in2, out, ctrl,
+      trace)` = 5 user BOs). Multi-tile xclbins that need more than
+      5 host-visible per-tile buffers must either (a) consolidate
+      multiple per-tile streams through memtile splits / fans-out
+      (so the host sees one shim DMA instead of N), or (b) accept
+      a smaller per-tile count.
+
+      The Phase 1 cross-walk did not flag this constraint. Bonito's
+      5-layer LSTM stack with separate per-layer weight DMAs maps to
+      7 host buffers (1 in + 5 wb + 1 out), one over the 5-slot cap.
+    workaround: |
+      Two paths forward, neither adopted in :
+
+      (1) **Consolidated weight DMA** — concatenate all 5 layers'
+          weights into a single host buffer; route through one shim
+          DMA → memtile split → 5 per-cell ObjectFifos via
+          object_fifo_link's split-by-offset pattern (the upstream
+          ``programming_examples/basic/matrix_multiplication/cascade/``
+          pattern). Reduces host BO count from 7 to 3. Estimated
+          1-2 days additional engineering for the IRON-side split
+          topology + matching host runner reshape.
+
+      (2) **3-tile cascade test** — drop two Bonito layers and run
+          the cross-walk silicon test on a 3-tile cascade (input + 3
+          wb + output = 5 BOs, fits the cap exactly). Tests the
+          cascade-FP32-handoff mechanism but with a 3-layer stack
+          instead of Bonito's 5-layer. The cross-walk's hypothesis
+          ("cascade FP32 handoff recovers precision") is testable at
+          either depth; the absolute max-abs threshold (< 0.23) is
+          not meaningful at 3-layer depth without a matching 3-layer
+           baseline.
+
+       ships with the build infrastructure (kernels, IRON
+      topology, host runner, Makefile) **complete + verified through
+      the xclbin build**, but the silicon-level encoder
+      max-abs measurement is **deferred** to a follow-up that picks
+      either workaround. measurements.json records verdict:
+      "deferred_silicon_build" with this gap as the diagnosis.
+
+      **CLOSED 2026-04-25 (T1 swarm task) — path (1) consolidated
+      weight DMA implemented**. ``lstm_cell_bf16_acc_cascade.py``
+      now uses a single shim → memtile ObjectFifo
+      (``weight_in_all``, parent frame = N_LAYERS chunks
+      back-to-back) with ``of_weights_consolidated.cons().split(
+      per_layer_chunk_offsets, ...)`` fanning out at the memtile
+      to 5 per-cell sub-fifos. Lowered MLIR runtime_sequence
+      shows exactly 3 host BOs:
+      ``aie.runtime_sequence(memref<32064xbf16>,
+      memref<143646720xbf16>, memref<32064xbf16>)`` (input,
+      consolidated weights, output). The
+      ``aie.objectfifo.link [@weight_in_all] -> [@weight_in_L0..L4]
+      ([] [0, 5376, 10752, 16128, 21504])`` op is preserved
+      end-to-end through the lowering. Single silicon dispatch
+      under the swarm NPU mutex submitted the 3-BO host call
+      cleanly — **no ``std::out_of_range`` exception**, the original
+       ABI blocker is gone. New silicon-side firmware
+      timeout surfaced (the multi-tile cascade kernel itself wedges
+      the firmware after host call returns) — filed as 
+      below; that is **distinct from 's host-arg-slot
+      ABI scope**. See
+      ``state/swarm/t1/silicon-ratification-summary-{iso8601}.json``
+      for the full run evidence.
+    upstream_issue: null
+    status: "closed"
+    closure_ref:
+      fork_repo: "https://github.com/opensensor/mlir-aie"
+      fork_branch: "feature/-split-fifo-attr-propagation"
+      fork_commit: "930e23c7825a8e45b99e99c31d816e52d2f03ea2"
+      summary: |
+        Consolidated weight DMA via memtile-split-by-offset implemented
+        on the bionpu side using the existing IRON
+        ``ObjectFifoHandle.split`` API (no fork edit required). Drops
+        host BO count from 7 to 3, fitting the AIE2P 5-slot kernel-arg
+        ABI cap. Silicon dispatch confirms the host call succeeds with
+        no ABI exception. New firmware-timeout issue surfaced (the
+        multi-tile cascade kernel itself wedges the firmware after the
+        host call returns) — distinct gap, filed as .
+        Evidence: ``state/swarm/t1/build-verification-{iso8601}.json``
+        + ``state/swarm/t1/silicon-ratification-summary-{iso8601}.json``
+        + ``state/swarm/t1/lowered-L334-input_with_addresses.mlir``.
+    blocks: []
+    severity: "blocker"
+
+  - id: ""
+    category: "correctness"
+    op_or_pattern: "Multi-tile cascade-stream LSTM kernel firmware-timeout on AIE2P silicon"
+    attempted: |
+      After 's consolidated-weight ABI fix lands the host
+      call submits cleanly, the multi-tile cascade-stream kernel was
+      dispatched once on AIE2P silicon under the swarm NPU mutex.
+      The host runner returns "PASS" (no XRT exception, no
+      std::out_of_range) but the output buffer remains all-zero and
+      the per-iteration NPU time is 5.9s, which equals the firmware
+      TDR (Timeout Detection & Recovery) window. dmesg's
+      ``aie2_tdr_work counter`` advanced from 451 to 454 across the
+      single dispatch with multiple ``aie2_dump_ctx: Firmware timeout
+      state capture`` blocks captured at
+      ``state/swarm/t1/wedge-{iso8601}.txt``. The dump shows
+      ``DPU PC: 0xffffffff`` and ``Context PC: 0x28b060ad`` with
+      no fatal-error type set — consistent with the cores never
+      starting work or stalling on a cascade synchronisation that
+      never completes.
+
+      **2026-04-26 follow-up bisection (item4 agent)**: 8 silicon
+      tests under ``tests/cascade_bisection/`` performed under the
+      NPU mutex. Evidence files at
+      ``state/followup/item4/silicon-*-{iso8601}.log`` and lowered
+      MLIR snapshots under the same dir.
+
+      Bisection table (every test silicon-run on AIE2P / NPU2):
+
+        step  | topology + scope                                                | result
+        ------+-----------------------------------------------------------------+-------
+        1     | baseline (existing 5-tile LSTM xclbin from T1 build)             | WEDGE
+        2     | 2-tile cascade vertical (0,3)->(0,2), 1 put/get total            | PASS  (842us)
+        3     | 4-tile cascade all vertical col 0 rows 5..2, 1 put/get/iter      | PASS  (1662us)
+        4     | 5-tile cascade 4v + 1h, (0,5)->(0,4)->(0,3)->(0,2)->(1,2)        | PASS  (1371us)
+        5     | step4 + L=334 long loop, 6 puts+6 gets/iter (2004 transfers)     | PASS  (2016us)
+        6     | step5 + memtile-split objectfifo (3 host BOs, mirrors LSTM ABI)  | PASS  (1440us)
+        7     | step6 + LSTM-style 16-calls/iter, cascade ONLY in conditional    | WEDGE (5.97s, TDR+1)
+        8     | step6 + LSTM-style 16-calls/iter, cascade UNCONDITIONAL/call     | PASS  (2066us)
+        fix1  | original LSTM kernel + cascade ops moved to dedicated entry
+                points called once per timestep at IRON-loop level              | WEDGE (5.19s, TDR+1)
+
+      **Bisection conclusion**: The wedge is NOT the cascade primitive,
+      NOT the horizontal hop, NOT the multi-tile chain length, NOT the
+      long-loop iteration count, NOT the memtile-split objectfifo, NOT
+      the LSTM math arithmetic. The wedge IS triggered by some
+      interaction between (a) multiple kernel calls per IRON-loop
+      iteration with (b) cascade ops issued from one of those calls
+      (whether conditional inside a per-call branch OR consolidated
+      into a dedicated cascade-only call at the IRON top level).
+
+      The minimal failing reproducer (step 7, NO LSTM math) is at
+      ``tests/cascade_bisection/topology_5tile_lstm_call_pattern/``.
+      The minimal passing variant (cascade fires every kernel call)
+      is at
+      ``tests/cascade_bisection/topology_5tile_lstm_call_unconditional/``.
+      Both share the same LSTM-shape call structure (16 calls/iter
+      with (g, t, chunk_idx) parameters, memtile-split, L=334); the
+      only material difference is cascade-firing-frequency.
+
+      **Fix attempt 1 (FAILED)**: refactored ``lstm_layer_cascade.cc``
+      to lift cascade put/get out of conditional branches into
+      dedicated extern "C" entry points
+      (``dorado_fast_lstm_cascade_put_h``,
+      ``dorado_fast_lstm_cascade_get_h_to_x_bf16``,
+      ``dorado_fast_lstm_h_state_to_y_t``,
+      ``dorado_fast_lstm_final_state_update``) called once per timestep
+      at the IRON-loop level. Per-chunk math kernels became math-only.
+      Identical wedge fingerprint (DPU PC 0xffffffff, Context PC
+      0x28b060ad, 5.19s NPU time, TDR counter advanced 498->499). The
+      narrowed hypothesis (cascade-in-conditional) is INCOMPLETE —
+      moving cascade out of the per-chunk conditional did NOT lift the
+      wedge. The fix attempt was reverted; the lowered MLIR is kept at
+      ``state/followup/item4/lstm-fix-attempt-input_with_addresses.mlir``
+      and the failed silicon-test log at
+      ``state/followup/item4/silicon-fixed-lstm-{iso8601}.log``.
+    failed_with: |
+      Symptom (no exception raised on the host side):
+        - host runner reports "Avg NPU time: 5909740us" (~ TDR window)
+        - output buffer remains all-zero (not just close-to-zero)
+        - dmesg aie2_tdr_work counter advances by 3 across one dispatch
+        - Multiple aie2_dump_ctx Firmware-timeout blocks captured
+        - DPU PC = 0xffffffff (no work executed)
+
+      Step 7 reproducer (NO LSTM math, just LSTM-style call structure)
+      and fix-attempt-1 (LSTM math + cascade-only kernel split) both
+      reproduce the SAME wedge fingerprint:
+        - DPU PC: 0xffffffff
+        - Context PC: 0x28b060ad
+        - Fatal error type: 0x0
+        - msg: 0x1d000001
+        - aie2_tdr_work counter advances by 1 (vs 3 in T1's original
+          dispatch — fewer increments because step 7's runner has
+          shorter pre-/post-dispatch latency, but the per-dispatch
+          stall behavior is identical).
+    root_cause: |
+      **2026-04-26 update**: Bisection (8 silicon tests, see
+      ``state/followup/item4/``) has falsified the original
+      hypotheses (horizontal hop, multi-tile chain, long-loop count,
+      memtile-split, LSTM math) and narrowed the wedge to the
+      multi-kernel-call-per-IRON-iteration + cascade-firing-pattern
+      interaction. Step 7 reproduces the wedge with NO LSTM math; step
+      8 lifts the wedge by making cascade fire on EVERY kernel call
+      (instead of just one per timestep).
+
+      First-attempt fix (split cascade into dedicated entry points
+      called at IRON-loop top level) FAILED — same wedge fingerprint.
+
+      **2026-04-26 followup-C update — MLIR + ELF diff narrows the wedge
+      to a peano-emitted instruction-level pattern.** Full evidence at
+      ``state/followup-c/`` (MLIR diff: file 03; ELF diff: file 04).
+
+      MLIR-LEVEL FINDING: The lowered MLIR (``input_with_addresses.mlir``)
+      between step 6 PASS, step 7 WEDGE, and step 8 PASS is byte-identical
+      across every section EXCEPT the per-tile ``aie.core(...)`` body.
+      All 5 ``aie.mem(...)`` blocks are byte-identical between PASS and
+      WEDGE; ``aie.memtile_dma`` is byte-identical; ``aie.configure_cascade``
+      ops are identical (5 ops with the same {N,S,E,W} mapping); all 8
+      ``aie.flow`` ops are identical; all 30 ``aie.lock`` declarations
+      are identical. The only MLIR-level lock delta is +8 ``aie.use_lock``
+      ops on the input/output ObjectFifo locks (WEDGE acquires once
+      per ts vs PASS acquires once per call) — there are NO MLIR-level
+      lock ops on cascade-related locks in either variant.
+
+      The MLIR diff between step 7 (WEDGE) and step 8 (PASS-unconditional)
+      is **44 lines, 100 % of which are pure string substitutions**
+      (``lcp_*`` ↔ ``lcu_*``, ``...pattern.o`` ↔ ``...unconditional.o``).
+      This proves the wedge cause is NOT in MLIR-level lowering.
+
+      ELF-LEVEL FINDING (load-bearing): Disassembling the per-tile
+      ``main_core_*.elf`` with ``$PEANO_INSTALL_DIR/bin/llvm-objdump
+      -d <elf>`` shows:
+
+        variant       per-tile cascade-fn branches (jnz/jne)  result
+        ──────────────────────────────────────────────────────────────
+        step 6 PASS   0 in every tile                         PASS
+        step 8 PASS   0 in every tile                         PASS
+        step 7 WEDGE  3 in every tile                         WEDGE
+
+      Every WEDGE per-tile cascade kernel function (``cascade_5t_lcp_*``)
+      contains exactly 3 ``jnz`` instructions: one guarding the cascade-
+      get loop (``vmov bmll1, scd``) on ``(t==0 && g==0 && chunk==0)``
+      and two guarding the cascade-put loop (``vmov mcd, bmll1``) on
+      ``(g==3 && chunk==3)``. Every PASS variant emits these intrinsics
+      UNCONDITIONALLY with ZERO ``jnz`` instructions in the cascade-firing
+      function. The wedge correlates 1:1 with the presence of ``jnz``
+      branches around cascade-port intrinsics.
+
+      Sample WEDGE consumer (tile 1_2, ``cascade_5t_lcp_get_only``)::
+
+        720:  or r5, r2, r0
+        724:  jnz r5, #0x8b0      ; BRANCH 1: skip cascade-get if (g|t|chunk) != 0
+        ...   [cascade GET 6-iter loop, only reached when g==0&&t==0&&chunk==0]
+        780:  vmov bmll1, scd     ; vst bmll1, [p4, dj0]
+        ...
+        8b0 .LBB2_6:
+        8c2:  ne r0, r0, r4 ; jnz r0, #0x9a0  ; BRANCH 2: skip y_out if g != 3
+        8da:  ne r0, r2, r4 ; jnz r0, #0x9a0  ; BRANCH 3: skip y_out if chunk != 3
+        ...   [y_out write loop, only reached on (g==3 && chunk==3)]
+
+      Sample step 8 PASS consumer (tile 1_2, ``cascade_5t_lcu_get_only``)::
+
+        720:  lda r3, [p0, #0]; event #0     ; weight touch + start trace
+        ...   [stack save]
+        780:  vmov bmll0, scd                ; get_scd UNCONDITIONAL (1 word)
+        788:  ret lr
+        792:  vst bmll0, [p1, #0x0]          ; y_out write UNCONDITIONAL (1 word)
+        79c:  event #1
+
+      REFINED ROOT-CAUSE HYPOTHESIS (cross-checks Item-4's failed Fix-
+      attempt-1): The wedge mechanism is the **cascade-port idle
+      ratio** as observed by AIE2P firmware — the fraction of tile-
+      core cycles where the cascade port stays armed but no
+      ``vmov mcd`` / ``vmov ..., scd`` instruction issues. Estimated
+      ratios:
+
+        - step 6 PASS:        ~5 % cascade-port idle (1 call/ts, cascade
+                              fires immediately within the call)
+        - step 8 PASS:        ~10 % idle (16 calls/ts, every call fires
+                              1 cascade word; total cascade traffic is
+                              16x that of step 6)
+        - step 7 WEDGE:       ~94 % idle (16 calls/ts, cascade fires
+                              only on call 16; ``jnz``-skipped on the
+                              other 15)
+        - fix-attempt-1:      ~95 % idle (16 math-only calls + 1
+                              cascade-only call/ts; cascade fires only
+                              in the 17th call out of 17)
+
+      This is consistent with an AIE2P firmware-side cascade-port
+      watchdog with a threshold somewhere between ~10 % and ~94 %
+      idle-per-frame. A "frame" likely corresponds to the time between
+      two consecutive ``aie.dma_start`` BD epochs (the ObjectFifo
+      input-buffer drain interval). The fingerprint
+      (``DPU PC = 0xffffffff``, ``Context PC = 0x28b060ad``,
+      ``fatal_error = 0x0``, 5.97 s wall = TDR window) matches a
+      "firmware refused to schedule cores" pattern, not a "cores hung
+      after running".
+
+      Falsifiable predictions:
+
+      (1) ``jnz``-removal is necessary: any kernel where ``vmov mcd``
+          appears inside a runtime branch will wedge on AIE2P (5/5
+          tiles in step 7 confirm this).
+      (2) Cascade-active-per-call is sufficient: any kernel where
+          every per-tile call body issues at least one ``vmov mcd``
+          (or ``vmov ..., scd``) will pass on AIE2P (step 8 confirms).
+      (3) Fix-attempt-1 wedged because lifting cascade out into a
+          separate function still left it firing only 1 call out of
+          17 (~6 % cascade-active calls).
+    workaround: |
+      **2026-04-26 update — Followup G: Fix C silicon-EXECUTED + silicon-
+      FALSIFIED on production LSTM.** The Followup E Stage 1 hypothesis
+      ("0 jnz around vmov mcd/scd in any function on any tile is
+      sufficient to lift the wedge") is now empirically REFINED — that
+      invariant is necessary but NOT sufficient for the production-scale
+      kernel. The actually-load-bearing variable is the cascade-port
+      active-call ratio per ts (per the original Followup C predictions
+      table, gaps.yaml lines 530-541, now silicon-supported as the
+      refined model).
+
+      Followup G silicon evidence (state/followup-g/silicon-20260426T025820Z.json):
+
+        - Fix C kernel split landed (8 extern "C" functions; lstm_layer_cascade.cc
+          + lstm_cell_bf16_acc_cascade.py refactored to do build-time
+          per-call kernel selection at the IRON level)
+        - Per-tile ELF disasm verified (state/followup-g/jnz-invariant-*.json):
+          ALL 5 cascade-firing functions on ALL 5 tiles have 0 jnz; only
+          one math-only function (_first_math on tile 0_5, 3 jnz total)
+          contains any jnz and that function has 0 cascade ops. SAME
+          per-tile-ELF invariant Followup E Stage 1 silicon-validated.
+        - Silicon outcome: WEDGE with identical fingerprint to the original
+           baseline:
+            DPU PC: 0xffffffff
+            Context PC: 0x28b060ad
+            msg: 0x1d000001
+            ~5s per-iter NPU wall (TDR window)
+            output buffer: all-zero
+            aie2_tdr_work counter advanced (now at count 530)
+            aie2_dump_ctx fresh in dmesg post-dispatch
+        - Wall: 5.094s; runner exit code: 0 (returned "PASS!" deceptively)
+
+      Cascade-port active-call ratio observation (not yet load-bearing):
+        - Stage 1 reproducer (PASS): 1 call/ts, cascade fires every call
+          → 100 % cascade-active call ratio
+        - Fix C production (WEDGE): 16 calls/ts, cascade fires on 1-2 calls
+          → ~6-12 % cascade-active call ratio
+
+      **2026-04-26 correction**: treating this two-point comparison as
+      root cause was an over-fit. Followup C already over-fit on
+      ``jnz`` around cascade ops, and Fix C satisfied that invariant
+      while still wedging. The active-call-ratio explanation has the
+      same weakness: one PASS sample and one WEDGE sample differ in
+      multiple dimensions (primitive contract, token ordering, and
+      topology), so it should not prescribe a keepalive fix.
+
+      **Production-side status (post-Followup-G)**: Fix C is filed-and-
+      falsified. Two known forward production paths remain:
+
+      (Fix B production) — collapse 16-call IRON loop to 1
+        call/ts AT THE PRODUCTION SCALE. Multi-day; requires the L1 /
+        memtile weight-DMA restructure that Stage 2 scoping rejected
+        as infeasible on AIE2P CoreTile L1 (~64 KB) / single-memtile
+        (~512 KB) capacity. SEE .
+
+      (Contract/topology audit) NEW — retire the keepalive
+        idea and test the actual silicon contract: AccumFifo
+        acquire/release token ordering, producer/consumer balance, and
+        whether the horizontal hop (0,2)->(1,2) is valid under the same
+        stream/DMA pressures as production. SEE .
+
+      The cross-walk's < 0.23 silicon-level prediction remains UNTESTED
+      on silicon — closing still requires either Fix B
+      production or the contract/topology audit to identify
+      a correct production schedule.
+
+      Pre-Followup-G evidence (kept for narrative continuity)
+      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+      Followup E Stage 1 (the hypothesis that Followup G refined):
+
+      Fix B (collapse the 16-call IRON loop into 1 call/ts at the
+      kernel-body level, emit cascade ops UNCONDITIONALLY) was applied
+      to the WEDGING reproducer
+      ``tests/cascade_bisection/topology_5tile_lstm_call_pattern/`` and
+      silicon-tested on AIE2P / NPU2 under the canonical
+      ``bionpu.dispatch.npu_silicon_lock``:
+
+        - Pre-fix: 3 jnz/tile around vmov mcd / vmov scd → WEDGE
+          (DPU PC=0xffffffff, ~5.97s TDR), as established in Followup C
+        - Post-fix: 0 jnz/tile in cascade-firing function in 4/5 tiles
+          (the 5th tile has a 1-jnz seed loop which is NOT around any
+          cascade intrinsic) → silicon **PASS in 1890us** with the
+          5-tile cascade round-trip verifying element-by-element across
+          L=334 timesteps × 96 floats/ts = 32064 elements
+        - Evidence under ``state/followup-e/stage1-fixed-build-v2-*``
+          and ``state/followup-e/stage1-fixed-silicon-*.json``
+
+      Followup C's hypothesis ("jnz-around-vmov-mcd/scd in a per-tile
+      cascade kernel function triggers the AIE2P firmware-side cascade-
+      port watchdog") is now CONFIRMED — Stage 1 PASS demonstrates that
+      removing the jnz around cascade-port intrinsics lifts the wedge
+      while preserving the same 5-tile + memtile-split + L=334 topology
+      and the same 3-host-BO ABI shape as the production LSTM.
+
+      Production-side status (Stage 2)
+      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+      Stage 2 (apply Fix B to ``lstm_layer_cascade.cc`` +
+      ``lstm_cell_bf16_acc_cascade.py``) is **DEFINED but NOT YET
+      EXECUTED** in this followup due to a memory-capacity constraint
+      surfaced during Stage 2 scoping:
+
+      Fix B's "1 call/ts at the kernel-body level" requires the kernel
+      to access ALL 16 weight chunks (4 gates × 4 halves) of the
+      timestep within ONE call. The current ObjectFifo split delivers
+      one chunk per acquire. Two viable production-Fix-B paths:
+
+      (B-prod-1) Bump per-layer ObjectFifo depth to 16 and acquire(16)
+        per ts. **INFEASIBLE on AIE2P**: 16 buffers × 5376 bf16 ×
+        2 bytes = 172 KB per per-layer split × 5 layers = 860 KB;
+        per-tile L1 is ~64 KB on AIE2P (Strix CoreTiles). Verified by
+        inspecting the lowered MLIR of the Stage 1 reproducer build:
+        per-layer ObjectFifo split allocates buffers in CONSUMER core
+        L1 (``aie.buffer(%tile_0_5)`` etc), not in memtile.
+
+      (B-prod-2) Restructure parent frames so each per-layer split
+        delivers a 16-chunk slab per acquire (memtile-resident). New
+        per-layer slab = 16 × 5376 bf16 × 2 = 172 KB; total memtile
+        usage = 5 × 172 KB = 860 KB. **EXCEEDS single-memtile capacity**
+        (AIE2P memtile ≈ 512 KB). Mitigation: distribute across the 5
+        memtiles in column 0 (one per layer; weight delivery becomes
+        per-layer point-to-point shim → memtile → core, no single-shim
+        fan-out). This re-introduces multi-shim host BOs ('s
+        original blocker) unless combined with a shim-side time-mux.
+
+      Both production-Fix-B paths require multi-day weight-DMA
+      restructuring AND interact with 's ABI closure. Stage 2
+      is therefore properly scoped as a separate engineering follow-up
+ rather than a cheap edit.
+
+      **Cheaper production alternative — Fix C / passthrough**: the
+      Fix-C path described below remains viable on production AIE2P
+      capacity (no DMA restructure needed; only kernel-body refactor +
+      IRON-side static call-site selection). The Stage 1 PASS evidence
+      strongly suggests Fix C will also lift the wedge (since it
+      achieves the same "0 jnz around vmov mcd/scd in any cascade-
+      firing function" invariant). Fix C is recommended as the
+      production-side pivot if the cross-walk silicon validation is
+      time-pressured.
+
+      Stage 1's reproducer code
+      ~~~~~~~~~~~~~~~~~~~~~~~~~
+
+      The validated Fix B kernel + IRON topology lives in
+      ``tests/cascade_bisection/topology_5tile_lstm_call_pattern/`` on
+      branch ``followup/E-fix-b-collapse-lstm-cascade``
+      (commit ``f875ebe``). It demonstrates the exact pattern needed
+      for production: ``cascade_5tile_lstm_call_pattern.cc`` collapses
+      the 16-call IRON loop and emits cascade put/get unconditionally;
+      ``cascade_5tile_lstm_call_pattern.py`` makes 1 kernel call per ts
+      while still draining all 16 weight-chunk acquires/releases to
+      preserve the 3-host-BO ABI.
+
+      **Concrete fix prescription (Stage 1 silicon-validated; Stage 2
+      production refactor still pending)**:
+
+      Refactor the LSTM kernel body so cascade intrinsics
+      (``vmov mcd, ...`` / ``vmov ..., scd``) appear UNCONDITIONALLY
+      at every call site on cascade-configured tiles. Three viable
+      approaches in priority order:
+
+      (Fix-B, RECOMMENDED) **Collapse the 16-call IRON loop into 1
+      call/ts at the kernel-body level.** The 16-call decomposition
+      was a peano-register-allocation defensive choice (per
+      DESIGN.md), but the bisection now shows peano can handle the
+      combined call body — what it can't handle is rare-cadence
+      cascade-port emission. Merge the 4-gate × 4-chunk loop into the
+      kernel body, with the cascade ``put_mcd`` / ``get_scd``
+      intrinsics emitted once per call at well-defined entry/exit
+      points. This matches the upstream silicon-tested
+      ``programming_examples/basic/matrix_multiplication/cascade/
+      cascade_mm.cc`` (NPU1) shape. Estimated ~2-3 days of LSTM kernel
+      re-engineering + CPU-reference re-validation + silicon test
+      under the NPU mutex.
+
+      (Fix-C, RETIRED) The per-call cascade-passthrough / keepalive
+      idea is no longer a viable defensive path. It was inferred from
+      a weak active-call-ratio comparison and is not functionally
+      equivalent to step 8 for the production LSTM: extra cascade
+      tokens are visible payload and can shift the real hidden-state
+      token stream. replaces this with an AccumFifo
+      token-ordering + horizontal-hop audit.
+
+      (Fix-A, NOT RECOMMENDED) **Lift cascade into a dedicated
+      extern "C" entry point** — this is what Item-4's Fix-attempt-1
+      tried and it wedged with a worse cascade-port-idle ratio than
+      step 7. Avoid this approach unless combined with the IRON-level
+      passthrough scheme of Fix-C.
+
+      Diagnostic next-step paths if Fix-B/C fail:
+
+      (D1) Build a ONE-tile cascade test (producer = consumer = same
+      tile, intra-tile BM-to-BM register move per AccumFifo's same-
+      tile path) with the 16-call branched pattern. If it wedges, the
+      ``jnz``-around-cascade hypothesis is general to all peano AIE2P
+      cascade; if it passes, the issue is specifically inter-tile
+      cascade-port back-pressure interacting with branched per-tile
+      cores.
+
+      (D2) **Verify the cascade-port-idle-ratio threshold by
+      construction**: build a test with 32 calls/ts where the cascade
+      fires on calls {1, 8, 16, 24} (4 of 32 = 12.5 % active). If it
+      passes, the threshold is between ~10 % and ~94 %; narrow with
+      a 64-call variant.
+
+      (D3) **Upstream report to AMD**: no upstream silicon-tested
+      AIE2P cascade example exists. The followup-C ELF diff narrative
+      (``state/followup-c/04-elf-diff-narrative-*.md``) is now
+      submission-ready and includes a precise reproducer (the
+      ``tests/cascade_bisection/topology_5tile_lstm_call_pattern/``
+      mini-test, NO LSTM math) for AMD support to ratify or refute.
+
+      Long-term fork-side opportunity (out of scope for this followup,
+      but documented for ratification by future fork PR): peano's
+      AIE2P backend should EITHER refuse to compile a cascade-
+      configured tile whose kernel contains a runtime branch over a
+      cascade intrinsic (compile-time error), OR require an explicit
+      proof that branch-local cascade traffic preserves token count and
+      ordering. Do not synthesize "keepalive" traffic implicitly; extra
+      cascade tokens are observable data.
+
+      's ABI closure is independent of this gap and stands.
+      The cross-walk's < 0.23 silicon-level prediction remains
+      UNTESTED on silicon (the production LSTM still wedges; Fix B is
+      validated only on the math-free reproducer so far).
+
+      **Important UNBLOCKING evidence (post-Followup-E)**:
+
+      - The cascade primitive itself works on AIE2P silicon (steps 2-6
+        + step 8 of the bisection).
+      - Followup C's ELF diff localised the wedge-causing instruction-
+        level pattern (jnz around vmov mcd/scd).
+      - **Followup E Stage 1 silicon-PROVES the Fix B prescription**:
+        applying it to a 5-tile + memtile-split + L=334 reproducer
+        with the exact production topology shape lifts the wedge and
+        produces correct cascade round-trip data in 1890us (3000x
+        faster than the wedging baseline's TDR).
+
+      Production-side remaining work is now : validate
+      AccumFifo token ordering and the horizontal hop before another
+      production rewrite is attempted.
+
+    upstream_issue: null
+    blocks:
+      - ""
+    severity: "blocker"
+    status: "open"
+
+  - id: ""
+    category: "correctness"
+    op_or_pattern: "Production lstm_layer_cascade.cc refactor — Fix C silicon-EXECUTED + silicon-FALSIFIED 2026-04-26; Fix B production remains possible but is gated by contract/topology audit"
+    attempted: |
+      **2026-04-26 update — Followup G: Fix C silicon-tested + silicon-
+      FALSIFIED.** Same wedge fingerprint as the original 
+      baseline despite achieving the Followup E Stage 1-validated
+      per-tile-ELF invariant. The later active-call-ratio explanation
+      is now treated as an over-fit, not a proven root cause. See
+       for the replacement AccumFifo token-ordering +
+      horizontal-hop audit.
+
+      Followup G silicon evidence (state/followup-g/silicon-20260426T025820Z.json):
+        - Fix C kernel split landed: 8 extern "C" functions split
+          across roles (lstm_layer_cascade.cc rev'd to 8 fns;
+          lstm_cell_bf16_acc_cascade.py IRON loop unrolls inner g/chunk
+          loops at IRON-build time and statically selects which kernel
+          symbol to call at each of the 16 (g, chunk) call-sites per ts)
+        - Per-tile ELF disasm (state/followup-g/jnz-invariant-*.json):
+          ALL 5 cascade-firing functions on ALL 5 tiles have 0 jnz; the
+          one math-only function with jnz (_first_math, tile 0_5, 3 jnz)
+          contains 0 cascade ops. Same per-tile-ELF invariant Followup E
+          Stage 1 silicon-validated.
+        - Silicon outcome: WEDGE with identical fingerprint:
+            DPU PC: 0xffffffff
+            Context PC: 0x28b060ad
+            msg: 0x1d000001
+            ~5s per-iter NPU wall (TDR window)
+            output buffer: all-zero
+            aie2_tdr_work counter advanced (now at count 530)
+            aie2_dump_ctx fresh in dmesg post-dispatch
+
+      Cascade-port active-call ratio analysis (now-load-bearing):
+        - Stage 1 reproducer (PASS): 1 call/ts, cascade fires every call
+          → 100 % cascade-active call ratio
+        - Fix C production (WEDGE): 16 calls/ts, cascade fires on 1-2
+          calls only → ~6-12 % cascade-active call ratio (matches the
+          wedging fix-attempt-1 row of the Followup C bisection table)
+
+      **Pre-Followup-G context (Stage 2 scoping during Followup E)**:
+
+      Followup E Stage 1 silicon-validated the Fix B prescription on a
+      math-free 5-tile + memtile-split + L=334 reproducer
+      (``tests/cascade_bisection/topology_5tile_lstm_call_pattern/``,
+      branch ``followup/E-fix-b-collapse-lstm-cascade`` commit
+      ``f875ebe``): collapsing 16-conditional-calls/ts to 1-unconditional-
+      call/ts reduces per-tile cascade-fn jnz from 3 to 0 and lifts the
+       firmware-timeout wedge (silicon PASS in 1890us, vs
+      ~5.97s TDR for the WEDGING baseline).
+
+      Followup E Stage 2 (Fix B production) was scoped but **not
+      executed** in Followup E — production application requires either:
+
+      (B-prod-1) Bumping per-layer ObjectFifo depth to 16 + acquire(16)
+        per ts. Verified via inspection of the Stage 1 build's
+        ``input_with_addresses.mlir`` that per-layer ObjectFifo split
+        buffers allocate in CONSUMER core L1 (``aie.buffer(%tile_0_5)``
+        etc) — depth-16 storage cost would be 16×5376bf16×2 = 172 KB
+        per per-layer split, well exceeding AIE2P CoreTile L1 (~64 KB).
+        INFEASIBLE.
+
+      (B-prod-2) Restructuring parent frames so each per-layer split
+        delivers a 16-chunk slab per acquire (memtile-resident).
+        Per-layer slab = 172 KB; 5 layers in single memtile = 860 KB
+        > 512 KB single-memtile capacity. Mitigation: 5-memtile
+        per-layer point-to-point routing (re-introduces multi-shim
+        BO problem solved by ).
+
+      (C-prod) Fix C — split per-call kernel into two extern "C"
+        functions (real cascade-firing + math-only), with
+        IRON-side static call-site selection on the (g, chunk) index.
+        Neither function contains a runtime branch over a cascade
+        intrinsic; the IRON-level branch is at the func.call selection
+        site. Achieves the same "0 jnz around vmov mcd/scd in any
+        cascade-firing function" invariant as Fix B without DMA
+        restructure. Followup G silicon-tested this and FALSIFIED the
+        prediction for production.
+
+    failed_with: null
+    root_cause: |
+      Production LSTM kernel (``lstm_layer_cascade.cc``) has cascade
+      put inside ``if (g == 3 && chunk_idx == 3)`` and cascade get
+      inside ``if (g == 0 && chunk_idx == 0)`` — exactly the pattern
+      Followup C's ELF diff localised as the AIE2P firmware-side
+      cascade-port watchdog trigger. The IRON-level for-loop
+      (``for g in range_(N_GATES): for chunk in range_(4)``) puts each
+      kernel call in a runtime-branch context, and peano emits the
+      conditional cascade as 3 jnz/tile around vmov mcd/scd.
+
+      The math contract (16 chunk × 4 gate matmuls + bias accumulation
+      + activation update + state writeback per timestep) is correct
+      and silicon-validated at the per-cell level ('s
+      ``lstm_cell_bf16_acc.cc``). The cascade-stream variant adds
+      inter-tile cascade put/get which can be lifted at the kernel-body
+      level (Fix B) or at the IRON-call-site level (Fix C) per the
+      Followup C / Followup E analysis.
+
+    workaround: |
+      **Fix C is silicon-FALSIFIED (Followup G, 2026-04-26).** The
+      earlier Fix C variant A / cascade-passthrough keepalive proposal is
+      explicitly retired. It was inferred from an N=2 comparison
+      (Stage 1 PASS at 100% cascade-active vs Fix C WEDGE at ~6-12%)
+      and would likely corrupt data: downstream tiles block on the first
+      real ``get_scd`` while upstream tiles compute 15 math calls before
+      the real ``put_mcd``; injecting keepalive tokens into those calls
+      changes the token stream rather than acting as a no-op.
+
+      The next forward path is : audit the AccumFifo primitive
+      contract and the production topology. Specifically, validate
+      acquire/release token ordering, producer/consumer balance, and the
+      horizontal hop (0,2)->(1,2) under a production-shaped schedule
+      before prescribing another kernel rewrite.
+
+      **Fix B production** (longer-term; multi-day; capacity-blocked)
+
+      Collapse the 16-call IRON loop to 1 call/ts AT THE PRODUCTION
+      SCALE — same prescription Followup E Stage 1 silicon-validated
+      on the math-free reproducer. Requires the L1 / memtile weight-DMA
+      restructure that Followup E Stage 2 scoping rejected as
+      infeasible:
+
+      (B-prod-1) Bumping per-layer ObjectFifo depth to 16 + acquire(16)
+        per ts. Verified via inspection of the Stage 1 build's
+        ``input_with_addresses.mlir`` that per-layer ObjectFifo split
+        buffers allocate in CONSUMER core L1 (``aie.buffer(%tile_0_5)``
+        etc) — depth-16 storage cost would be 16×5376bf16×2 = 172 KB
+        per per-layer split, well exceeding AIE2P CoreTile L1 (~64 KB).
+        INFEASIBLE.
+
+      (B-prod-2) Restructuring parent frames so each per-layer split
+        delivers a 16-chunk slab per acquire (memtile-resident).
+        Per-layer slab = 172 KB; 5 layers in single memtile = 860 KB
+        > 512 KB single-memtile capacity. Mitigation: 5-memtile
+        per-layer point-to-point routing (re-introduces multi-shim
+        BO problem solved by ).
+
+      Both Fix B production paths require multi-day weight-DMA
+      restructuring AND interact with 's ABI closure.
+      Estimated 3-5 days. Do not start this until has
+      separated topology/primitive-contract failure from schedule shape.
+
+      **Reproducer + reference code**
+
+      Stage 1's silicon-validated Fix B applied to the math-free
+      reproducer is at
+      ``tests/cascade_bisection/topology_5tile_lstm_call_pattern/`` on
+      branch ``followup/E-fix-b-collapse-lstm-cascade`` (commit
+      ``f875ebe``). Use as the reference shape for production Fix B.
+      Use the upstream ``programming_examples/basic/matrix_multiplication
+      /cascade/cascade_mm.cc`` (NPU1) as the reference shape for the
+      kernel-body collapsed form.
+
+      The cross-walk's < 0.23 silicon-level prediction is testable
+      once this gap is closed.
+    upstream_issue: null
+    blocks:
+      - ""
+    severity: "workaround"
+    status: "open"
+
+  - id: ""
+    category: "correctness"
+    op_or_pattern: "Production cascade wedge root-cause audit: AccumFifo token-ordering contract + horizontal-hop validity falsified by microtest. Retires the over-fit Fix C variant A keepalive hypothesis."
+    attempted: |
+      Followup G silicon-tested Fix C (8 extern "C" function split with
+      IRON-side static call-site selection) on the production LSTM
+      cascade kernel and observed WEDGE despite achieving the Followup E
+      Stage 1-validated per-tile-ELF invariant ("0 jnz around vmov mcd /
+      vmov scd in any function on any tile"). Evidence at
+      ``state/followup-g/silicon-20260426T025820Z.json`` and the per-tile
+      ELF disasm/jnz-invariant snapshots
+      (``state/followup-g/jnz-invariant-20260426T025506Z.json``).
+
+      The wedge fingerprint is identical to the original 
+      baseline:
+
+        DPU PC: 0xffffffff
+        Context PC: 0x28b060ad
+        msg: 0x1d000001
+        ~5s per-iter NPU wall (TDR window)
+        output buffer: all-zero
+        aie2_tdr_work counter advanced (now at count 530)
+        aie2_dump_ctx fresh in dmesg post-dispatch
+
+      Per-tile cascade-port active-call ratio comparison that originally
+      motivated Fix C variant A:
+
+        Stage 1 reproducer (PASS): 1 call/ts, cascade fires every call
+          → 100 % cascade-active call ratio, silicon PASS in 1890us
+        Fix C production (WEDGE): 16 calls/ts, cascade fires on 1-2
+          calls only → ~6-12 % cascade-active call ratio, silicon WEDGE
+        Original Followup C step 8 PASS variant: 16 calls/ts, every
+          call fires 1 cascade word → 100 % cascade-active call ratio
+          (math-free stream round-trip, not production LSTM semantics)
+
+      **2026-04-26 correction**: the active-call-ratio conclusion was
+      over-fit on one PASS sample and one WEDGE sample. It was useful as
+      a clue, but not strong enough to prescribe a keepalive. The same
+      investigation pattern already misled Followup C: a visible
+      difference was promoted to root cause, the prescribed invariant
+      was satisfied, and the production kernel still wedged. The host
+      drain-size fixes also showed that not every "wedge" fingerprint is
+      firmware/silicon. therefore pivots from a keepalive fix
+      to measuring the primitive/topology contract directly.
+
+      **2026-04-26 token-order result**: added
+      ``tests/cascade_bisection/topology_accum_token_order``. The
+      microtest carries explicit sequence-number payloads through
+      AccumFifo with the production-shaped 16-call schedule:
+
+        FIRST: 15 math calls, then 1 put_mcd payload
+        MIDDLE: 1 get_scd payload, 14 math calls, then 1 put_mcd payload
+        LAST: 1 get_scd payload, then 15 math calls
+
+      Silicon results on AIE2P:
+
+        vertical4, 8 timesteps: PASS, byte-equal, 811us
+        horizontal5, 8 timesteps: PASS, byte-equal, 818us
+        horizontal5, 334 timesteps: PASS, byte-equal, 1144us
+
+      This falsifies the simple AccumFifo token-ordering /
+      producer-consumer-balance explanation and the standalone
+      (0,2)->(1,2) horizontal-hop validity explanation. The production
+      wedge is now more likely in the LSTM-specific interaction: weight
+      ObjectFifo/memtile split, static state arrays, heavy aie_api math,
+      or the way role-specific LSTM calls combine those with cascade.
+
+    failed_with: |
+      Fix C silicon-tested 2026-04-26 (state/followup-g/silicon-*.json):
+        - per-tile ELF jnz invariant: SATISFIED (verified via
+          jnz-invariant-*.json: cascade-firing fns have 0 jnz on all 5
+          tiles)
+        - cascade-port active-call ratio: 6-12 % (observed difference,
+          no longer treated as proven root cause)
+        - silicon outcome: WEDGE (identical fingerprint to 
+          baseline)
+    root_cause: |
+      UNKNOWN, but narrowed. The simple AccumFifo token-ordering /
+      producer-consumer-balance and standalone horizontal-hop theories
+      are falsified by the production-shaped token-order microtest:
+      horizontal5 with 334 timesteps completes byte-equal on silicon.
+
+      Remaining silicon-grounded suspects are now LSTM-specific:
+
+      1. **Weight ObjectFifo / memtile split interaction**: the
+         production kernel carries consolidated weight DMA, split
+         per-layer chunks, and 16 acquired/released weight chunks per
+         timestep. The token-order test deliberately excludes this.
+      2. **Kernel-body state/math interaction**: the production LSTM
+         combines static h/c/gate buffers, heavy aie_api loops, bf16
+         math, and cascade get/put in role-specific functions. The
+         token-order test proves the schedule without those bodies.
+      3. **Schedule/data contract mismatch inside LSTM calls**: the
+         production kernel consumes layer input at (g=0,chunk=0) and
+         produces output at (g=3,chunk=3). Any rewrite that changes
+         cascade traffic between those points can still silently corrupt
+         hidden-state payloads, even though the primitive schedule is
+         sound in isolation.
+    workaround: |
+      **Retired path**: do not implement Fix C variant A /
+      cascade-passthrough keepalive. It is not semantics-preserving
+      unless it can prove token order and payload identity, and no such
+      proof exists for the current production schedule.
+
+      **Completed bisection**:
+
+      1. Add a microtest that uses the same 4+1 placement and
+         horizontal hop as production but carries explicit sequence
+         numbers through AccumFifo. Assert exact token order and count
+         at every layer, not just liveness. DONE.
+      2. Add a vertical-only equivalent of the same token-order test.
+         Difference between vertical-only PASS and 4+1 FAIL isolates the
+         horizontal hop. Matching outcomes point back to AccumFifo
+         scheduling or kernel usage. DONE; both PASS.
+      3. Add a production-shaped schedule microtest: 16 calls/timestep,
+         real payload only at the production get/put sites, no
+         keepalive. This should distinguish "call ratio" from "token
+         placement contract" without corrupting data. DONE; horizontal5
+         with 334 timesteps PASS.
+
+      **Next bisection plan**:
+
+      4. Add weight-ObjectFifo pressure to the token-order microtest:
+         consolidated weights split per layer, 16 chunks/timestep, but
+         still no LSTM math. If this wedges, the memtile/objectfifo
+         traffic is the missing ingredient.
+      5. If weight pressure passes, add the LSTM static-state buffer
+         touches without bf16 math. Then add aie_api math in narrow
+         slices. The target is the first minimal silicon FAIL after the
+         token-order PASS.
+      6. Only after that should we revisit a production rewrite such as
+         Fix B or a packetized/monolithic schedule.
+
+      The cross-walk's < 0.23 silicon-level prediction remains UNTESTED
+      on silicon until identifies a correct cascade schedule
+      or 's Fix B production lands.
+    upstream_issue: null
+    blocks:
+      - ""
+    severity: "workaround"
+    status: "open"
+
+  - id: ""
+    category: "schedule-dataflow"
+    op_or_pattern: "Production weight direct-stream suffix chain"
+    attempted: |
+      Added an opt-in ``production-weight-direct-stream`` experiment after
+      the CRISPR packetized-stream result. The path keeps the production
+      host ABI on tile 0, replaces full-frame inter-core ObjectFifos with
+      explicit Core:0 ``aie.flow`` routes, and moves bf16 payload transfer
+      into Peano AIE2P C++ intrinsics:
+
+        - ``dorado_prod_stream_first_*``
+        - ``dorado_prod_stream_middle_*``
+        - ``dorado_prod_stream_last_*``
+
+      The L=1 xclbin builds successfully:
+
+        make NPU2=1 experiment=production-weight-direct-stream seq=1 all
+
+      Follow-up bisection added ``production-weight-direct-stream-probe``:
+      the same production 16-frame weight traffic and same four Core:0
+      direct-stream routes, but with cascade and LSTM math removed. The last
+      tile writes the first 96 bf16 words of the final streamed layer chunk
+      so the probe has a byte-equality oracle.
+    failed_with: |
+      Silicon smoke timed out after 120 seconds with no output:
+
+        logs/dorado-prod-direct-stream-20260426T084728Z
+
+      This is not the previous aiecc tile-memory failure. The build gets
+      past the full-frame middle-tile ObjectFifo allocation problem, but
+      the naive chain deadlocks at runtime.
+
+      The no-cascade probe PASSED on silicon:
+
+        logs/dorado-prod-direct-stream-probe-20260426T085933Z
+        Avg NPU time: 3720us
+        output: 96/96 nonzero, byte-equal to expected final chunk
+    root_cause: |
+      The CRISPR stream pattern does not directly transfer to Dorado because
+      Dorado has an inter-layer sequence dependency. Middle layer 1 receives
+      the first weight-frame suffix and then blocks on the layer-0 cascade
+      value before it can receive frame 2. Layer 0 cannot produce that
+      cascade value until after all 16 gate/chunk computations for the
+      timestep, but it cannot start streaming frame 2 because layer 1 is no
+      longer draining the stream.
+
+      In short:
+
+        stream frame 0 -> layer 1 waits on cascade
+        layer 0 needs to stream frames 1..15 before cascade_put
+        layer 0 blocks because layer 1 stopped draining
+
+      Avoiding this requires either buffering all 16 local chunks per layer
+      before cascade (too large for tile DM), or changing the distribution
+      topology so each layer's weights arrive after its cascade input without
+      relying on the previous layer to hold/forward later-layer suffixes.
+
+      The passing no-cascade probe rules out the direct Core:0 stream route
+      and Peano ``put_ms`` / ``get_ss_int`` bf16 packing as the root cause.
+      The failure requires the production-style cascade wait interleaved with
+      the stream-forwarding schedule.
+    workaround: |
+      Keep ``production-weight-direct-stream`` as a buildable negative
+      experiment, not a promotion candidate. The next viable Dorado lever is
+      not a CRISPR-style suffix chain; it is one of:
+
+        1. a host/runtime ABI that delivers per-layer chunks directly to each
+           tile without exceeding kernel BO limits,
+        2. a memtile/BD layout that performs the split without the unsafe
+           full production topology, or
+        3. a monolithic per-layer schedule that computes all chunks with
+           local weights already resident, then emits cascade.
+    upstream_issue: null
+    blocks:
+      - ""
+    severity: "blocker"
+    status: "open"
+
+  - id: ""
+    category: "host-abi"
+    op_or_pattern: "Five independent per-layer production weight BOs"
+    attempted: |
+      Added ``production-weight-direct-layer-probe`` to test direct runtime
+      fanout: five independent layer-weight runtime inputs, one per tile,
+      no memtile split, no tile-to-tile forwarding, no cascade, and no LSTM
+      math. The runner keeps the existing consolidated weight file format
+      and splits it into five layer-major BOs under
+      ``--direct-layer-weights``.
+
+      The xclbin builds cleanly:
+
+        make NPU2=1 experiment=production-weight-direct-layer-probe seq=1 all
+
+      Unlike the stream-suffix probe, this emits no first-tile 53.7KB
+      bank-placement warning because each tile only receives one 5376-bf16
+      chunk buffer.
+    failed_with: |
+      Host launch fails before dispatch:
+
+        logs/dorado-prod-direct-layer-probe-20260426T090346Z
+        terminate called after throwing an instance of 'std::out_of_range'
+        what(): vector::_M_range_check: __n (which is 8) >= this->size() (which is 8)
+
+      The failure happens when the runner asks XRT for ``kernel.group_id(8)``
+      while allocating the fifth layer-weight BO. The kernel's argument group
+      table has only indices 0..7 in this build.
+    root_cause: |
+      The current MLIR_AIE/XRT ABI cannot launch input + five independent
+      per-layer weight BOs + output + trace. This reproduces the original
+      reason the production path consolidated weights into one host BO before
+      using memtile split.
+
+      Direct runtime fanout is therefore not a drop-in replacement for
+      ``ObjectFifoHandle.split`` unless the BO count is reduced or the host
+      ABI/toolchain limit is lifted.
+    workaround: |
+      Continue with reduced-BO layouts:
+
+        1. four direct per-layer BOs plus one packed/shared BO for the
+           remaining layer(s),
+        2. two or three packed group BOs with on-tile local unpacking,
+        3. a memtile split variant with fewer output endpoints or safer BD
+           pressure than the original production split.
+
+      The direct-layer probe is retained as a buildable ABI boundary test,
+      not a silicon performance candidate.
+    upstream_issue: null
+    blocks:
+      - ""
+    severity: "blocker"
+    status: "open"

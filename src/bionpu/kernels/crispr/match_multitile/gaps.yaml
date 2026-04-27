@@ -1,0 +1,57 @@
+# gaps.yaml — toolchain-gap report (multi-tile streaming CRISPR match).
+# Schema: bionpu/report/gaps.schema.json (v1.0.0).
+# Convention: bionpu/kernels/GAPS-CONVENTION.md.
+
+schema_version: "1.0.0"
+task_id: ""
+kernel_name: "crispr_match_multitile"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T11:15:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+
+gaps:
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "ObjectFifo fan-in: 4 producers (match tiles) → 1 consumer (joiner) on AIE2P"
+    attempted: |
+      Initial topology per CRISPR PRD §4.2 sketch: 4 match tiles (each
+      handling 32 of 128 guides) feeding 4 partial-output ObjectFifos into
+      a single joiner tile (Tile Z). IRON lowering accepted the
+      topology and emitted valid MLIR (4 separate `partial_<i>`
+      ObjectFifos with the joiner as the lone consumer of each). aiecc
+      then placed the joiner on tile (1, 2) and asked it to consume 4
+      input streams via S2MM DMA channels.
+    failed_with: |
+      <unknown>:0: error: 'aie.tile' op number of input DMA channel exceeded!
+      <unknown>:0: note: see current operation: %2 = "aie.tile"() <{col = 1 : i32, row = 2 : i32}> : () -> index
+      AIECC COMPILATION FAILED
+      (lib/Dialect/AIE/Transforms/AIEObjectFifoStatefulTransform.cpp:2107)
+    root_cause: |
+      AIE2P compute tiles expose only 2 input DMA channels (S2MM
+      direction). The IRON ObjectFifo lowering assigns one S2MM channel
+      per consumer FIFO endpoint on the consuming tile; a 4-fan-in joiner
+      therefore needs 4 channels and exceeds the 2-channel budget. This
+      is a *hardware* constraint surfaced through the compiler — not a
+      Peano bug — but the IRON layer offers no built-in pattern for
+      DMA-channel multiplexing (memtile aggregation, packet-mode
+      multiplexing, or temporal sharing) at the Worker / ObjectFifo
+      abstraction level. The error fires at placement time, not at
+      ObjectFifo construction time, so the "the topology won't fit"
+      feedback comes after a successful Python lowering.
+    workaround: |
+      Reduced fan-out to 2 match tiles × 64 guides per tile; joiner
+      consumes 2 input partials (within the 2-input-DMA-channel budget).
+      Functionally correct (byte-equal to single-tile) and exercises
+      the full multi-tile broadcast + fan-out + join dataflow. The wider
+      4-tile topology is recoverable by inserting a memtile-buffered
+      aggregation stage in front of the joiner (the memtile has more DMA
+      channels and supports concatenation via stream-offsets), but that
+      lift was deferred past v1 because (a) the C-M4 milestone is
+      "does multi-tile work at all", not optimal width, and (b) the PRD
+      risk row 3 (tile-local memory) was the predicted wall — DMA
+      channels were not, which is itself a publishable finding for the
+      umbrella RQ4 deliverable.
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"

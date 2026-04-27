@@ -1,0 +1,21 @@
+# gaps.yaml — toolchain-gap report (single-tile CRISPR match).
+# Schema: bionpu/report/gaps.schema.json (v1.0.0).
+# Convention: bionpu/kernels/GAPS-CONVENTION.md.
+#
+# reports CLEAN: 128 × 4096 single-tile elementwise + reduce
+# compiled cleanly via IRON + Peano + aiecc. AIE2P data memory at 27%
+# usage (17,664 / 65,536 B) — plenty of headroom. No expressibility
+# blockers, no DMA-channel issues at this scale (those surfaced in
+# when scaling to multiple match tiles → joiner — see
+# ). Empty `gaps: []` per GAPS-CONVENTION's load-bearing
+# distinction: reporting clean, not absent.
+
+schema_version: "1.0.0"
+task_id: ""
+kernel_name: "crispr_match_singletile"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T08:00:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+
+gaps: []

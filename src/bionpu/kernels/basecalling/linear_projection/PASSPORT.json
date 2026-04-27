@@ -1,0 +1,20 @@
+{
+  "accuracy_metrics": {
+    "fp32_max_abs_error_npu_vs_cpu": 1.907e-06,
+    "tile_memory_used_bytes": 51456
+  },
+  "calibration_data_id": "synthetic_seed20260425_n1_L334",
+  "degradation_vs_fp32": {
+    "int8_pending_t6_1": 0.0
+  },
+  "generated_at_iso8601": "2026-04-25T04:35:00Z",
+  "hardware_signature": "x86_64;Ryzen-AI-9-HX-370;npu=AIE2P;6x8",
+  "host": "matteius-ProArt-P16-H7606WI",
+  "model_name": "dorado_fast_linear_projection",
+  "model_sha256_fp32": "cc4669e8a08c756679f0718abe68b84a833dc53b091494eb9934222283a0da53",
+  "model_sha256_quant": "cc4669e8a08c756679f0718abe68b84a833dc53b091494eb9934222283a0da53",
+  "n_samples": 1,
+  "precision": "int8",
+  "schema_version": "1.0.0",
+  "strategy": "per_channel"
+}

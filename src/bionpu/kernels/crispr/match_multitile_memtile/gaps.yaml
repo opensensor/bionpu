@@ -1,0 +1,17 @@
+# gaps.yaml — toolchain-gap report (memtile-aggregated 4-into-1
+# CRISPR match kernel; AM020 cross-walk follow-up).
+# Schema: bionpu/report/gaps.schema.json (v1.0.0).
+# Convention: bionpu/kernels/GAPS-CONVENTION.md.
+
+schema_version: "1.0.0"
+# Cross-walk follow-up retrofit of ; same task_id family so the
+# aggregator groups gaps under the multi-tile work. Per GAPS-CONVENTION,
+# kernel_name disambiguates the specific kernel.
+task_id: ""
+kernel_name: "crispr_match_multitile_memtile"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T17:30:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+
+gaps: []

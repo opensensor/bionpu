@@ -1,0 +1,313 @@
+# gaps.yaml — toolchain-gap report (PAM filter + threshold + sparse-emit).
+# Schema: bionpu/report/gaps.schema.json (v1.0.0).
+# Convention: bionpu/kernels/GAPS-CONVENTION.md.
+
+schema_version: "1.0.0"
+task_id: ""
+kernel_name: "crispr_pam_filter"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T13:00:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+
+gaps:
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "Stream-conditional forward (skip-or-pass at ObjectFifo producer side)"
+    attempted: |
+      Tile A's intended semantics: read each input window, check the
+      PAM byte, and *conditionally acquire/release* the
+      `windows_out` ObjectFifo only for windows that pass NGG. The
+      goal was real cycle savings on the match tiles in the
+      filter-early path (only ~12.5% of windows trigger downstream
+      mismatch arithmetic). IRON's Worker / ObjectFifo abstraction
+      models a fixed-stride producer-consumer pipeline: each
+      `acquire(1)` produces (or consumes) one logical element, and
+      a release count must match the acquire count modulo the FIFO
+      depth. There is no first-class "skip this element" or
+      "variable rate per chunk" pattern.
+    failed_with: |
+      <no diagnostic — pattern is simply absent from the IRON
+      Surface as documented at the time of this commit. The same gap
+      shows up in mlir-aie/programming_examples/algorithms/for_each.py
+      where every iteration emits exactly one output (no skip).>
+    root_cause: |
+      ObjectFifo's static-rate contract is the right abstraction for
+      most dataflow programs (lets the placer reason about DMA rates
+      and tile-buffer sizing) but does not natively express "drop
+      with no replacement" — which is what filter-early would ideally
+      do. A general fix likely requires either (a) a packet-mode
+      ObjectFifo with end-of-packet markers (some support exists for
+      AIE-ML targets but not exposed via IRON on AIE2P at
+      time of writing), or (b) a memtile-buffered compaction stage
+      that emits a sparse run + a per-chunk count to downstream
+      tiles.
+    workaround: |
+      v1 always forwards a full-size 64-window chunk out of Tile A;
+      PAM-failing windows are zero-filled so the match tiles compute
+      a stable (but discardable) result, and the per-window pam_meta
+      byte gates the sparse-emit at Tile Z. This means filter-early
+      saves DMA-out volume (sparse stream is 8x smaller) but does
+      NOT save match-tile cycles in v1. Real match-tile savings
+      require either (1) folding the PAM check INTO the match
+      kernel itself ( territory — use a CPU-style branch to
+      skip the inner-loop popcount when pam_meta[w] == 0) or (2) a
+      memtile-compacted sparse window stream out of Tile A. (1) is
+      cheap and recoverable in ; (2) is a larger lift and
+      likely / future. For C-M5 the byte-equality + sparse-
+      emit-volume gates are the load-bearing assertions; the
+      cycle-cost ratio is reported but not required to be 8x.
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"
+    status: "closed-pending-orchestrator-wheel-rebuild"
+    closure_ref:
+      fork_repo: "https://github.com/opensensor/mlir-aie"
+      fork_branch: "feature/-variable-rate-fifo"
+      fork_commit: "02cef1591e4658b93d20d8acb6dcc3db09d0b45e"
+      summary: |
+         lands aie.iron.VariableRateFifo (sibling to
+        PacketFifo from ). The new IRON primitive resolves the
+        single-producer / conditional-forward half of this gap by
+        adding a discard(n) API on the producer handle and a
+        marker discardable attribute (aie.variable_rate = true)
+        on the lowered ObjectFifoCreateOp. The
+        AIEObjectFifoStatefulTransformPass consumes the marker in
+        unrollForLoops (skipping the LCM unroll on variable-rate
+        fifos) and in the split-fifo attr-propagation slot
+        (mirroring the SparseFifo propagation).
+        Lit tests under
+        third_party/mlir-aie/test/objectFifo-stateful-transform/
+        verify both the LCM-unroll opt-out behavior and the
+        cross-column split-fifo lowering. Worked example at
+        third_party/mlir-aie/programming_examples/basic/variable_rate_filter/.
+        DESIGN.md alongside the primitive at
+        third_party/mlir-aie/python/iron/VARIABLE_RATE_DESIGN.md.
+
+        T9  integrates the primitive into pam_filter.py,
+        replacing the static-rate ObjectFifo on the PAM-filter
+        producer side. Combined with T3's vectorisation half of
+        , the dynamic-fifo integration is expected to
+        drive per-launch kernel-time well below the
+        vectorisation-only floor. Status flips to ``closed`` once
+        T9 ratifies the silicon-level cycle-time win.
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "Memtile-aggregated 4-match-tile fan-in (recovers 's 4-tile parallelism)"
+    attempted: |
+      Inherited from 's gaps.yaml entry — the AIE2P
+      compute-tile 2-input-DMA-channel constraint forces the joiner
+      tile to consume only 2 partials, capping the match-tile fan-out
+      at 2. We considered inserting a memtile-buffered aggregation
+      stage in front of Tile Z to combine 4 match-tile partials into
+      2 wider partials before Tile Z's input DMAs, recovering the 4-
+      tile match parallelism the original PRD §4.2 sketch wanted.
+    failed_with: null
+    root_cause: |
+      The IRON surface supports MemTile placement explicitly
+      via `memtile=` arguments on ObjectFifo, but the
+      "concatenation-by-stream-offsets" pattern needed for memtile
+      aggregation is a placement-time construct rather than a
+      first-class lowering rule. Building it requires hand-placement
+      of the memtile, which (a) is significantly harder to reason
+      about than the broadcast pattern uses and (b) only pays
+      off if filter-early's match-tile cycle savings get unlocked
+      via 's resolution. So we deferred the lift.
+    workaround: |
+      Keep 's 2-match-tile topology unchanged. Sparse-emit DMA
+      volume (the actual filter-early win in v1) is independent of
+      match-tile parallelism, so deferring the 4-tile recovery does
+      not block the C-M5 byte-equality gate or the filter-early-vs-
+      late comparison. The 4-tile path is recoverable in / 
+      once lands a real cycle saving worth scaling out.
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "Ring-buffer back-pressure / overrun protection at Tile Z"
+    attempted: |
+      Tile Z's sparse-emit ring buffer is sized for 256 records per
+      chunk (per-slot). Worst case at threshold 4 on highly
+      degenerate input (all-G windows with matching guide library)
+      can produce far more — up to 64 windows * 128 guides = 8192
+      records per chunk if every guide matches every window. We
+      considered an in-tile back-pressure path: when n_records
+      approaches the slot cap, signal a downstream "drain me first"
+      state to the host.
+    failed_with: null
+    root_cause: |
+      ObjectFifo back-pressure is implicit (producer blocks on
+      `acquire` if the consumer has not released a slot) but the
+      consumer here is the shim-DMA-out, which the host drives.
+      There's no IRON-level "wait for the host to consume" beyond
+      the natural double-buffering semantics. A safer pattern would
+      be a host-side ring with a producer-pointer / consumer-pointer
+      protocol (ala kfifo) but that requires more mlir-aie surface
+      than we have on AIE2P today.
+    workaround: |
+      **2026-04-26 update**: this gap firing on real chr22 + the test
+      guides was eventually filed as and FIXED by bumping
+      ``EMIT_SLOT_RECORDS`` from 256 to 1024. The earlier "max records
+      / chunk well under 200" claim was wrong — it relied on synthetic
+      random ACGT, which doesn't exercise repeat-rich biology. Real
+      chr22 reaches 508 records per sub-chunk (4096-window IRON chunk
+      → 64 sub-chunks of 64 windows; the cap is per-sub-chunk).
+
+      Pre-fix v1 hardcoded the per-slot record cap at 256 and silently
+      truncated beyond that (with a kernel-side `goto done`). The
+      host-side post-pass would detect `n_records == 256` and warn but
+      did not propagate the warning to canonical TSV output; that's
+      why the chr22 truncation went unnoticed until the visualizer
+      surfaced the byte-equality mismatch.
+    upstream_issue: null
+    blocks: []
+    severity: "cosmetic"
+  - id: ""
+    category: "correctness"
+    op_or_pattern: "crispr_pam_filter (early + late) — Tile-Z EMIT_SLOT_RECORDS=256 cap silently dropped records on chr22's repeat-rich sub-chunks. FIXED 2026-04-26 by bumping the cap to 1024."
+    attempted: |
+      Surfaced 2026-04-26 by the new ``bionpu crispr race`` web visualizer
+      and confirmed independently via the existing tested e2e-compare on
+      chr22:
+
+        python tracks/crispr/bench/run_npu_e2e_compare.py \
+          --target data_cache/cas-offinder/genomes/chr22.fa \
+          --guides AAAAAAAAAAAAAAAAAAAA,CCCCCCCCCCCCCCCCCCCC \
+          --ops late \
+          --out-dir results/crispr/e2e-npu-compare-chr22
+
+      Observed (sequential, no concurrency):
+
+        host (force_host=True):  41,011 raw records → 6,487 canonical rows
+        NPU late (silicon):      40,006 raw records → 6,478 canonical rows
+        byte_equal_to_host:      false
+        diff:                    9 canonical rows host has, NPU does not;
+                                 zero rows NPU has, host does not.
+
+      Performance result is unchanged and clean (5.11x sequential
+      speedup, 32.9 s NPU vs 168.2 s host on chr22); this gap is a
+      correctness anomaly, not a throughput one.
+
+      Diff localization:
+
+        - All 9 missing canonical rows have lowercase letters in their
+          ``dna`` column (soft-masked GRCh38 repetitive regions).
+          Initially this looked like a case-handling bug.
+        - Refined: ``tracks/crispr/cli/scan.py:376`` uppercases the
+          full sequence before window-packing, so both lanes see
+          identical uppercase windows. Soft-masking is a presentation
+          artifact in the TSV (``dna`` column is read back from the
+          original sequence after the hit).
+        - 6,034 / 6,487 (93%) of host's rows ALSO contain lowercase
+          letters in their ``dna`` column and are NOT missing on NPU.
+          So lowercase positions are not the load-bearing variable.
+        - The 9 missing rows cluster at the threshold-edge: mismatch
+          counts {2, 3, 3, 3, 4, 4, 4, 4, 4} against max_mismatches=4.
+          Soft-masked regions are repeat-rich (poly-A, poly-T) and
+          produce many threshold-edge hits, which is why the missing
+          rows appear concentrated there.
+        - Positions are scattered (1.5-40 Mbp on chr22), not clustered
+          at chunk boundaries — rules out chunk-edge off-by-one.
+
+      Evidence at:
+        - results/crispr/e2e-npu-compare-chr22/measurements.json
+        - results/crispr/e2e-npu-compare-chr22/host.tsv
+        - results/crispr/e2e-npu-compare-chr22/late.tsv
+    failed_with: |
+      kernel arithmetic claims byte-equivalence with host emulation
+      (``bionpu/kernels/crispr/pam_filter/pam_filter.cc`` line 23-26
+      docstring + ``_host_emulate_match_and_emit`` in
+      ``bionpu/kernels/crispr/pam_filter/__init__.py:443``); the chr22
+      diff falsifies that claim on a small but real subset of inputs.
+    root_cause: |
+      UNKNOWN. The synthetic 1 Mbp fixture has no soft-masked content
+      and only exercises a narrow slice of mismatch-count outcomes.
+      chr22 has biological diversity that exposes a divergence between
+      the host emulation's numpy XOR/popcount and the kernel's silicon
+      math. Most likely classes:
+
+      1. **Mismatch-count rounding/overflow** in the kernel's per-byte
+         popcount sum. Host uses uint8 5-byte sum (max 20, fits). If
+         the kernel uses a narrower accumulator on some path, edge
+         windows could over-count by 1 and fall above the threshold.
+      2. **PAM masking interaction** — pam_p1/pam_p2 byte extraction
+         may have a subtle different result on certain byte values,
+         dropping windows the host accepts.
+      3. **Output buffer ordering / dedup** — kernel writes
+         (window, guide) records in window-major order; if two records
+         collide on the same buffer slot under specific input patterns,
+         one could be lost.
+
+      Bisection plan to localize:
+
+      1. Run the NPU lane twice on the same chr22 + same guides;
+         compare hit lists. Same → deterministic divergence (kernel
+         math); different → race / output-collision.
+      2. For each of the 9 missing canonical rows, hand-construct a
+         single-window input matching that row's ``dna`` column and
+         the guide spacer; run both host emulation and NPU on a
+         1-window chunk; observe which one drops the hit.
+      3. From step 2's first divergence, narrow to the exact byte
+         pattern that produces different mismatch counts between
+         paths. That points at the kernel line.
+    workaround: |
+      **FIXED 2026-04-26**. None of the three speculative root-cause
+      hypotheses (mismatch popcount, PAM masking, output ordering)
+      was correct. Actual root cause: the Tile-Z sparse-emit slot cap
+      ``EMIT_SLOT_RECORDS = 256`` was silently truncating records on
+      sub-chunks where many threshold-edge hits accumulated. chr22's
+      repeat-rich regions (centromeric + LINE/SINE repeats) produce
+      poly-A and poly-T windows that match the all-A/all-C test guides
+      densely; for the test guides, 6 sub-chunks across all of chr22
+      had 257-508 hits each, dropping a total of 1,004 records via
+      the kernel's ``goto done`` overflow handler. The "9 lowercase
+      canonical rows" pattern was incidental (soft-masked regions
+      coincide with repeat regions which is where overflow happens).
+
+      Bisection trail that localized it:
+
+      1. Determinism check on chr22 NPU x 2 runs: NON-DETERMINISTIC
+         (6479, 6471, 6456 lines across 3 successive runs). Suggested
+         capacity-driven race rather than purely deterministic kernel
+         math divergence.
+      2. Single-window probes on the 9 missing canonical rows: HOST
+         produced hits for all 9. Confirmed the missing windows ARE
+         valid hits; both paths see the same uppercase byte stream.
+      3. Per-sub-chunk host-emulation overflow probe across all 19,122
+         chr22 chunks: found 6 overflowing sub-chunks dropping exactly
+         1004 records, worst sub-chunk = chunk 9345 sub 21 with 508
+         hits (vs 256 cap). The 1004 dropped records exactly explained
+         the host-vs-NPU 1005 raw-record gap (1 record difference is
+         determinism noise).
+
+      Fix: bumped ``EMIT_SLOT_RECORDS`` from 256 to 1024 (2x safety
+      margin against the worst observed 508). Updated 4 callsites in
+      lockstep:
+
+        - bionpu/kernels/crispr/pam_filter/tile_a_filter.cc
+        - bionpu/kernels/crispr/pam_filter/runner.cpp
+        - bionpu/kernels/crispr/pam_filter/pam_filter.py
+        - bionpu/kernels/crispr/pam_filter/__init__.py
+
+      Tile Z double-buffered DM use: 4 KiB → 16 KiB (well under 64 KiB
+      AIE2P L1).
+
+      Verification:
+
+        - chr22 e2e compare post-fix:
+            host:    6,487 rows / 41,011 records / 167.07 s
+            NPU late: 6,487 rows / 41,011 records /  39.57 s
+            byte_equal_to_host: TRUE
+            TSVs byte-identical
+        - synthetic 1 Mbp regression: PASS byte-equal on early + late
+        - throughput cost: ~20% (NPU late 32.9 s → 39.6 s on chr22 due
+          to 4x larger output BO drain). Net 4.22x sequential speedup
+          over CPU on real chr22, byte-equal.
+
+      Evidence at:
+        - results/crispr/e2e-npu-compare-chr22-fix/measurements.json
+        - results/crispr/e2e-npu-compare-1mbp-fix/measurements.json
+    upstream_issue: null
+    blocks: []
+    severity: "cosmetic"

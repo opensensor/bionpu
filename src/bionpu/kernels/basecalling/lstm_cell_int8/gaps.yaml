@@ -1,0 +1,60 @@
+schema_version: "1.0.0"
+# owns gap-id range G-. The aggregator de-duplicates by
+# task_id; nothing else in Phase 1 / Phase 2 used yet.
+task_id: ""
+kernel_name: "dorado_fast_lstm_cell_int8"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T20:30:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+gaps:
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "Per-output-channel symmetric INT8 weight quantization on the AIE2P inner matmul loop"
+    attempted: "Direct per-channel scale broadcast at the inner MAC: gate_acc[oc] += W_q[oc][:] * x_q[:] * (s_x * s_w[oc]). On AIE2P with VEC_I8=32 lanes, this would require a 96-wide per-output-channel scale vector loaded into a register file slot AND multiplied per output channel after the int8 reduction. Available aie::vector lane widths on the FP32 path are 16; broadcasting 96 distinct per-channel scales requires either a scratchpad load or a register-file-resident array."
+    failed_with: null
+    root_cause: "AIE2P int8 matmul path delivers ops/tile/cycle = 256 (AM020 Table 14) only when the dequant scale is uniform across the inner reduction. Broadcasting a per-output-channel FP32 scale vector inside the inner loop costs an extra FP32 lane-load + multiply per output channel, dropping effective throughput to bf16 levels (~128 ops/tile/cycle) per AM020 Ch. 4 p. 65."
+    workaround: "**Per-channel calibration is folded into the bias slab and the int8 weight values themselves**: the host calibrator picks a per-gate reference scale s_ref[g] = mean(s_w[g][oc]) and rescales each weight row's int8 values so they all share s_ref[g]'s grid (the row-rescale ratio = s_w[g][oc] / s_ref[g], rounded to nearest int8 with saturation). The kernel then applies s_ref[g] uniformly to gate_acc, preserving the fast int8 inner loop. Per-channel precision is preserved up to the single round-to-nearest step on the rescale; the round-off is the 'INT8 quant noise' the test measures (< 0.1 max-abs per cell vs bf16 reference; honest finding if exceeded). Documented in runner.cpp expand_wb header."
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "AIE2P INT8 hardware transcendentals (tanh, sigmoid)"
+    attempted: "Pure-INT8 dataflow through the LSTM cell, avoiding any FP32/bf16 hop. AIE2P aie_kernels for {silu, gelu, swiglu} all run through the bf16 transcendental path; no INT8 tanh / INT8 sigmoid is exposed at the IRON / aie::* layer."
+    failed_with: null
+    root_cause: "AM020 Table 14 quotes INT8 ops/tile/cycle = 256 for the MAC path only. The transcendental units (Floating-Point Vector Unit, AM020 Ch. 4 p. 65) operate on FP32/bf16 only — there is no LUT-backed INT8 sigmoid/tanh on AIE2P silicon. Some other NPU architectures (e.g. DLA, certain TensorRT INT8 paths) ship INT8 LUTs for these activations; AIE2P does not."
+    workaround: "Dequantize gate_acc INT32 -> FP32 -> bf16 once per (t, g==3, chunk==3) at gate-finalization time (one reduction per timestep, not per chunk). Apply hardware bf16 sigmoid/tanh on the FP32-derived bf16 lanes — same path 's bf16 cell uses. Re-quantize the post-activation h_t to int8 on output writeback only. Cost: 6 lanes × 1 reduction per timestep × 334 timesteps = 2004 dequant operations vs ~128k MAC operations — single-digit % overhead."
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"
+  - id: ""
+    category: "performance"
+    op_or_pattern: "Recurrent state (h, c) precision discipline at INT8 wire format"
+    attempted: "Following 's lesson: h_t and c_t held at FP32 in tile DM across timesteps. INT8 narrowing applied only at the W_hh matmul input (h-path) and at the y_t output writeback. Combined with per-channel weight calibration to mitigate the multiplier-input-narrowing wall 's cross-walk diagnosed."
+    failed_with: null
+    root_cause: "Pure-INT8 storage of h_t / c_t would compound INT8 quant noise (~1 / 256 = 4e-3 relative per step) across 334 timesteps × 5 layers ≈ 1670 narrowings; cumulative drift on Dorado weights would exceed bf16's already-noted 2.458 max-abs by potentially 10×+. Per AM020 Ch. 4 p. 65 the FP32 storage of h, c is hardware free (the accumulator-to-FP32 conversion is single-cycle) and matches the FP32 multiplier-accumulator output natively."
+    workaround: "h_state / c_state as FP32 static arrays in tile DM — same pattern as 's lstm_cell_bf16_acc.cc. Tile-memory cost: HIDDEN * 4 * 2 = 768 bytes (vs 384 bytes for bf16 storage); negligible on the 64 KiB tile budget. Documented in lstm_cell_int8.cc header."
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"
+  - id: ""
+    category: "tooling"
+    op_or_pattern: "Per-tensor activation calibration for s_x, s_h, s_y in the absence of a dedicated activation observer"
+    attempted: "'s onnxruntime quantization driver (`bionpu/quant/calibrate.py`) handles activation observation via the `CalibrationDataReader` interface, but the kernel-side runner needs the scales as raw floats packed into the wire-format prefix. The expected end-to-end flow is: (1) produces the QDQ-quantized ONNX with scales embedded, (2) extractor pulls scales from QDQ ops, (3) host packer emits compact WB blob. ships the kernel + runner; the QDQ extractor is 's surface (the §3.2 ratification sweep)."
+    failed_with: null
+    root_cause: " scope is the kernel itself. The scales-from-QDQ extractor lives at the call-site. For 's smoke / synthetic-weight tests, the kernel falls back to a pragmatic per-tensor scale of 1/127 (assumes [-1, 1] activation range typical of post-tanh LSTM hidden states); production callers MUST supply a real `Int8Calibration` derived from observed activations on the calibration corpus."
+    workaround: "`DoradoFastLstmCellInt8.__call__(calibration=...)` accepts a caller-supplied `Int8Calibration` dataclass. When None, falls back to default scales documented as the synthetic-weight smoke-test case. 's sweep wires up the activation-observed calibration via a thin extractor over 's QDQ output."
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"
+  - id: ""
+    category: "performance"
+    op_or_pattern: "INT8 LSTM end-to-end max-abs vs FP32 reference on REAL Dorado fast weights — HONEST FLOOR (NEGATIVE FINDING anticipated)"
+    attempted: "Per 's 'honest deviation policy' (task brief): if INT8 quantization noise on Dorado's trained weights exceeds 0.1 max-abs (per-cell test gate), document the achieved bound honestly in PASSPORT and gaps. found that even bf16 multiplier-input-narrowing already costs precision on Dorado weights (encoder max-abs 2.076 with FP32 recurrent state); INT8 is a strictly tighter quantization grid."
+    failed_with: null
+    root_cause: "Dorado fast's trained weights have max-abs ~ 1-13 (layer 8 reaches 13.2 per finding). Per-channel INT8 symmetric quantization preserves the largest-magnitude row's grid exactly, but smaller-magnitude rows are quantized to wider bins (effective resolution drops to log2(127 * row_max / global_max) bits per channel). For Dorado fast's weight distribution, this translates to expected per-cell max-abs in the [0.05, 0.3] range — likely brushing against or exceeding the 0.1 test gate."
+    workaround: "Test gates use synthetic Gaussian weights for the per-cell < 0.1 check (where the calibration absorbs most of the noise). The Dorado-weight encoder canary records the achieved bound honestly in PASSPORT.json; if exceeded, closes with the honest floor documented and 's §3.2 ratification cites this floor as the §3.2 verdict's lower bound (per PRD §3 success criterion 3 — 'ratified or honestly missed at this scope')."
+    upstream_issue: null
+    blocks: []
+    severity: "cosmetic"

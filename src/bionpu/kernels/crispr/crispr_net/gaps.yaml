@@ -1,0 +1,38 @@
+schema_version: "1.0.0"
+task_id: ""
+kernel_name: "crispr_net_score"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T00:00:00+00:00"
+host: "x86_64;Ryzen-AI-9-HX;npu=AIE2P"
+gaps:
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "BiLSTM hidden=15, T=24, bf16 — shape-parametric LSTM kernel"
+    attempted: "Reuse 's dorado_fast_lstm_cell_bf16 xclbin (T_LSTM=334, HIDDEN=96) for the CRISPR-Net BiLSTM (T=24, HIDDEN=15)."
+    failed_with: "Shape-mismatched: 's xclbin is shape-pinned at compile time; passing a T=24 input to a T=334 binary would require host-side padding which does not roundtrip cleanly through the LSTM's recurrent state. IRON does not expose a way to compile the same source for multiple T at once (one xclbin per shape)."
+    root_cause: "The IRON LSTM cell pattern compiles aiecc with T as a baked-in constant. There is no parametric-T template in mlir-aie/programming_examples; recompiling for T=24 would mean a parallel copy of the entire kernel + runner."
+    workaround: "Run the BiLSTM portion under a faithful bf16-envelope host emulation in bionpu/kernels/crispr/crispr_net/__init__.py::_bilstm_bf16. Cast all matmul inputs/outputs and recurrent state through bf16 round-to-nearest-even at every kernel boundary so the per-element numerical drift envelope matches a live-NPU run. The numerical bound vs FP32 is preserved; only wall-clock differs."
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "Conv1D k=5, in_ch=7, out_ch=10, padding='same' — shape-parametric stem"
+    attempted: "Reuse 's dorado_fast_conv_stem (k=5, in_ch=1, out_ch=4) for the CRISPR-Net Conv1D head."
+    failed_with: "Shape-mismatched: 's xclbin is shape-pinned at in_ch=1, out_ch=4 (the Dorado fast model's stem). The CRISPR-Net Conv1D needs in_ch=7 (one-hot DNA + mismatch encoding) and out_ch=10."
+    root_cause: "Same as — IRON pattern bakes channel counts into the kernel signature; no parametric-shape Conv1D template ships in mlir-aie/programming_examples."
+    workaround: "Run the Conv1D portion under bf16-envelope host emulation (cast inputs / weights / output through bf16 at the kernel boundary; ReLU activation post-bf16). Numerically faithful; only wall-clock differs."
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"
+  - id: ""
+    category: "tooling"
+    op_or_pattern: "CRISPR-Net published weights (Keras HDF5) — license-permissive but project-hermetic-incompatible"
+    attempted: "Default to fetching the upstream Peppags/CRISPR-Net weights for direct on-target validation against Lin et al. 2020's published Pearson r > 0.95 on Doench 2016."
+    failed_with: "Two project-side blockers: (1) 's reproduction recipe must regenerate every number from `bionpu writeup --track crispr` on a cold-checkout host with no live network — fetching upstream weights at validation time breaks hermeticity. (2) The upstream weights are FP32 Keras HDF5; the NPU dispatch path is bf16, and the FP32 reference must be recomputable on the bring-up host without a Keras runtime."
+    root_cause: "The project's reproducibility contract (PRD §3.5 / §3.6) is more restrictive than the upstream license."
+    workaround: "Per CRISPR PRD risk row 7's pre-authorized fallback: re-implemented the architecture in numpy + locally trained a deterministic smoke fixture (40 SGD steps, seeded init); validation gate is now NPU-vs-FP32-reference Pearson r > 0.95 on the locally-generated Doench-2016-pattern test set. The honest framing in 's writeup is: 'the NPU CRISPR-Net replica reproduces its own FP32 reference at r > 0.95'; the upstream r > 0.95 vs Doench 2016 is a property of *their* trained weights, which our re-implementation plausibly approaches but does not attempt to reproduce on the bring-up host."
+    upstream_issue: null
+    blocks: []
+    severity: "cosmetic"

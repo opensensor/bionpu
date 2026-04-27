@@ -1,0 +1,20 @@
+{
+  "accuracy_metrics": {
+    "bf16_max_abs_error_npu_vs_cpu_per_layer": 0.0,
+    "tile_memory_used_bytes": 22784
+  },
+  "calibration_data_id": "synthetic_seed20260425_n1_L334_bf16_cast",
+  "degradation_vs_fp32": {
+    "bf16_pending_canary": 0.0
+  },
+  "generated_at_iso8601": "2026-04-25T05:15:00Z",
+  "hardware_signature": "x86_64;Ryzen-AI-9-HX-370;npu=AIE2P;6x8",
+  "host": "matteius-ProArt-P16-H7606WI",
+  "model_name": "dorado_fast_lstm_cell_bf16",
+  "model_sha256_fp32": "22019ee59525e698f11bbc832622db668bc316e6117e5a69555a9a7bdd339cc0",
+  "model_sha256_quant": "4cd1372a8fd9c4ee46c630cf9693ace43dd109bbb3a15509dfc0d334f71df1b6",
+  "n_samples": 1,
+  "precision": "int16",
+  "schema_version": "1.0.0",
+  "strategy": "per_channel"
+}

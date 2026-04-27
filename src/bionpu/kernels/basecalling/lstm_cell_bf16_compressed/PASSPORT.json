@@ -1,0 +1,26 @@
+{
+  "accuracy_metrics": {
+    "bf16_2_4_max_abs_vs_bf16_dense": 0.0,
+    "sparsity_pattern_n": 2,
+    "sparsity_pattern_m": 4,
+    "structural_correctness_verified": 1,
+    "tile_memory_used_bytes": 22784,
+    "wire_dma_dense_bytes_per_call": 0,
+    "wire_dma_measured_bytes_per_call": 0,
+    "wire_dma_theoretical_compressed_bytes_per_call": 0
+  },
+  "calibration_data_id": "synthetic_seed20260425_n1_L334_bf16_2_4_pruned",
+  "degradation_vs_fp32": {
+    "bf16_2_4_pending_silicon_canary": 0.0
+  },
+  "generated_at_iso8601": "2026-04-25T18:00:00Z",
+  "hardware_signature": "x86_64;Ryzen-AI-9-HX-370;npu=AIE2P;6x8",
+  "host": "matteius-ProArt-P16-H7606WI",
+  "model_name": "dorado_fast_lstm_cell_bf16_compressed",
+  "model_sha256_fp32": "22019ee59525e698f11bbc832622db668bc316e6117e5a69555a9a7bdd339cc0",
+  "model_sha256_quant": "d3632b20e18bf490b08f6e622e7441602a3d84674b733e7a348cf5d465cc6cbf",
+  "n_samples": 1,
+  "precision": "int16",
+  "schema_version": "1.0.0",
+  "strategy": "per_channel"
+}

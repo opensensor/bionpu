@@ -1,0 +1,14 @@
+schema_version: "1.0.0"
+task_id: ""
+# Consolidated gaps live in
+# `bionpu/kernels/basecalling/conv_stem_layers_2_3/gaps.yaml` (the
+# aggregator de-duplicates by task_id and walks alphabetically). This
+# file ships an empty `gaps: []` so the lstm_cell kernel is visible
+# to the aggregator as "reported clean" without colliding with the
+# consolidated entry.
+kernel_name: "dorado_fast_lstm_cell"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T04:35:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+gaps: []

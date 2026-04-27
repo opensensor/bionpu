@@ -1,0 +1,19 @@
+# gaps.yaml — toolchain-gap report (first Dorado conv stem layer).
+# Schema: bionpu/report/gaps.schema.json (v1.0.0).
+# Convention: bionpu/kernels/GAPS-CONVENTION.md.
+#
+# reports CLEAN: IRON lowering, Peano clang++, aiecc, and
+# XRT all handled the AIE2P FP32 Conv1d cleanly. Tile-DM budget required
+# chunked dataflow (T_chunk=200) but that's a design choice within the
+# tooling's expressibility, not a gap. Empty `gaps: []` per
+# GAPS-CONVENTION's load-bearing distinction: reporting clean, not absent.
+
+schema_version: "1.0.0"
+task_id: ""
+kernel_name: "dorado_fast_conv_stem_layer1"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T07:00:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+
+gaps: []

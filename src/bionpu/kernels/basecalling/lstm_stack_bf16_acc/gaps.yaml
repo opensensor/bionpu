@@ -1,0 +1,16 @@
+schema_version: "1.0.0"
+# consolidated gaps live in
+# `bionpu/kernels/basecalling/lstm_cell_bf16_acc/gaps.yaml` (the
+# aggregator de-duplicates by task_id; 's gaps.yaml is
+# discovered alphabetically first so neither this file nor
+# lstm_cell_bf16_acc's gap entries surface in the umbrella render —
+# they exist on disk for downstream readers). This file ships an
+# empty `gaps: []` so the lstm_stack_bf16_acc composite is visible
+# to the aggregator as "reported clean".
+kernel_name: "dorado_fast_lstm_stack_bf16_acc"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T12:30:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+task_id: ""
+gaps: []

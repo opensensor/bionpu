@@ -233,6 +233,105 @@ def _cmd_score(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bench_probe(args: argparse.Namespace) -> int:
+    """Probe per-device energy readers on this host.
+
+    Cheap, side-effect free. Reports AVAILABLE / UNAVAILABLE for
+    RAPL (CPU), nvidia-smi (GPU), xrt-smi (NPU) per
+    docs/POWER_DOMAINS.md. Stub fallback is a documented operating
+    mode, not an error — exit 0 always; ``--require-all-real``
+    exits 1 if any reader falls back to a stub.
+    """
+    import json
+
+    from .bench.probe import probe_readers
+
+    report = probe_readers()
+    if args.format == "json":
+        print(json.dumps(report.to_json(), indent=2))
+    else:
+        print(f"bench probe: {report.hostname} ({report.platform_str})")
+        for r in report.readers:
+            tag = "AVAILABLE" if r.available else "UNAVAILABLE"
+            print(f"  {r.device:<3}  {tag:<11}  source={r.source}")
+            print(f"       detail: {r.detail}")
+    if args.require_all_real and not report.all_real():
+        return 1
+    return 0
+
+
+def _cmd_bench_scan(args: argparse.Namespace) -> int:
+    """Time + measure energy of a `bionpu scan` invocation.
+
+    Wraps the existing :func:`bionpu.scan.cpu_scan` /
+    :func:`bionpu.scan.npu_scan` paths in
+    :class:`bionpu.bench.harness.TimedRun` with the best-available
+    energy reader for the chosen device. Emits a single
+    ``measurements.json`` record matching ``bench/schema.json``.
+
+    The scan output TSV is written alongside (so byte-equivalence
+    can be verified against a reference); the bench JSON carries
+    timing / energy / RSS / VRAM-peak only.
+    """
+    import json
+
+    from .bench.energy import auto_reader
+    from .bench.harness import TimedRun
+    from .data.canonical_sites import normalize, write_tsv
+    from .scan import cpu_scan, npu_scan, parse_guides, read_fasta
+
+    chrom, seq = read_fasta(args.target)
+    guides = parse_guides(args.guides)
+
+    reader = auto_reader(args.device)
+    print(
+        f"bionpu bench scan [{args.device}]: chrom={chrom!r}, "
+        f"seq={len(seq):,} nt, guides={len(guides)}, "
+        f"reader={type(reader).__name__}",
+        file=sys.stderr,
+    )
+
+    out_path = pathlib.Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    bench_path = pathlib.Path(args.bench_out) if args.bench_out else None
+
+    with TimedRun(
+        track="crispr",
+        op="scan",
+        device=args.device,
+        energy_reader=reader,
+    ) as run:
+        run.record_units(bases=len(seq), guides=len(guides))
+        if args.device == "npu":
+            from .dispatch.npu import NpuArtifactsMissingError
+            try:
+                rows = npu_scan(
+                    chrom=chrom, seq=seq, guides=guides,
+                    pam_template=args.pam, max_mismatches=args.max_mismatches,
+                )
+            except NpuArtifactsMissingError as exc:
+                print(f"bionpu bench scan: {exc}", file=sys.stderr)
+                return 3
+        else:
+            rows = cpu_scan(
+                chrom=chrom, seq=seq, guides=guides,
+                pam_template=args.pam, max_mismatches=args.max_mismatches,
+            )
+        rows = normalize(rows)
+
+    write_tsv(out_path, rows)
+    measurement = run.measurements.to_json()  # type: ignore[union-attr]
+    measurement["accuracy"] = {"hits": len(rows)}
+
+    if bench_path is not None:
+        bench_path.parent.mkdir(parents=True, exist_ok=True)
+        bench_path.write_text(json.dumps(measurement, indent=2) + "\n")
+        print(f"bionpu bench scan: wrote {bench_path}", file=sys.stderr)
+    else:
+        print(json.dumps(measurement, indent=2))
+    return 0
+
+
 def _cmd_not_implemented(args: argparse.Namespace) -> int:
     print(
         f"bionpu {args.cmd}: not yet implemented in v0.1. "
@@ -424,10 +523,61 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_score.set_defaults(func=_cmd_score)
 
-    # placeholders — scope for v0.2
+    # bench
+    p_bench = sub.add_parser(
+        "bench",
+        help=(
+            "Energy + timing harness. `bench probe` reports per-device "
+            "energy-reader availability; `bench scan` wraps a CRISPR scan "
+            "in the timed harness and emits a measurements.json record."
+        ),
+    )
+    sub_bench = p_bench.add_subparsers(dest="bench_kind")
+
+    p_b_probe = sub_bench.add_parser(
+        "probe",
+        help=(
+            "Report per-device energy-reader availability "
+            "(RAPL / nvidia-smi / xrt-smi). Side-effect-free."
+        ),
+    )
+    p_b_probe.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="Output format. Default: human-readable text.",
+    )
+    p_b_probe.add_argument(
+        "--require-all-real", action="store_true",
+        help="Exit 1 if any reader falls back to a stub (CI gate).",
+    )
+    p_b_probe.set_defaults(func=_cmd_bench_probe)
+
+    p_b_scan = sub_bench.add_parser(
+        "scan",
+        help="Wrap a `bionpu scan` invocation in the timed/energy harness.",
+    )
+    p_b_scan.add_argument("--target", required=True, help="FASTA target.")
+    p_b_scan.add_argument(
+        "--guides", required=True,
+        help="Comma-separated 20-nt spacers, or a guide-list file path.",
+    )
+    p_b_scan.add_argument("--out", required=True, help="Canonical scan TSV path.")
+    p_b_scan.add_argument(
+        "--bench-out", default=None,
+        help=(
+            "measurements.json path. If omitted, the JSON is printed to stdout."
+        ),
+    )
+    p_b_scan.add_argument(
+        "--device", choices=["cpu", "npu"], default="cpu",
+        help="Compute device for the scan stage.",
+    )
+    p_b_scan.add_argument("--pam", default="NGG", help="PAM template.")
+    p_b_scan.add_argument("--max-mismatches", type=int, default=4)
+    p_b_scan.set_defaults(func=_cmd_bench_scan)
+
+    # placeholders — scope for v0.3+
     for name, help_text in (
-        ("basecall", "Nanopore basecalling (v0.2 scope)"),
-        ("bench", "Energy + timing harness (v0.2 scope)"),
+        ("basecall", "Nanopore basecalling (v0.2+ scope)"),
     ):
         sp = sub.add_parser(name, help=help_text)
         sp.set_defaults(func=_cmd_not_implemented)
@@ -441,15 +591,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd is None:
         p.print_help()
         return 0
-    if args.cmd == "verify" and getattr(args, "verify_kind", None) is None:
-        # `bionpu verify` with no sub-subcommand — print verify help
-        for action in p._subparsers._actions:  # type: ignore[attr-defined]
-            if isinstance(action, argparse._SubParsersAction):
-                for choice, sub_p in action.choices.items():
-                    if choice == "verify":
-                        sub_p.print_help()
-                        return 0
-        return 0
+    # Print sub-subcommand help when invoked without one.
+    for parent_cmd, kind_attr in (("verify", "verify_kind"), ("bench", "bench_kind")):
+        if args.cmd == parent_cmd and getattr(args, kind_attr, None) is None:
+            for action in p._subparsers._actions:  # type: ignore[attr-defined]
+                if isinstance(action, argparse._SubParsersAction):
+                    for choice, sub_p in action.choices.items():
+                        if choice == parent_cmd:
+                            sub_p.print_help()
+                            return 0
+            return 0
     return int(args.func(args))
 
 

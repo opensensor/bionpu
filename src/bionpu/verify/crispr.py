@@ -26,7 +26,7 @@ import hashlib
 from os import PathLike
 from pathlib import Path
 
-from . import _crispr_canonical as _canon
+from ..data import canonical_sites as _canon
 from .types import VerifyDivergence, VerifyResult
 
 __all__ = ["compare_against_cas_offinder"]

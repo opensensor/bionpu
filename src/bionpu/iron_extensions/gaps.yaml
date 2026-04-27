@@ -1,0 +1,132 @@
+# gaps.yaml — T7-IRON / IRON investigation surface.
+# Schema: bionpu/report/gaps.schema.json (v1.0.0).
+# Convention: bionpu/kernels/GAPS-CONVENTION.md.
+#
+# Per the T7-IRON investigation brief's `gaps.yaml` rule:
+#   - If the prototype path was viable: empty `gaps: []` at this
+#     path (the task ADDRESSES gaps; doesn't surface new ones).
+#   - If the source path was needed: a SINGLE gap entry capturing
+#     the architectural blocker.
+#
+# T7-IRON's outcome is a mix:
+#   - Cascade-stream prototype path: VIABLE — addressed (no new gap).
+#   - AM-to-AM register move: VIABLE-but-cosmetic — sugar only,
+#     no new gap surfaced.
+#   - Variable-rate ObjectFifo / pktMerge: source path NEEDED —
+#     SINGLE gap entry below per the brief's rule.
+#
+# Note for the aggregator: this file lives outside the aggregator's
+# default search paths (`bionpu/kernels` + `tracks`), so the kernel-
+# design directory at `bionpu/kernels/basecalling/lstm_cell_bf16_acc_cascade/gaps.yaml`
+# is the file the aggregator picks up under task_id . That file
+# is intentionally empty (`gaps: []`) — the kernel design ADDRESSES
+# the cross-walk's cascade-stream gap, doesn't surface a new one.
+# The single architectural blocker recorded here (variable-rate
+# ObjectFifo) is documented in `INVENTORY.md` §5 + the investigation
+# report at `docs/`. If the variable-rate
+# ObjectFifo silicon-level demonstration becomes load-bearing for
+# 's writeup, this file should be moved into a kernel directory
+# that the aggregator searches (e.g. a future
+# `bionpu/kernels/crispr/pam_filter_pktmerge/`).
+
+schema_version: "1.0.0"
+task_id: ""
+kernel_name: "iron_extensions"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-25T14:30:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+
+gaps:
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "Variable-rate / packet-switched-merge ObjectFifo (pktMerge) for filter-early cycle savings in IRON"
+    attempted: |
+      The cross-walk's deferred- design needs three AM020-documented
+      hardware primitives: (1) packet-switched merge N:1 (AM020 Ch. 2
+      Figure 17 "pktMerge"), (2) S2MM finish-on-TLAST (AM020 Ch. 2 Tile
+      DMA Controller p. 27), (3) memtile out-of-order BD processing on
+      packet header (AM020 Ch. 5 p. 74).
+
+      The IRON ObjectFifo class (786 LoC at
+      aie.iron.dataflow.objectfifo) was inspected for hooks to either of
+      these. Constructor flags exposed: dims_to_stream,
+      dims_from_stream_per_cons, plio, pad_dimensions, depth, name.
+      None touch packet-switched / variable-rate / TLAST primitives.
+      ObjectFifo lowers to aie.dialects.aie.object_fifo which is
+      hard-coded to fixed-stride rectangle dataflow.
+
+      The MLIR-dialect packet-flow ops (aie.packet_flow,
+      aie.packet_source, aie.packet_dest, aie.packet_rules) ARE
+      exported by aie.dialects._aie_ops_gen.py (verified via grep).
+      However, IRON's resolution machinery in Worker.__init__
+      (worker.py:85-116) only registers ObjectFifoHandle instances
+      from fn_args — there is no equivalent for packet-flow handles,
+      so a pure-extension PacketFifo-style class cannot reach the
+      placement pass cleanly without re-implementing IRON's
+      Resolvable / Worker.fn_args / Program.resolve_program glue.
+    failed_with: null
+    root_cause: |
+      Pure subclass / composition extension above the wheel cannot
+      teach Worker about non-ObjectFifoHandle dataflow handles
+      without re-implementing IRON's resolution pipeline. That
+      re-implementation is architecturally a partial fork of IRON
+      Python, not a clean extension. A wheel-source-rebuild (forking
+      mlir-aie source) is the cleaner path: add
+      aie/iron/dataflow/packetfifo.py as a sibling of objectfifo.py,
+      wire the resolution glue into Program.resolve_program(), and
+      either reuse or extend the existing
+      --aie-objectfifo-stateful-transform MLIR pass to lower
+      packet-switched ObjectFifos through the packet routing fabric.
+      AM020 confirms the silicon supports this; the gap is genuinely
+      toolchain.
+    workaround: |
+      Two viable interim paths, neither is "extension above the wheel":
+
+      (1) Forked mlir-aie source rebuild. Estimated 10-20 days
+          end-to-end (new IRON class + integration + MLIR pass + tests
+          + the eventual upstreaming PR). High regression surface for
+          non-cascade ObjectFifo users. Reward: unlocks the
+          cross-walk's filter-early cycle-savings prediction for 
+          properly + the deferred- finish-on-TLAST
+          sparse-emit path.
+      (2) Direct dialect-level lowering bypassing IRON entirely.
+          aie.dialects.aie placed-style API supports the packet-flow
+          ops today. Estimated ~3-5 days for a non-IRON-style Python
+          lowering of 's filter-early variant; the cost is
+          forgoing IRON's Worker/ObjectFifo ergonomics for that one
+          kernel.
+
+      Recommendation: defer until 's RQ4 writeup decides whether
+      the variable-rate ObjectFifo's silicon-level demonstration is
+      publication-load-bearing. Current v1 (filter-late) is
+      shipping and adequate for the writeup's "IRON wall is partially
+      penetrable" narrative.
+    upstream_issue: null
+    blocks:
+      - ""
+    severity: "blocker"
+    status: "closed-pending-orchestrator-wheel-rebuild"
+    closure_ref:
+      fork_repo: "https://github.com/opensensor/mlir-aie"
+      fork_branch: "feature/-variable-rate-fifo"
+      fork_commit: "02cef1591e4658b93d20d8acb6dcc3db09d0b45e"
+      summary: |
+         closes the abstraction-layer blocker this entry
+        documents. The fork-side wheel rebuild path (workaround
+        option 1) is the path taken: aie.iron.VariableRateFifo +
+        aie.iron.PacketFifo (sibling primitives) ship via the
+        feature/-variable-rate-fifo branch, both as
+        first-class IRON Python classes (ObjectFifo /
+        ObjectFifoHandle subclasses) integrated with
+        Worker.fn_args dispatch via the fifo_handle_registry.
+
+        The lowering pass change at
+        third_party/mlir-aie/lib/Dialect/AIE/Transforms/AIEObjectFifoStatefulTransform.cpp
+        is small (LCM-unroll skip + split-fifo attr propagation
+        slot). Regression surface contained to fifos that
+        explicitly carry the aie.variable_rate marker; vanilla
+        ObjectFifo unchanged.
+
+        See third_party/mlir-aie/python/iron/VARIABLE_RATE_DESIGN.md
+        for the full design rationale.

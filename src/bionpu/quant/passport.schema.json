@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/matteius/genetics/bionpu/quant/passport.schema.json",
+  "title": "bionpu quantization passport",
+  "description": "Per-model quantization passport. Required by every quantized ONNX/Peano artifact in the repo: documents the calibration corpus, the strategy, the resulting accuracy degradation versus the FP32 baseline, and the host on which the figure was produced. Consumed verbatim by 's basecalling INT8 sweep and 's CRISPR scoring quant. Mirrors the x-deterministic annotation convention of bionpu/bench/schema.json: fields legitimately differing run-to-run carry x-deterministic: false so consumers can diff records modulo non-determinism.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "model_name",
+    "model_sha256_fp32",
+    "model_sha256_quant",
+    "strategy",
+    "precision",
+    "calibration_data_id",
+    "n_samples",
+    "accuracy_metrics",
+    "degradation_vs_fp32",
+    "host",
+    "generated_at_iso8601",
+    "hardware_signature"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "SemVer of this passport schema. Bump when the passport's shape changes; sweep pins to a major.",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "model_name": {
+      "type": "string",
+      "description": "Logical model identifier (e.g. 'dorado_fast_v5.0.0', 'crispr_oracle_v1')."
+    },
+    "model_sha256_fp32": {
+      "type": "string",
+      "description": "Hex SHA-256 of the FP32 ONNX file the quantization was performed against. Required so the passport is repointable to a specific source artifact.",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "model_sha256_quant": {
+      "type": "string",
+      "description": "Hex SHA-256 of the quantized ONNX file produced by this run.",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "strategy": {
+      "type": "string",
+      "description": "Calibration strategy. per_tensor and per_channel are PTQ paths via onnxruntime.quantization. awq is a placeholder for transformer-style activation-aware weight quant; not used for Dorado's LSTM-CRF, may be relevant for CRISPR-Net / DeepCRISPR.",
+      "enum": ["per_tensor", "per_channel", "awq"]
+    },
+    "precision": {
+      "type": "string",
+      "description": "Target weight/activation precision.",
+      "enum": ["int8", "int16"]
+    },
+    "calibration_data_id": {
+      "type": "string",
+      "description": "Stable identifier of the calibration corpus (e.g. 'pod5_hg002_subsample_seed42_n128'). Required: a passport without a named calibration set is unreviewable."
+    },
+    "n_samples": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Number of calibration samples actually consumed by the quantizer."
+    },
+    "accuracy_metrics": {
+      "type": "object",
+      "description": "Absolute accuracy metrics for the quantized model on the validation set, keyed by metric name from bionpu/bench/UNITS.md (e.g. modal_accuracy in pp; max_abs_error unitless). At least one entry required.",
+      "minProperties": 1,
+      "additionalProperties": { "type": "number" }
+    },
+    "degradation_vs_fp32": {
+      "type": "object",
+      "description": "Per-metric delta vs the FP32 reference, in the units of bionpu/bench/UNITS.md. Sign convention: degradation is `quantized - fp32` for error-style metrics (positive = worse) and `fp32 - quantized` for accuracy-style metrics (positive = worse). Producers MUST document the convention in the consuming pipeline.",
+      "minProperties": 1,
+      "additionalProperties": { "type": "number" }
+    },
+    "host": {
+      "type": "string",
+      "description": "Hostname on which the quantization ran. Differs run-to-run by definition.",
+      "x-deterministic": false
+    },
+    "generated_at_iso8601": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp of passport generation. Differs run-to-run by definition.",
+      "x-deterministic": false
+    },
+    "hardware_signature": {
+      "type": "string",
+      "description": "Stable signature of the quantization host hardware (e.g. 'x86_64;Ryzen-AI-9-HX;npu=AIE2P'). Used by to bin sweep results by hardware class."
+    }
+  }
+}

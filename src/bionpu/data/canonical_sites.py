@@ -13,17 +13,31 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Canonical Cas-OFFinder TSV normalizer.
+"""Canonical Cas-OFFinder normalizer.
 
-Internal helper for :mod:`bionpu.verify.crispr`. Cas-OFFinder's row order
-for sites at identical mismatch counts is implementation-defined: the
-GPU/OpenCL backends can produce different row orderings of the same
-match set. Byte-equality is therefore asserted against a *normalized*
-canonical TSV produced by this module, with the sort key:
+Cas-OFFinder's row order for sites at identical mismatch counts is
+implementation-defined: GPU runs of the same input on the same machine can
+produce different row orderings (the row *set* is invariant; the order is
+not). PRD §3.2 byte-equality is therefore asserted against a *normalized*
+canonical TSV produced by this module.
+
+The sort key is load-bearing for and byte-equality:
 
     (chrom, start, mismatch_count, guide_id, strand)
 
-The TSV writer emits LF line endings and a single trailing newline so
+where:
+- ``chrom`` is the contig name as emitted by Cas-OFFinder (e.g. ``"chr22"``).
+- ``start`` is the 0-based site position (Cas-OFFinder calls this Location).
+- ``mismatch_count`` is Cas-OFFinder's Mismatches column.
+- ``guide_id`` is the stable ID assigned by FIXTURE-A — for v3 outputs we
+  use Cas-OFFinder's leading Id column; for legacy outputs we fall back to
+  the crRNA sequence as the ID surrogate (a stable string either way).
+- ``strand`` is ``"+"`` or ``"-"`` (Cas-OFFinder's Direction column).
+
+Sort is stable — calling ``normalize`` twice produces the same output (and
+applying it to an already-normalized list is a no-op).
+
+The TSV writer emits LF line endings and a single trailing newline so that
 byte-equality holds independent of the producer's line-ending choice.
 """
 
@@ -38,17 +52,16 @@ __all__ = [
     "normalize",
     "normalize_file",
     "parse_tsv",
+    "serialize_canonical",
     "write_tsv",
-    "CANONICAL_HEADER",
 ]
-
 
 _VALID_STRANDS = frozenset({"+", "-"})
 
-# The canonical normalized TSV column header. Picking a single fixed
-# layout means byte-equality holds across producers (Cas-OFFinder v3,
-# legacy Cas-OFFinder, NumPy oracle, NPU runner).
-CANONICAL_HEADER: tuple[str, ...] = (
+# Column header for the canonical normalized TSV. We pick a single fixed
+# layout so byte-equality holds across producers (Cas-OFFinder v3, legacy
+# Cas-OFFinder, NumPy oracle).
+_HEADER = (
     "guide_id",
     "bulge_type",
     "crrna",
@@ -60,14 +73,13 @@ CANONICAL_HEADER: tuple[str, ...] = (
     "bulge_size",
 )
 
-
 @dataclass(frozen=True, slots=True)
 class CasOFFinderRow:
     """One Cas-OFFinder match row, normalized into a fixed schema.
 
-    Field names match the canonical TSV header. ``bulge_type`` is ``"X"``
-    for no-bulge runs (the typical case); other values appear only when
-    DNA or RNA bulges are enabled.
+    Field names match the canonical TSV header. ``bulge_type`` is ``"X"`` for
+    no-bulge runs (the FIXTURE-A regime); other values appear only when DNA
+    or RNA bulges are enabled, which FIXTURE-A forbids.
     """
 
     guide_id: str
@@ -83,11 +95,9 @@ class CasOFFinderRow:
     def sort_key(self) -> tuple[str, int, int, str, str]:
         if self.strand not in _VALID_STRANDS:
             raise ValueError(
-                f"unknown strand {self.strand!r}; "
-                f"expected one of {sorted(_VALID_STRANDS)}"
+                f"unknown strand {self.strand!r}; expected one of {sorted(_VALID_STRANDS)}"
             )
         return (self.chrom, self.start, self.mismatches, self.guide_id, self.strand)
-
 
 def normalize(rows: Iterable[CasOFFinderRow]) -> list[CasOFFinderRow]:
     """Return rows sorted by the documented canonical key.
@@ -96,32 +106,32 @@ def normalize(rows: Iterable[CasOFFinderRow]) -> list[CasOFFinderRow]:
     Independent of input order: sorting is stable and total over the key.
     """
     materialized = list(rows)
+    # Validate strands eagerly so a bad row fails the call rather than
+    # silently being placed at an arbitrary position.
     for r in materialized:
         if r.strand not in _VALID_STRANDS:
             raise ValueError(
-                f"unknown strand {r.strand!r}; "
-                f"expected one of {sorted(_VALID_STRANDS)}"
+                f"unknown strand {r.strand!r}; expected one of {sorted(_VALID_STRANDS)}"
             )
     return sorted(materialized, key=CasOFFinderRow.sort_key)
 
-
 def parse_tsv(path: Path) -> list[CasOFFinderRow]:
-    """Parse a Cas-OFFinder TSV into ``CasOFFinderRow`` objects.
+    """Parse a Cas-OFFinder TSV (v3 or legacy) into ``CasOFFinderRow`` objects.
 
     Header detection rules:
     - Lines starting with ``##`` are skipped (v3 generator banner).
     - A line starting with ``#`` is treated as the column header.
     - Otherwise the file is assumed to have no header (legacy form).
-    - The canonical normalized TSV (this module's own output) starts
-      with ``guide_id\\t...`` and is recognized too.
+    - The canonical normalized TSV (this module's own output) starts with
+      ``guide_id\\t...`` — that is recognized too.
 
     Column mappings (case-insensitive on header tokens):
 
-    - v3:        Id, Bulge Type, crRNA, DNA, Chromosome, Location,
-                 Direction, Mismatches, Bulge Size
-    - legacy:    crRNA, Chromosome, Position, DNA, Direction, Mismatches
-    - canonical: guide_id, bulge_type, crrna, dna, chrom, start,
-                 strand, mismatches, bulge_size
+        v3:        Id, Bulge Type, crRNA, DNA, Chromosome, Location, Direction,
+                   Mismatches, Bulge Size
+        legacy:    crRNA, Chromosome, Position, DNA, Direction, Mismatches
+        canonical: guide_id, bulge_type, crrna, dna, chrom, start, strand,
+                   mismatches, bulge_size
     """
     path = Path(path)
     raw_lines = path.read_text().splitlines()
@@ -134,9 +144,11 @@ def parse_tsv(path: Path) -> list[CasOFFinderRow]:
         if line.startswith("##"):
             continue
         if line.startswith("#"):
+            # Column header.
             header = line.lstrip("#").split("\t")
             continue
         if header is None and line.split("\t")[0].lower() == "guide_id":
+            # Canonical normalized header (no leading '#').
             header = line.split("\t")
             continue
         data_lines.append(line)
@@ -193,13 +205,12 @@ def parse_tsv(path: Path) -> list[CasOFFinderRow]:
                 )
             return rows
 
-        legacy_cols = ("crrna", "chromosome", "position", "dna", "direction", "mismatches")
-        if has(*legacy_cols):
+        if has("crrna", "chromosome", "position", "dna", "direction", "mismatches"):
             for line in data_lines:
                 cols = line.split("\t")
                 rows.append(
                     CasOFFinderRow(
-                        guide_id=cols[idx["crrna"]],  # crRNA stands in for guide_id
+                        guide_id=cols[idx["crrna"]],  # crRNA stands in for guide_id in legacy
                         bulge_type="X",
                         crrna=cols[idx["crrna"]],
                         dna=cols[idx["dna"]],
@@ -234,20 +245,18 @@ def parse_tsv(path: Path) -> list[CasOFFinderRow]:
             )
         else:
             raise ValueError(
-                f"unrecognized Cas-OFFinder TSV row "
-                f"(no header, {len(cols)} cols): {line!r}"
+                f"unrecognized Cas-OFFinder TSV row (no header, {len(cols)} cols): {line!r}"
             )
     return rows
 
-
 def write_tsv(path: Path, rows: Iterable[CasOFFinderRow]) -> None:
-    """Write rows to ``path`` in canonical schema with LF newlines.
+    """Write rows to ``path`` using the canonical schema with LF newlines.
 
     The resulting file is independent of producer line-ending choices,
-    which is what makes byte-equality robust across platforms.
+    which matters for byte-equality across platforms.
     """
     path = Path(path)
-    parts: list[str] = ["\t".join(CANONICAL_HEADER)]
+    parts: list[str] = ["\t".join(_HEADER)]
     for r in rows:
         parts.append(
             "\t".join(
@@ -267,12 +276,11 @@ def write_tsv(path: Path, rows: Iterable[CasOFFinderRow]) -> None:
     blob = "\n".join(parts) + "\n"
     path.write_bytes(blob.encode("utf-8"))
 
-
 def normalize_file(input_tsv: Path, output_tsv: Path) -> None:
-    """Read a Cas-OFFinder TSV, normalize, write to ``output_tsv``.
+    """Read a Cas-OFFinder TSV (v3, legacy, or canonical), normalize, write.
 
-    The output TSV is byte-stable: re-running ``normalize_file`` on the
-    output produces a byte-identical file.
+    The output TSV is byte-stable: ``normalize_file(out, out2)`` produces
+    ``out2`` byte-identical to ``out`` for any already-normalized ``out``.
     """
     rows = parse_tsv(Path(input_tsv))
     write_tsv(Path(output_tsv), normalize(rows))
@@ -281,11 +289,11 @@ def normalize_file(input_tsv: Path, output_tsv: Path) -> None:
 def serialize_canonical(rows: Iterable[CasOFFinderRow]) -> bytes:
     """Return the canonical TSV byte representation of ``rows``.
 
-    Equivalent to writing with :func:`write_tsv` and reading the result;
-    used by the comparator to compute a SHA-256 without touching the
-    filesystem.
+    Equivalent to writing with :func:`write_tsv` and reading the result
+    back as bytes; used by :mod:`bionpu.verify.crispr` to compute a
+    SHA-256 over the canonical form without touching the filesystem.
     """
-    parts: list[str] = ["\t".join(CANONICAL_HEADER)]
+    parts: list[str] = ["\t".join(_HEADER)]
     for r in rows:
         parts.append(
             "\t".join(

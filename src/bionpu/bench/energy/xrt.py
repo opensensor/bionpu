@@ -117,6 +117,7 @@ match), the constructor raises :class:`XrtUnavailableError` and the
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -172,19 +173,35 @@ class XrtUnavailableError(RuntimeError):
 def _resolve_xrt_smi(explicit: str | Path | None = None) -> str | None:
     """Return a working ``xrt-smi`` binary path, or ``None`` if absent.
 
-    Order: explicit path > ``shutil.which("xrt-smi")`` > the
-    /opt/xilinx/xrt/bin fallback.
+    Resolution order (designed around the AMD-Strix Ubuntu reality):
+
+    1. **Explicit override** via the ``explicit`` arg or ``BIONPU_XRT_SMI``
+       env var — caller knows best.
+    2. **AMD vendor xrt-smi at /opt/xilinx/xrt/bin/xrt-smi** — checked
+       BEFORE ``$PATH`` because Ubuntu's generic ``libxrt-utils``
+       package installs an older Xilinx-FPGA-only ``xrt-smi`` at
+       ``/usr/bin/xrt-smi`` that does **not** enumerate AMD NPUs even
+       when the kernel driver is loaded. The vendor build ships from
+       ``xrt_plugin-amdxdna`` and supports the AIE2P device. POWER_DOMAINS.md
+       §3 — favour the build that actually sees the device.
+    3. **``shutil.which("xrt-smi")``** — fallback for hosts without
+       the vendor stack at the canonical path.
     """
     if explicit is not None:
         p = Path(explicit)
         if p.is_file():
             return str(p)
         return None
+    env = os.environ.get("BIONPU_XRT_SMI")
+    if env:
+        p = Path(env)
+        if p.is_file():
+            return str(p)
+    if Path(_XRT_SMI_DEFAULT).is_file():
+        return _XRT_SMI_DEFAULT
     cand = shutil.which("xrt-smi")
     if cand:
         return cand
-    if Path(_XRT_SMI_DEFAULT).is_file():
-        return _XRT_SMI_DEFAULT
     return None
 
 def _read_estimated_power_watts(

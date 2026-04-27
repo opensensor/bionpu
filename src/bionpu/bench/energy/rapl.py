@@ -159,44 +159,75 @@ def probe_rapl() -> Path:
 
     Raises:
         RaplUnavailableError: if no candidate is readable. The error
-            message lists every path tried plus a remediation hint per
-            POWER_DOMAINS.md §1.4.
+            message lists every path tried, distinguishes "file missing"
+            from "permission denied" (a fixable mode 0400 mitigation),
+            and includes a remediation pointer per POWER_DOMAINS.md §1.4.
     """
     checked: list[str] = []
+    # Cause-of-failure breakdown so the remediation message can be
+    # specific instead of cargo-cult.
+    files_missing: list[str] = []
+    files_unreadable: list[str] = []  # exist but mode 0400 / EACCES
 
     for cand in _POWERCAP_CANDIDATES:
         p = Path(cand)
         checked.append(cand)
         if not p.is_file():
+            files_missing.append(cand)
             continue
         if _try_read_uj(p) is not None:
             return p
+        files_unreadable.append(cand)
 
     # hwmon fallback (amd_energy)
     for p in _hwmon_candidates():
-        checked.append(str(p))
+        path_str = str(p)
+        checked.append(path_str)
+        if not p.is_file():
+            files_missing.append(path_str)
+            continue
         if _try_read_uj(p) is not None:
             return p
+        files_unreadable.append(path_str)
 
-    # All candidates either missing, mode 0400 (root-only), or returned
-    # garbage. POWER_DOMAINS.md §1.4 says fail loud.
+    # POWER_DOMAINS.md §1.4 says fail loud. Tailor the remediation to
+    # the actual cause: permission-denied is one-liner-fixable; missing
+    # files are a kernel/module-loading problem.
     is_root = os.geteuid() == 0
-    hint = (
-        "AMD RAPL on Strix typically requires `intel_rapl_msr` loaded AND "
-        "either running as root OR `chmod a+r /sys/class/powercap/*/energy_uj` "
-        "(stock Ubuntu ships these mode 0400 due to a side-channel mitigation). "
-        "Alternative: install `amd_energy` and read via hwmon. If neither path "
-        "works on this kernel, document CPU energy as UNAVAILABLE per "
-        "POWER_DOMAINS.md §1.4 and skip the cross-domain CPU energy comparison."
-    )
-    if is_root:
+    if files_unreadable and not is_root:
         hint = (
-            "Running as root and still no RAPL surface — kernel likely lacks "
-            "`intel_rapl_msr` / `amd_energy` modules. " + hint
+            f"RAPL sysfs nodes exist but are mode 0400 (root-only). "
+            f"Stock Ubuntu/Debian ship them this way as a side-channel "
+            f"mitigation. Run `tools/host-energy-setup.sh` (or "
+            f"`sudo chmod a+r {' '.join(files_unreadable)}`) to make them "
+            f"world-readable. The bundled helper persists the change "
+            f"across reboots via /etc/tmpfiles.d. Unreadable: "
+            f"{files_unreadable!r}."
+        )
+    elif files_missing and not files_unreadable:
+        hint = (
+            "No RAPL sysfs nodes found at the expected paths. Likely "
+            "cause: `intel_rapl_msr` and `amd_energy` kernel modules "
+            "are not loaded. Try `sudo modprobe intel_rapl_msr` (the "
+            "AMD RAPL counter on Strix surfaces under the historical "
+            "intel-rapl naming when this driver is present). If that "
+            "fails, the kernel may not include the AMD MSR-RAPL driver; "
+            "document CPU energy as UNAVAILABLE per POWER_DOMAINS.md §1.4."
+        )
+    elif is_root:
+        hint = (
+            "Running as root and still no RAPL surface — kernel likely "
+            "lacks `intel_rapl_msr` / `amd_energy` modules. Try "
+            "`modprobe intel_rapl_msr`; if that fails, the kernel build "
+            "doesn't include the driver and CPU energy is UNAVAILABLE."
+        )
+    else:
+        hint = (
+            "Mixed cause (some paths missing, some unreadable). Run "
+            "`tools/host-energy-setup.sh` for a guided fix."
         )
     raise RaplUnavailableError(
-        f"RAPL surface not exposed on this kernel; checked: {checked!r}; "
-        f"suggested fix: {hint}"
+        f"RAPL surface not exposed; checked: {checked!r}; suggested fix: {hint}"
     )
 
 @dataclass

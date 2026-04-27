@@ -82,10 +82,9 @@ GRCH38_SPEC = DatasetSpec(
     name="grch38",
     kind="reference",
     urls=[GRCH38_FULL_URL],
-    # Full hg38.fa.gz SHA-256 from UCSC goldenPath (placeholder until
-    # the agent's first --mode full fetch lands and pins the real value).
-    sha256="0" * 64,
-    size_bytes=0,
+    # Full hg38.fa.gz SHA-256 (fetched 2026-04-27 from UCSC goldenPath).
+    sha256="c1dd87068c254eb53d944f71e51d1311964fce8de24d6fc0effc9c61c01527d4",
+    size_bytes=983_659_424,
     license_name="UCSC goldenPath public-domain",
     license_url="https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/README.txt",
     citation=(

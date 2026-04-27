@@ -157,6 +157,82 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_score(args: argparse.Namespace) -> int:
+    """Score canonical scan rows with an off-target probability.
+
+    v0.3 alpha: DNABERT-Epi (no-epi variant) on CPU or GPU. The AIE2P
+    backend is a follow-up; the with-epi (BigWig) variant is a
+    follow-up. The ``--smoke`` flag exercises the pipeline end-to-end
+    without weights or torch (deterministic pseudo-random scores
+    keyed by row identity), useful for CI and CLI demonstration.
+    """
+    from .data.canonical_sites import parse_tsv
+    from .scoring.dnabert_epi import DNABERTEpiScorer, DNABERTEpiUnavailableError
+    from .scoring.types import write_score_tsv
+
+    rows = parse_tsv(pathlib.Path(args.candidates))
+    print(
+        f"bionpu score [{args.model}/{args.device}{' smoke' if args.smoke else ''}]: "
+        f"{len(rows)} candidate rows from {args.candidates}",
+        file=sys.stderr,
+    )
+
+    if args.model != "dnabert-epi":
+        print(
+            f"bionpu score: model {args.model!r} not yet wired; "
+            f"only 'dnabert-epi' is available in v0.3 alpha.",
+            file=sys.stderr,
+        )
+        return 2
+
+    weights = pathlib.Path(args.weights) if args.weights else None
+    try:
+        scorer = DNABERTEpiScorer(
+            device=args.device,
+            weights_path=weights,
+            smoke=args.smoke,
+            seed=args.seed,
+        )
+        scored = list(scorer.score(rows))
+    except DNABERTEpiUnavailableError as exc:
+        print(f"bionpu score: {exc}", file=sys.stderr)
+        return 3
+
+    out_path = pathlib.Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    write_score_tsv(out_path, scored)
+    print(
+        f"bionpu score: wrote {len(scored)} scored rows to {out_path}",
+        file=sys.stderr,
+    )
+
+    if args.verify:
+        from .verify.score import compare_score_outputs
+
+        result = compare_score_outputs(
+            out_path,
+            args.verify,
+            policy=args.verify_policy,
+            epsilon=args.verify_epsilon if args.verify_policy == "NUMERIC_EPSILON" else None,
+        )
+        verdict = "EQUAL" if result.equal else "DIVERGENT"
+        print(f"verify score [{result.policy}]: {out_path} vs {args.verify}")
+        print(f"  result:        {verdict}")
+        print(f"  records:       {result.record_count}")
+        print(f"  a sha256:      {result.a_sha256}")
+        print(f"  b sha256:      {result.b_sha256}")
+        if result.max_abs_diff is not None:
+            print(f"  max |a-b|:     {result.max_abs_diff:.6g}")
+        if not result.equal and result.divergences:
+            print("  divergences:")
+            for div in result.divergences[:8]:
+                print(f"    [{div.record_index}] {div.message}")
+            if len(result.divergences) > 8:
+                print(f"    ... ({len(result.divergences) - 8} more)")
+        return 0 if result.equal else 1
+    return 0
+
+
 def _cmd_not_implemented(args: argparse.Namespace) -> int:
     print(
         f"bionpu {args.cmd}: not yet implemented in v0.1. "
@@ -264,6 +340,89 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_scan.set_defaults(func=_cmd_scan)
+
+    # score
+    p_score = sub.add_parser(
+        "score",
+        help=(
+            "Score canonical scan rows with an off-target probability "
+            "(v0.3 alpha: DNABERT-Epi, no-epi, CPU+GPU)."
+        ),
+    )
+    p_score.add_argument(
+        "--candidates",
+        required=True,
+        help="Canonical scan TSV (output of `bionpu scan`).",
+    )
+    p_score.add_argument(
+        "--out",
+        required=True,
+        help="Output scored canonical TSV.",
+    )
+    p_score.add_argument(
+        "--model",
+        default="dnabert-epi",
+        choices=["dnabert-epi"],
+        help="Scorer model. Only dnabert-epi is wired in v0.3 alpha.",
+    )
+    p_score.add_argument(
+        "--device",
+        default="cpu",
+        choices=["cpu", "gpu"],
+        help=(
+            "Compute device. cpu = baseline + byte-equivalence reference; "
+            "gpu = CUDA-accelerated (requires torch.cuda)."
+        ),
+    )
+    p_score.add_argument(
+        "--weights",
+        default=None,
+        help=(
+            "Path to a fine-tuned classifier checkpoint. Required unless "
+            "--smoke is set. See docs/model-selection-audit.md for the "
+            "current state of trained-weights availability."
+        ),
+    )
+    p_score.add_argument(
+        "--smoke",
+        action="store_true",
+        help=(
+            "Use deterministic pseudo-random scores keyed by row identity. "
+            "No torch / weights required; intended for CI and CLI demos."
+        ),
+    )
+    p_score.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Salt for --smoke mode (no effect on real scoring).",
+    )
+    p_score.add_argument(
+        "--verify",
+        default=None,
+        help=(
+            "If supplied, compare the score output against this reference "
+            "score TSV under the policy chosen by --verify-policy."
+        ),
+    )
+    p_score.add_argument(
+        "--verify-policy",
+        default="NUMERIC_EPSILON",
+        choices=["NUMERIC_EPSILON", "BITWISE_EXACT"],
+        help=(
+            "Equivalence policy when --verify is set. "
+            "BITWISE_EXACT for deterministic backends (e.g. CPU vs CPU); "
+            "NUMERIC_EPSILON for cross-device (CPU vs GPU vs NPU) where "
+            "ULP-level deviation is expected."
+        ),
+    )
+    p_score.add_argument(
+        "--verify-epsilon",
+        type=float,
+        default=1e-6,
+        help="Per-row score tolerance for NUMERIC_EPSILON. Default 1e-6.",
+    )
+    p_score.set_defaults(func=_cmd_score)
 
     # placeholders — scope for v0.2
     for name, help_text in (

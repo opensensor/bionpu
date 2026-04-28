@@ -40,24 +40,34 @@ static constexpr int32_t SEQ_IN_OVERLAP_K21 = 8;   // 4096+8 = 4104, aligned (ne
 static constexpr int32_t SEQ_IN_OVERLAP_K31 = 8;   // 4096+8 = 4104, aligned
 
 // =====================================================================
-// v0.5 streaming-emit constants.
+// v0.5 streaming-emit constants (with v1.2 (a) amendments).
 // =====================================================================
 //
 // Per-pass emit format (written by tile kernel into partial_out):
-//   [uint32 emit_idx LE prefix]
-//   [emit_idx × uint64 canonical]
-//   [zero pad to PARTIAL_OUT_BYTES_V05_PADDED]
+//   [0..3]:                            uint32 emit_idx LE prefix
+//   [4 .. 4 + 8*emit_idx]:             emit_idx × uint64 canonical
+//   [middle zero pad]
+//   [PARTIAL_OUT_BYTES_V05_PADDED-4 .. -1]:
+//                                      uint32 all_a_counter LE (v1.2 (a))
+//
+// v1.2 (a) AMENDMENT: the LAST 4 bytes of partial_out carry a uint32 LE
+// summary counter for canonical=0 (all-A) k-mers observed in this chunk.
+// Only the pass=0 xclbin writes a non-zero value (canonical=0 lands in
+// pass=0 by the slice mask). Host adds this to counts[0] per chunk.
+// Closes kmer-chr22-canonical0-cap-fire by removing all-A k-mers from
+// the bounded emit stream.
 //
 // MAX_EMIT_IDX_V05 caps the per-pass canonical count so the writeback
-// stays within PARTIAL_OUT_BYTES_V05_PADDED (32 KiB). The kernel asserts
-// emit_idx < MAX_EMIT_IDX_V05 and silently drops further emissions; this
-// only fires at N_PASSES=1 (no slice partitioning) with chunks producing
-// > MAX_EMIT_IDX_V05 k-mers. The host runner re-dispatches with smaller
-// chunks or larger N_PASSES if the cap fires (runtime check in T7).
+// (emit stream + summary counter) stays within PARTIAL_OUT_BYTES_V05_PADDED
+// (32 KiB). The kernel asserts emit_idx < MAX_EMIT_IDX_V05 and silently
+// drops further emissions; this only fires at N_PASSES=1 (no slice
+// partitioning) with chunks producing > MAX_EMIT_IDX_V05 non-canonical-0
+// k-mers. The host runner re-dispatches with smaller chunks or larger
+// N_PASSES if the cap fires (runtime check in T7).
 //
-// 32768 = 32 KiB; (32768 - 4) / 8 = 4095.5 → cap at 4095.
+// 32768 = 32 KiB; (32768 - 4 prefix - 4 summary) / 8 = 4095 → cap at 4095.
 static constexpr int32_t PARTIAL_OUT_BYTES_V05_PADDED = 32768;  // 32 KiB
-static constexpr int32_t MAX_EMIT_IDX_V05 = 4095;               // (32768 - 4) / 8 floor
+static constexpr int32_t MAX_EMIT_IDX_V05 = 4095;               // (32768 - 8) / 8 floor
 
 // =====================================================================
 // Hash-slice partition: SLICE_HASH_SHIFT = 0 (low bits of canonical).

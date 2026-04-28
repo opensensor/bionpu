@@ -8,7 +8,7 @@ task_id: ""
 kernel_name: "bionpu_kmer_count"
 target: "aie2p"
 compiler: "peano"
-build_date: "2026-04-28T00:00:00+00:00"
+build_date: "2026-04-28T07:00:00+00:00"
 host: "matteius-ProArt-P16-H7606WI"
 
 gaps:
@@ -72,19 +72,22 @@ gaps:
       v1.0 T13/T14: silicon-validated v0.5 on chr22 at k=21,
       n_tiles=4, n_passes=4. canonical=0 NPU keep = 2 977 273 vs
       oracle 11 669 944.
-      v1.1 (a) (this report, 2026-04-28): rebuilt at n_passes=16
-      (3 K × 16 passes = 48 xclbins; 14s wall per K) and re-ran
-      chr22 byte-equal. canonical=0 NPU keep = 2 992 193 — barely
-      changed (delta = +14 920). Hypothesis "n_passes=16 redistributes
-      all-A across 16 slices" is DISPROVED.
+      v1.1 (a) (2026-04-28): rebuilt at n_passes=16 (3 K × 16 passes
+      = 48 xclbins; 14s wall per K) and re-ran chr22 byte-equal.
+      canonical=0 NPU keep = 2 992 193 — barely changed
+      (delta = +14 920). Hypothesis "n_passes=16 redistributes
+      all-A across 16 slices" was DISPROVED.
+      v1.2 (a) (2026-04-28): implemented fix path (C) — special-case
+      canonical=0 in the kernel via a per-tile per-chunk uint32
+      summary counter written to the LAST 4 bytes of partial_out and
+      gated by (pass_idx==0 && tile_idx==0). Host runner reads the
+      trailing uint32 from each tile slot and adds to counts[0].
     failed_with: |
-      v1.0 (np=4): canonical=0 NPU=2 977 273 vs oracle=11 669 944
-        (delta = -8 692 671).
-      v1.1 (np=16): canonical=0 NPU=2 992 193 vs oracle=11 669 944
-        (delta = -8 677 751). chr22 top-100 byte-equal = 16/100;
-        top-1000 byte-equal = 486/1000. The remaining 84 top-100
-        mismatches are EXCESS counts of +7 to +8 (the
-        kmer-chunk-overlap-double-emit gap, scope of v1.1 (c)).
+      v1.0 (np=4): canonical=0 NPU=2 977 273 vs oracle=11 669 944.
+      v1.1 (np=16): canonical=0 NPU=2 992 193 vs oracle=11 669 944.
+      v1.2 (a) (np=16): canonical=0 NPU=11 669 944 vs oracle=11 669 944
+        (diff = 0; byte-equal). chr22 top-100 byte-equal = 100/100,
+        top-1000 byte-equal = 1000/1000. Closed.
     root_cause: |
       REVISED 2026-04-28 after v1.1 (a) data:
 
@@ -110,40 +113,36 @@ gaps:
       n_passes increase cannot fix this because all-A is invariant
       under the pass/tile slice mask (zero-bits stay zero-bits).
     workaround: |
-      v1.1 (a) data shows n_passes=16 alone insufficient. Real fixes
-      (none attempted; kernel/IRON/runner locked at v1.1 (a)):
+      v1.2 (a) lands fix path (C): special-case canonical=0 in the
+      kernel. Implementation:
 
-      (A) Larger MAX_EMIT_IDX_V05: the 4 095 cap derives from a
-          32 KiB output BO (32 768 - 4 prefix) / 8 bytes/canonical.
-          Raising BO to 64 KiB gives cap = 8 191 — enough for fully-
-          all-A chunks at k=21 (~3 924 entries). Requires CoreTile
-          DM budget audit (kmer_count_constants.h pinned 32 KiB for
-          a reason — the AIE2P CoreTile DM is 64 KiB total).
-      (B) Smaller chunk size: drop SEQ_IN_CHUNK_BYTES_BASE from 4096
-          to 2048. Halves all-A k-mers per chunk to ~1 962, well
-          below the 4 095 cap. Doubles the chunk count → doubles
-          dispatch overhead. ~2× silicon wall on chr22.
-      (C) Special-case canonical=0 in the kernel: dedicated counter
-          slot for the all-zeros canonical (not in the emit-list),
-          summed by host. Most hardware-correct fix; no chunk-cap
-          impact. Requires kernel C source change + IRON Python
-          tile-DMA layout change. Contract bump.
-      (D) SLICE_HASH_SHIFT > 0 with non-zero base: the current
-          slicing uses `canonical & pass_mask`. A different mix —
-          e.g. `((canonical * GOLDEN_RATIO) & pass_mask)` — would
-          spread canonical=0 across (pass, tile) slots only if the
-          mix moves the all-zeros input off the all-zeros output.
-          Requires investigation; likely Peano-implementable.
+        - Kernel: a uint32 all_a_counter is incremented in-line for
+          every canonical=0 k-mer (gated by pass_idx==0 &&
+          tile_idx==0 since canonical=0 lands in that slice cell by
+          definition; without the tile_idx==0 gate ALL N_TILES tiles
+          would each count the same all-A k-mers, producing N_TILES×
+          overcount because seq_in is broadcast).
+        - Wire format: the LAST 4 bytes of partial_out (offset
+          PARTIAL_OUT_BYTES_V05_PADDED - 4) carry the per-chunk
+          summary counter, written by the kernel at chunk-end.
+        - Host: accumulate_pass_blob() reads the trailing uint32
+          and accumulates into counts[0].
 
-      Path (C) is the cleanest. Path (A) is the cheapest if the DM
-      budget allows. Both are v1.1 (c) or v1.2 PRD scope.
+      Validation (chr22, k=21, n_tiles=4, n_passes=16):
+        canonical=0 NPU=11,669,944 oracle=11,669,944 → diff=0.
+        Top-100 byte-equal=100/100; top-1000=1000/1000.
+
+      The wire-format extension (uint32 tail) is a v1.2 amendment
+      to the v0.5 contract; the contract document update is deferred
+      to a follow-on PRD per task policy.
     upstream_issue: null
     blocks: []
     severity: "correctness"
-    status: "open"
+    status: "closed"
     history:
       - "v1.0 (T13/T14): observed at np=4."
       - "v1.1 (a) (2026-04-28): retest at np=16 disproved n_passes hypothesis. Root cause REVISED to per-chunk cap on centromere-resident all-A chunks. Real fixes A-D documented; none implemented."
+      - "v1.2 (a) (2026-04-28): fix path (C) shipped (canonical=0 summary counter, gated by pass=0 + tile=0). chr22 canonical=0 byte-equal (diff=0). Closed."
 
   - id: "kmer-chunk-overlap-double-emit"
     category: "correctness"
@@ -152,12 +151,17 @@ gaps:
       T13 + T14 silicon validation at chr22 scale. The host runner
       dispatches the input in 4 KiB chunks with per-k overlap
       (k=15: 4 B; k=21/31: 8 B per T1 contract).
+      v1.2 (a) (2026-04-28): implemented owned-range gate in the
+      kernel; runner stages a per-chunk owned_start_offset_bases
+      in-band in the chunk header.
     failed_with: |
       NPU output diverges from Jellyfish by 3-8 excess on each
       canonical at the top of the count distribution (T14 top-1000
       diffs first 50). Top-1000 Jaccard = 0.988, but counts are
       systematically 3-8 above Jellyfish for high-frequency
       canonicals.
+      v1.2 (a) chr22 retest: top-1000 sum_excess=0,
+      sum_undercount=0, top-1000 byte-equal=1000/1000. Closed.
     root_cause: |
       The runner's chunked dispatch counts boundary k-mers in two
       adjacent chunks because the overlap region is processed by
@@ -166,19 +170,40 @@ gaps:
       count distribution, the high-frequency canonicals receive a
       systematic 3-8 excess.
     workaround: |
-      v1.1 fix: emit only when k-mer start-index is in the chunk's
-      "owned" range, not the overlap region. Specifically, for
-      chunk `i` with overlap `O`:
-        owned_start = (i == 0) ? 0 : O
-        owned_end   = chunk_payload_capacity - O  (except last chunk)
-      The kernel signature needs a 6th int32_t `owned_start_offset`
-      (or the runner pre-shifts `n_input_bytes` to the owned
-      region). Either path is straightforward but contract-bumping;
-      v1.1 PRD will pin which.
+      v1.2 (a) fix: kernel-side owned-range gate. The chunk header
+      expanded from 4 bytes to 8 bytes (no IRON ABI change — this
+      is in-band header data inside the seq_in payload buffer):
+
+        bytes [0..3]: uint32 LE actual_payload_bytes (existing).
+        bytes [4..7]: int32  LE owned_start_offset_bases (NEW).
+        bytes [8..]:  payload (was offset 4).
+
+      The runner sets owned_start_offset_bases per chunk:
+        chunk 0           : 0  (first chunk; full payload owned).
+        chunk i  (i>0)    : overlap_bases - (k-1)
+                            where overlap_bases = overlap_bytes * 4.
+
+      For k=21, overlap_bytes=8 → overlap_bases=32 → owned=12.
+      For k=15, overlap_bytes=4 → overlap_bases=16 → owned=2.
+      For k=31, overlap_bytes=8 → overlap_bases=32 → owned=2.
+
+      The kernel tracks per-base position `pos` (0-indexed; 0 = first
+      base of payload) and only emits a k-mer when its start position
+      (= pos - (K-1)) is >= owned_start_offset_bases. K-mers whose
+      start lies in the overlap region were already emitted by the
+      previous chunk's tail, so dropping them in the current chunk
+      removes the systematic excess.
+
+      Validation (chr22, k=21, n_tiles=4, n_passes=16):
+        top-1000 sum_excess=0, sum_undercount=0,
+        top-1000 byte-equal=1000/1000.
     upstream_issue: null
     blocks: []
     severity: "performance"
-    status: "deferred-to-v1.1"
+    status: "closed"
+    history:
+      - "v1.0 (T13/T14): observed at chr22 scale; +3..+8 excess on top-1000."
+      - "v1.2 (a) (2026-04-28): owned-range gate shipped (in-band per-chunk header). chr22 top-1000 byte-equal (diff=0). Closed."
 
   - id: "kmer-host-postpass-python-bottleneck"
     category: "performance"

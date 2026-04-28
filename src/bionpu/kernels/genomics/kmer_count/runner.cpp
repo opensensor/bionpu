@@ -321,12 +321,17 @@ std::string resolve_pass_path(const std::string &template_path,
 // ---------------------------------------------------------------------
 // Streaming chunk-with-overlap dispatch planner.
 //
-// Each chunk carries up to (SEQ_IN_CHUNK_BYTES_BASE + overlap_bytes - 4)
-// bytes of payload (the leading 4 bytes are the in-band uint32 LE
-// length prefix consumed by the kernel). Without the -4 the kernel's
-// length prefix would clobber the first 4 payload bytes.
+// v1.2 (a): in-band header expanded from 4 bytes to 8 bytes. Bytes
+// [0..3] carry uint32 LE actual_bytes (existing); bytes [4..7] carry
+// int32 LE owned_start_offset_bases (per-chunk; chunk 0 = 0; chunk i
+// (i>0) = overlap_bases - (k-1)). Closes kmer-chunk-overlap-double-emit.
+//
+// Each chunk carries up to (SEQ_IN_CHUNK_BYTES_BASE + overlap_bytes - 8)
+// bytes of payload (the leading 8 bytes are the in-band header consumed
+// by the kernel). Without the -8 the kernel's header would clobber the
+// first 8 payload bytes.
 // ---------------------------------------------------------------------
-constexpr size_t LENGTH_PREFIX_BYTES = 4;
+constexpr size_t HEADER_BYTES = 8;  // v1.2 (a): was 4; now 4 (length) + 4 (owned_offset)
 
 struct ChunkPlan {
     size_t src_offset;     // first byte of this chunk in the source buffer
@@ -339,7 +344,7 @@ std::vector<ChunkPlan> plan_chunks(size_t input_bytes, int overlap_bytes) {
     if (input_bytes == 0) return plan;
     const size_t total_chunk = static_cast<size_t>(SEQ_IN_CHUNK_BYTES_BASE)
                              + static_cast<size_t>(overlap_bytes);
-    const size_t payload_cap = total_chunk - LENGTH_PREFIX_BYTES;
+    const size_t payload_cap = total_chunk - HEADER_BYTES;
     // Advance per chunk by base = payload_cap - overlap_bytes (so the
     // overlap region is re-read by the next chunk to preserve k-mers
     // straddling boundaries).
@@ -361,11 +366,19 @@ std::vector<ChunkPlan> plan_chunks(size_t input_bytes, int overlap_bytes) {
 // Per-pass output blob parser.
 //
 // Output layout per pass: N_TILES × PARTIAL_OUT_BYTES_V05_PADDED bytes.
-// Per-tile slot: [uint32 emit_idx LE prefix][emit_idx × uint64 canonical].
+// Per-tile slot:
+//   [uint32 emit_idx LE prefix]
+//   [emit_idx × uint64 canonical]
+//   [middle zero pad]
+//   [uint32 LE all_a_counter at offset PARTIAL_OUT_BYTES_V05_PADDED-4]
 //
 // For each canonical, counts[canonical]++. Each emit IS one observation
 // (NOT a count summary) — the kernel emits one canonical per k-mer
 // occurrence whose canonical falls into the active hash slice.
+//
+// v1.2 (a): the trailing all_a_counter is added to counts[0] (only ever
+// non-zero on the pass=0 xclbin; canonical=0 lands in pass=0 by the
+// slice mask). Closes kmer-chr22-canonical0-cap-fire.
 // ---------------------------------------------------------------------
 size_t accumulate_pass_blob(const uint8_t *blob, size_t blob_size,
                             int n_tiles,
@@ -396,6 +409,19 @@ size_t accumulate_pass_blob(const uint8_t *blob, size_t blob_size,
             counts[canonical] += 1ULL;
         }
         emits += static_cast<size_t>(emit_idx);
+
+        // v1.2 (a): read trailing all_a_counter and accumulate into
+        // counts[0]. Slot tail offset = off + PARTIAL_OUT_BYTES_V05_PADDED - 4.
+        size_t all_a_off = off +
+                           static_cast<size_t>(PARTIAL_OUT_BYTES_V05_PADDED) - 4u;
+        if (all_a_off + 4 <= blob_size) {
+            uint32_t all_a_counter = 0;
+            std::memcpy(&all_a_counter, blob + all_a_off, 4);
+            if (all_a_counter > 0u) {
+                counts[0ULL] += static_cast<uint64_t>(all_a_counter);
+                emits += static_cast<size_t>(all_a_counter);
+            }
+        }
     }
     out_emit_total += emits;
     return emits;
@@ -578,15 +604,32 @@ int main(int argc, char **argv) {
         for (size_t ci = 0; ci < n_chunks_host; ++ci) {
             const ChunkPlan &c = chunks[ci];
 
-            // Stage seq_in for this chunk: 4-byte uint32 LE length
-            // prefix at offset 0 (= c.bytes), then payload at offset 4
-            // for c.bytes bytes; zero-pad remainder.
+            // Stage seq_in for this chunk (v1.2 (a) 8-byte header):
+            //   [0..3]: uint32 LE actual_bytes (existing)
+            //   [4..7]: int32  LE owned_start_offset_bases (NEW)
+            //   [8..]:  payload
+            // Then zero-pad remainder.
             std::memset(p_seq_in, 0, seq_in_slot_bytes);
             // Length prefix.
             uint32_t actual_bytes_le = static_cast<uint32_t>(c.bytes);
             std::memcpy(p_seq_in, &actual_bytes_le, 4);
+            // v1.2 (a) owned_start_offset_bases:
+            //   chunk 0           : 0
+            //   chunk i  (i>0)    : overlap_bases - (k-1)
+            // overlap_bases = overlap_bytes * 4 (each byte carries 4
+            // 2-bit bases). For k=21, overlap_bytes=8 → overlap_bases=32
+            //                  → owned_start_offset_bases = 32 - 20 = 12.
+            // For k=15, overlap_bytes=4 → overlap_bases=16
+            //                  → owned_start_offset_bases = 16 - 14 = 2.
+            // For k=31, overlap_bytes=8 → overlap_bases=32
+            //                  → owned_start_offset_bases = 32 - 30 = 2.
+            int32_t owned_start_offset_bases =
+                (ci == 0)
+                    ? 0
+                    : (overlap_bytes * 4) - (args.k - 1);
+            std::memcpy(p_seq_in + 4, &owned_start_offset_bases, 4);
             // Payload.
-            std::memcpy(p_seq_in + LENGTH_PREFIX_BYTES,
+            std::memcpy(p_seq_in + HEADER_BYTES,
                         input_buf.data() + c.src_offset,
                         c.bytes);
             bo_seq_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);

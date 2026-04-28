@@ -36,6 +36,19 @@ static constexpr uint64_t MINIMIZER_MASK_K21 = (1ULL << 42) - 1ULL;
 //
 // (k=15, w=10): w + k - 1 = 24 bases = 6 bytes → round to 8.
 // (k=21, w=11): w + k - 1 = 31 bases = 8 bytes → 8 (already aligned).
+//
+// v1: chunk size kept at 4096 bytes (= 16384 bases). At this size,
+// chr22's high-density chunks produce up to 16352 emits/chunk; with
+// N_PASSES=4 + Fibonacci position hash, max per (chunk, slice) ≈ 4090,
+// over the MZ_MAX_EMIT_IDX=2046 cap. The cap-fire results in a 71%
+// chr22 byte-equal recovery (14.26 M of 20.01 M minimizers). Top-1000
+// is fully byte-equal.
+//
+// A v1 experiment reduced chunk size to 1024 bytes to fit cap, but
+// at 4× more dispatches the e2e wall ballooned to >15 minutes. Closure
+// of `minimizer-emit-cap-saturation` to full chr22 byte-equal is
+// deferred to v2 (option (b) from v0 gaps.yaml: widen
+// MZ_PARTIAL_OUT_BYTES_PADDED 32K→64K).
 static constexpr int32_t MZ_SEQ_IN_CHUNK_BYTES_BASE = 4096;
 static constexpr int32_t MZ_SEQ_IN_OVERLAP_K15_W10 = 8;  // covers 24 bases
 static constexpr int32_t MZ_SEQ_IN_OVERLAP_K21_W11 = 8;  // covers 31 bases (32 bases ok)
@@ -68,5 +81,31 @@ static constexpr int32_t MZ_MAX_EMIT_IDX = 2046;
 // >= owned_start_offset_bases. Without this gate, chunks would emit
 // duplicate minimizers in the (w + k - 1) base overlap region.
 static constexpr int32_t MZ_HEADER_BYTES = 8;
+
+// =====================================================================
+// v1: multi-pass hash-slice partitioning (mirrors kmer_count v0.5).
+// =====================================================================
+//
+// The kernel's window-min logic is UNCHANGED across passes — every pass
+// evaluates the full window. Only the EMIT decision is filtered by
+// hash-slice membership:
+//
+//   slice = canonical & ((1 << n_passes_log2) - 1)
+//   emit IFF slice == pass_idx
+//
+// At chr22 (k=15, w=10) the oracle averages 6451 records / 16-K-base
+// chunk. With N_PASSES=4 the per-pass average is ~1613 records, well
+// under MZ_MAX_EMIT_IDX=2046. With N_PASSES=8 ~806 records / pass.
+//
+// Coverage is exact: every minimizer maps to exactly ONE slice in
+// [0, N_PASSES). The host's union over all N_PASSES dispatches
+// reproduces the full minimizer set with no double-counting.
+//
+// Supported N_PASSES values (mirrors kmer_count's set):
+//   N_PASSES = 1   (log2 = 0)  — single-pass; back-compat with v0.
+//   N_PASSES = 4   (log2 = 2)  — primary chr22 cell.
+//   N_PASSES = 8   (log2 = 3)  — extra cap headroom.
+//   N_PASSES = 16  (log2 = 4)  — finest granularity.
+static constexpr int32_t MZ_N_PASSES_VALUES_LOG2[4] = {0, 2, 3, 4};
 
 #endif  // BIONPU_MINIMIZER_CONSTANTS_H

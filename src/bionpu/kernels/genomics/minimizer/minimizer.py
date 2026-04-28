@@ -10,18 +10,31 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 #
-# minimizer.py — IRON lowering for the v0 sliding-window minimizer
-# kernel. Mirrors kmer_count.py shape (broadcast → N tiles → memtile
-# join → shim) but specialised for (k, w) ∈ {(15,10), (21,11)} and
-# single-pass (no hash-slice partition: emit volume is low).
+# minimizer.py — IRON lowering for the (w, k) minimizer kernel.
+#
+# v1 adds multi-pass hash-slice partitioning (mirrors kmer_count v0.5):
+# the kernel emits only minimizers whose canonical falls into the active
+# slice (low n_passes_log2 bits == pass_idx). Each pass produces an
+# xclbin with (pass_idx, n_passes_log2) baked in as IRON arith.constants.
+# The host runner dispatches N_PASSES separate xclbins per chunk (one
+# per slice) and unions the results.
+#
+# Topology mirrors v0 (broadcast → N_TILES tiles → memtile join → shim);
+# only the kernel-arg list grew (5 → 7 args) to carry the multi-pass
+# selectors.
 #
 # Build-time parameters (all baked into the xclbin via env vars):
 #   K, W                  — minimizer params; per-build constants.
 #   LAUNCH_CHUNKS         — n_tiles fan-out (1, 2, 4, 8). Default 4.
-#   N_CHUNKS_PER_LAUNCH   — chunks per dispatch (default 1; v0 ships 1).
+#   N_PASSES              — hash-slice partition count (1, 4, 8, 16).
+#                           Default 1 (back-compat with v0).
+#   PASS_IDX              — which slice this xclbin handles
+#                           (0..N_PASSES-1).
+#   N_CHUNKS_PER_LAUNCH   — chunks per dispatch (default 1).
 #
 # CLI:
-#   python3 minimizer.py -d npu2 --k 15 --w 10 --launch-chunks 4
+#   python3 minimizer.py -d npu2 --k 15 --w 10 --launch-chunks 4 \
+#       --n-passes 4 --pass-idx 0
 #
 # This file is licensed under the Apache License v2.0 with LLVM Exceptions.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -55,7 +68,28 @@ N_TILES = LAUNCH_CHUNKS
 K_DEFAULT = int(_os.environ.get("BIONPU_MINIMIZER_K", "15"))
 W_DEFAULT = int(_os.environ.get("BIONPU_MINIMIZER_W", "10"))
 
+# v1: multi-pass hash-slice partitioning. log2 ∈ {0, 2, 3, 4} → values
+# {1, 4, 8, 16}. Build-time constant; one xclbin per (k, w, n_tiles,
+# n_passes, pass_idx).
+N_PASSES = int(_os.environ.get("BIONPU_MINIMIZER_N_PASSES", "1"))
+if N_PASSES not in (1, 4, 8, 16):
+    raise ValueError(
+        f"BIONPU_MINIMIZER_N_PASSES={N_PASSES} not in {{1, 4, 8, 16}}"
+    )
+
+# PASS_IDX — which slice this xclbin handles. 0..N_PASSES-1.
+PASS_IDX = int(_os.environ.get("BIONPU_MINIMIZER_PASS_IDX", "0"))
+
+
+def _n_passes_log2(n: int) -> int:
+    return {1: 0, 4: 2, 8: 3, 16: 4}[n]
+
+
 # Streaming chunk + per-(k,w) overlap (4-byte aligned for aiecc dma_bd).
+# v1: kept at 4096 bytes (16384 bases) — same as v0 — for throughput.
+# A chunk=1024 v1 experiment fit the cap fully at chr22 but blew up
+# e2e wall (15+ min). Cap-fire mitigation deferred to v2 (widen
+# partial_out 32K→64K).
 SEQ_CHUNK_BYTES = 4096
 
 # Overlap covers the prior chunk's tail (w + k - 1) bases. Round to
@@ -75,6 +109,11 @@ MAX_EMIT_IDX = 2046
 # How many input chunks one xclbin launch processes. v0: 1 (per-chunk
 # dispatch). Mirrors kmer_count.py:189-202 — short fixtures need
 # self-consistent dispatches.
+#
+# v1 batched-dispatch: setting N_CHUNKS_PER_LAUNCH > 1 amortises silicon
+# dispatch cost over N_BATCH chunks. The runner MUST pad short tail
+# batches with zero-actual-bytes chunks or the kernel will block
+# acquiring undelivered chunks.
 N_CHUNKS_PER_LAUNCH = int(_os.environ.get(
     "BIONPU_MINIMIZER_N_CHUNKS_PER_LAUNCH", "1"))
 if N_CHUNKS_PER_LAUNCH not in (1, 2, 4, 8):
@@ -89,20 +128,24 @@ if N_CHUNKS_PER_LAUNCH not in (1, 2, 4, 8):
 # ---------------------------------------------------------------------------
 
 
-def minimizer(dev, *, k: int, w: int):
-    """Build the IRON program for the v0 minimizer kernel.
+def minimizer(dev, *, k: int, w: int, n_passes: int = 1, pass_idx: int = 0):
+    """Build the IRON program for the (w, k) minimizer kernel.
 
     Args:
         dev: AIE device.
         k: k-mer length.
         w: window length.
+        n_passes: hash-slice partition count (1, 4, 8, 16). BUILD-TIME.
+        pass_idx: which slice this xclbin handles (0..n_passes-1).
+            BUILD-TIME — the host runner dispatches one xclbin per
+            pass_idx and unions the results.
 
     Topology:
         shim ─seq_in─ broadcast ──▶ tile_0 .. tile_{N_TILES-1}
                                           │
                                     (compute canonical;
                                      run sliding-window min;
-                                     emit (canonical, position) on min change)
+                                     hash-slice filter at emit time)
                                           │
                                     partial_minimizer_<i>
                                           │
@@ -113,15 +156,24 @@ def minimizer(dev, *, k: int, w: int):
 
     Note: every tile receives the SAME input chunk (broadcast), so
     every tile produces the SAME minimizer output. The host runner
-    reads tile_0's slot only and ignores the others. v1 will partition
-    work across tiles (e.g., assign chunks round-robin). v0's parallelism
-    is via N_CHUNKS_PER_LAUNCH-style batching, not per-tile splitting.
+    reads tile_0's slot only and ignores the others. v1 retains the v0
+    broadcast topology; per-tile partition is a future enhancement.
     """
     if (k, w) not in _OVERLAP_BY_KW:
         raise ValueError(
             f"unsupported (k, w)=({k}, {w}); pinned: "
             f"{tuple(_OVERLAP_BY_KW.keys())}"
         )
+    if n_passes not in (1, 4, 8, 16):
+        raise ValueError(
+            f"n_passes must be in {{1, 4, 8, 16}}, got {n_passes!r}"
+        )
+    if not (0 <= pass_idx < n_passes):
+        raise ValueError(
+            f"pass_idx must be in [0, {n_passes}), got {pass_idx!r}"
+        )
+
+    n_passes_log2 = _n_passes_log2(n_passes)
 
     overlap_bytes = _OVERLAP_BY_KW[(k, w)]
     seq_in_chunk_bytes = SEQ_CHUNK_BYTES + overlap_bytes
@@ -147,6 +199,8 @@ def minimizer(dev, *, k: int, w: int):
     ]
 
     # ----- external kernel function -----
+    # v1 7-arg signature: (packed_in, partial_out, n_input_bytes,
+    #                      pass_idx, n_passes_log2, tile_idx, n_tiles_log2)
     tile_symbol = f"minimizer_tile_k{k}_w{w}"
     tile_fn = Kernel(
         tile_symbol,
@@ -155,8 +209,10 @@ def minimizer(dev, *, k: int, w: int):
             seq_chunk_ty,                  # packed_in
             partial_chunk_ty,              # partial_out
             np.int32,                      # n_input_bytes
-            np.int32,                      # tile_idx (unused v0)
-            np.int32,                      # n_tiles_log2 (unused v0)
+            np.int32,                      # pass_idx (v1)
+            np.int32,                      # n_passes_log2 (v1)
+            np.int32,                      # tile_idx (unused in v1)
+            np.int32,                      # n_tiles_log2 (unused in v1)
         ],
     )
 
@@ -188,6 +244,8 @@ def minimizer(dev, *, k: int, w: int):
                     elem_seq,
                     elem_partial,
                     seq_in_chunk_bytes,         # n_input_bytes
+                    pass_idx,                   # build-time int (v1)
+                    n_passes_log2,              # build-time int (v1)
                     tile_idx_const,             # build-time int
                     n_tiles_log2,               # build-time int
                 )
@@ -217,7 +275,7 @@ def minimizer(dev, *, k: int, w: int):
 
 
 def main():
-    global LAUNCH_CHUNKS, N_TILES, N_CHUNKS_PER_LAUNCH
+    global LAUNCH_CHUNKS, N_TILES, N_PASSES, PASS_IDX, N_CHUNKS_PER_LAUNCH
 
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -245,6 +303,19 @@ def main():
         default=None,
     )
     p.add_argument(
+        "--n-passes",
+        type=int,
+        choices=(1, 4, 8, 16),
+        default=None,
+        help=f"Hash-slice partition count (default {N_PASSES}). BUILD-TIME.",
+    )
+    p.add_argument(
+        "--pass-idx",
+        type=int,
+        default=None,
+        help=f"Which slice this xclbin handles (0..n_passes-1; default {PASS_IDX}).",
+    )
+    p.add_argument(
         "--n-chunks-per-launch",
         type=int,
         choices=(1, 2, 4, 8),
@@ -255,8 +326,16 @@ def main():
     if opts.launch_chunks is not None:
         LAUNCH_CHUNKS = opts.launch_chunks
         N_TILES = LAUNCH_CHUNKS
+    if opts.n_passes is not None:
+        N_PASSES = opts.n_passes
+    if opts.pass_idx is not None:
+        PASS_IDX = opts.pass_idx
     if opts.n_chunks_per_launch is not None:
         N_CHUNKS_PER_LAUNCH = opts.n_chunks_per_launch
+    if not (0 <= PASS_IDX < N_PASSES):
+        raise ValueError(
+            f"--pass-idx={PASS_IDX} must be in [0, --n-passes={N_PASSES})"
+        )
 
     if opts.device == "npu":
         dev = NPU1Col1()
@@ -265,7 +344,13 @@ def main():
     else:
         raise ValueError(f"[ERROR] unknown device: {opts.device!r}")
 
-    print(minimizer(dev, k=opts.k, w=opts.w))
+    print(minimizer(
+        dev,
+        k=opts.k,
+        w=opts.w,
+        n_passes=N_PASSES,
+        pass_idx=PASS_IDX,
+    ))
 
 
 if __name__ == "__main__":

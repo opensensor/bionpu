@@ -10,7 +10,8 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 //
-// minimizer_tile.cc — per-tile sliding-window (w, k) minimizer kernel.
+// minimizer_tile.cc — per-tile sliding-window (w, k) minimizer kernel
+//                     (v1: multi-pass hash-slice partitioning).
 //
 // Two extern "C" entry points (gated on -DKW_ACTIVE=KW{15_10,21_11}):
 //
@@ -18,18 +19,43 @@
 //       uint8_t*  __restrict packed_in,    // chunk_bytes + overlap_bytes
 //       uint8_t*  __restrict partial_out,  // MZ_PARTIAL_OUT_BYTES_PADDED
 //       int32_t   n_input_bytes,           // BO capacity (chunk size + 8)
-//       int32_t   tile_idx,                // unused for v0 (see Note 1)
-//       int32_t   n_tiles_log2);           // unused for v0 (see Note 1)
+//       int32_t   pass_idx,                // 0..n_passes-1 (v1)
+//       int32_t   n_passes_log2,           // log2(N_PASSES) (v1)
+//       int32_t   tile_idx,                // unused for v1 (broadcast)
+//       int32_t   n_tiles_log2);           // unused for v1
 //
 // Note 1: the IRON Python broadcasts seq_in to all N_TILES tiles (same
-// fan-out topology as kmer_count). For v0 we do NOT partition the
+// fan-out topology as kmer_count). For v1 we still do NOT partition the
 // minimizer output across tiles — every tile sees the same chunk and
-// emits the SAME minimizers. The host runner reads tile_0's slot only
-// and ignores the others. This keeps the v0 build trivial; v1 will
-// either gate emits per-tile (e.g., partition by minimizer position
-// modulo n_tiles) or use a single-tile build.
+// emits the SAME hash-slice-filtered minimizers. The host runner reads
+// tile_0's slot only and ignores the others. The N_TILES fan-out exists
+// so that the IRON memtile-join topology matches kmer_count's wide
+// dispatch shape (and so that the same artifact dir naming convention
+// works).
 //
-// Algorithm — mirrors data/minimizer_oracle.py exactly:
+// v1 multi-pass: each pass emits only minimizers whose
+// (position-within-chunk's low n_passes_log2 bits) equal pass_idx. The
+// window-min logic is UNCHANGED across passes; only the emit decision
+// filters by slice.
+//
+// Why slice on hashed POSITION rather than CANONICAL: chr22 contains
+// long homopolymer-A regions in centromere/telomere that produce a high
+// density of canonical=0 minimizers at distinct positions (~1 emit per
+// W bases in steady state). Slicing on canonical's low bits would put
+// every canonical=0 minimizer into pass 0 (since all bits of canonical
+// are zero), blowing past MZ_MAX_EMIT_IDX in chunk 0. We slice on
+// Fibonacci-hashed position so emits at any stride distribute uniformly
+// across passes regardless of canonical value:
+//
+//   slice = (position * GOLDEN) >> (32 - n_passes_log2)
+//
+// where GOLDEN = 0x9E3779B9 is the 32-bit Fibonacci-hashing constant
+// (closest integer to 2^32 * (sqrt(5)-1)/2). For n_passes_log2==0 we
+// short-circuit to slice=0 (single-pass back-compat; avoids the
+// shift-by-32 corner case).
+//
+// Algorithm — mirrors data/minimizer_oracle.py exactly except for the
+// per-pass slice filter at emit time:
 //
 //   For each new ACGT base entering at index i:
 //     1. fwd = ((fwd << 2) | base) & MASK
@@ -42,13 +68,25 @@
 //     7. If n_pushed < w: window not full; no emit.
 //     8. If n_pushed == w: scan ring for oldest-on-tie min; emit if
 //        owned (kmer_start >= owned_start_offset_bases on the SCAN
-//        WINNER's position).
+//        WINNER's position) AND in-slice.
 //     9. Else (window has slid):
 //        a. If cur_min_slot == slot: previous min was overwritten
-//           → re-scan; emit if owned.
+//           → re-scan; emit if owned + in-slice.
 //        b. Else if canonical < cur_min_canonical: strict improvement
-//           → cur_min = (canonical, kmer_start, slot); emit if owned.
+//           → cur_min = (canonical, kmer_start, slot); emit if
+//           owned + in-slice.
 //        c. Else: no emit.
+//
+// In-slice predicate (per pass):
+//   if (n_passes_log2 == 0) in_slice = true (single-pass back-compat)
+//   else
+//     hash = (uint32_t)position * 0x9E3779B9u
+//     slice = hash >> (32 - n_passes_log2)
+//     in_slice = (slice == pass_idx)
+//
+// Fibonacci hashing on chunk-local position spreads all stride patterns
+// (including the W-stride pattern characteristic of homopolymer regions)
+// uniformly across passes.
 //
 // Non-ACGT base resets the rolling state AND the ring buffer.
 //
@@ -84,6 +122,8 @@ template <int K, int W, uint64_t MASK>
 static inline void minimizer_tile_impl(uint8_t* __restrict packed_in,
                                        uint8_t* __restrict partial_out,
                                        int32_t n_input_bytes,
+                                       int32_t pass_idx,
+                                       int32_t n_passes_log2,
                                        int32_t /*tile_idx*/,
                                        int32_t /*n_tiles_log2*/) {
     // Static window ring buffer in the tile DM.
@@ -116,6 +156,14 @@ static inline void minimizer_tile_impl(uint8_t* __restrict packed_in,
     bool     have_min          = false;
 
     constexpr int32_t RC_HIGH_SHIFT = 2 * (K - 1);
+
+    // v1: Fibonacci-hash slice filter on chunk-local position. For
+    // n_passes_log2 == 0 we short-circuit to in_slice=true (single-pass
+    // back-compat). Otherwise compute slice = (pos * GOLDEN) >>
+    // (32 - n_passes_log2). pass_idx must equal slice for emit.
+    constexpr uint32_t FIB_GOLDEN = 0x9E3779B9u;
+    const int32_t fib_shift = 32 - n_passes_log2;
+    const uint32_t pass_idx_u32 = (uint32_t)pass_idx;
 
     // ----- In-band header decode. -----
     int32_t actual_bytes = (int32_t)packed_in[0]
@@ -240,7 +288,20 @@ static inline void minimizer_tile_impl(uint8_t* __restrict packed_in,
                 // start position is in the overlap region.
                 bool owned = (cur_min_position >= owned_start_offset_bases);
 
-                if (owned && emit_idx < (uint32_t)MZ_MAX_EMIT_IDX) {
+                // v1: Fibonacci-hash slice filter on POSITION. n_passes_log2
+                // == 0 is the single-pass back-compat case (every emit
+                // passes). Otherwise slice = (pos * GOLDEN) >> (32 -
+                // n_passes_log2); emit IFF slice == pass_idx.
+                bool in_slice;
+                if (n_passes_log2 == 0) {
+                    in_slice = true;
+                } else {
+                    uint32_t hash = (uint32_t)cur_min_position * FIB_GOLDEN;
+                    uint32_t slice = hash >> fib_shift;
+                    in_slice = (slice == pass_idx_u32);
+                }
+
+                if (owned && in_slice && emit_idx < (uint32_t)MZ_MAX_EMIT_IDX) {
                     uint8_t* dst = partial_out + 4 +
                                    (size_t)emit_idx * (size_t)MZ_RECORD_BYTES;
                     // Bytes [0..7]: canonical LE.
@@ -299,10 +360,13 @@ extern "C" {
 void minimizer_tile_k15_w10(uint8_t* __restrict packed_in,
                             uint8_t* __restrict partial_out,
                             int32_t n_input_bytes,
+                            int32_t pass_idx,
+                            int32_t n_passes_log2,
                             int32_t tile_idx,
                             int32_t n_tiles_log2) {
     minimizer_tile_impl<15, 10, MINIMIZER_MASK_K15>(
-        packed_in, partial_out, n_input_bytes, tile_idx, n_tiles_log2);
+        packed_in, partial_out, n_input_bytes,
+        pass_idx, n_passes_log2, tile_idx, n_tiles_log2);
 }
 #endif
 
@@ -310,10 +374,13 @@ void minimizer_tile_k15_w10(uint8_t* __restrict packed_in,
 void minimizer_tile_k21_w11(uint8_t* __restrict packed_in,
                             uint8_t* __restrict partial_out,
                             int32_t n_input_bytes,
+                            int32_t pass_idx,
+                            int32_t n_passes_log2,
                             int32_t tile_idx,
                             int32_t n_tiles_log2) {
     minimizer_tile_impl<21, 11, MINIMIZER_MASK_K21>(
-        packed_in, partial_out, n_input_bytes, tile_idx, n_tiles_log2);
+        packed_in, partial_out, n_input_bytes,
+        pass_idx, n_passes_log2, tile_idx, n_tiles_log2);
 }
 #endif
 

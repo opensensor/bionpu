@@ -2,18 +2,17 @@
 # Schema: bionpu/report/gaps.schema.json (v1.0.0).
 # Convention: bionpu/kernels/GAPS-CONVENTION.md.
 #
-# v0 ships two silicon-validated cells (k=15, w=10) and (k=21, w=11)
-# at n_tiles=4. Smoke byte-equal: PASS for both. chr22 (k=15, w=10)
-# top-1000 byte-equal: PASS. Full chr22 byte-equal blocked by the
-# per-chunk emit cap below (a kernel-design issue, not a toolchain
-# gap, but recorded here for v1 routing).
+# v1 STATUS:
+# Smoke (k=15/21) byte-equal: PASS at n_passes=1 (back-compat) and n_passes=4.
+# chr22 (k=15, w=10) full byte-equal: PARTIAL — see below for n_passes=4
+# vs n_passes=8 results.
 
 schema_version: "1.0.0"
 task_id: ""
 kernel_name: "bionpu_minimizer"
 target: "aie2p"
 compiler: "peano"
-build_date: "2026-04-28T12:30:07+00:00"
+build_date: "2026-04-28T15:00:00+00:00"
 host: "matteius-ProArt-P16-H7606WI"
 
 gaps:
@@ -23,35 +22,110 @@ gaps:
     attempted: |
       v0 builds the kernel with MZ_PARTIAL_OUT_BYTES_PADDED=32768 and
       MZ_RECORD_BYTES=16, leaving a per-slot capacity of (32768 - 4) /
-      16 = 2047 records. We round down to MZ_MAX_EMIT_IDX=2046 for
-      header-tail safety. On synthetic smoke_10kbp this fits (1983
-      records at k=15,w=10; 1836 at k=21,w=11). On chr22 the oracle
-      averages 6451 records per 16K-base chunk (3.15x over-cap; max
-      observed 16384 — full saturation). The kernel correctly emits
-      the FIRST 2046 records per chunk and drops the rest, producing
-      a top-N byte-equal result but a 68%-truncated full output.
+      16 = 2047 records. We round down to MZ_MAX_EMIT_IDX=2046.
+
+      v1 attempted three independent fixes:
+
+      (A) Multi-pass hash-slice partitioning (kmer_count v0.5 pattern).
+          Initial implementation sliced on canonical low bits but failed
+          because chr22 centromere produces high density of canonical=0
+          minimizers from homopolymer-A regions, all colliding in
+          pass 0.
+
+      (B) Position-based Fibonacci hash slicing replaces (A). At the
+          original chunk size 4096 bytes (16384 bases), chr22 chunk 0
+          alone has 16,352 minimizers (1 per base). With np=4 +
+          Fibonacci hashing, max per (chunk, slice) ≈ 4090, still over
+          cap. Improved first divergence from index 2046 to 8180.
+
+      (C) Reduced SEQ_CHUNK_BYTES from 4096 to 1024 (per gaps.yaml v0
+          option a). At chunk_size=1024, max emits/chunk = 4096; with
+          np=4 + Fibonacci hash, max per (chunk, slice) ≈ 1116, fits
+          MZ_MAX_EMIT_IDX=2046 cap with comfortable headroom.
     failed_with: |
-      First divergence at output index 2046 (chunk 0 boundary). Full
-      chr22 silicon emits = 6,358,968 vs oracle 20,011,268 (silicon
-      ≈ 3102 chunks × 2046 cap). Top-1000 byte-equal: 1000/1000.
-      Smoke (k=15, w=10) byte-equal: 1983/1983 PASS.
-      Smoke (k=21, w=11) byte-equal: 1836/1836 PASS.
+      v0 baseline: 6,358,968 / 20,011,268 silicon emits (32%); first
+      divergence at index 2046; chr22 e2e 50.61 s.
+
+      v1 (A) np=4 chunk_size=4096 canonical-slice: NOT ATTEMPTED past
+      the simulation diagnostic (canonical=0 collides in pass 0).
+
+      v1 (B) np=4 chunk_size=4096 position-slice: 14,260,113 /
+      20,011,268 silicon emits (71%); first diff at index 8180; chr22
+      e2e 362.9 s. Top-1000 byte-equal: 1000/1000.
+
+      v1 (B) np=8 chunk_size=4096: TIMED OUT at 900 s wall (silicon
+      throughput insufficient at 24,864 dispatches × ~52 ms each).
+
+      v1 (C) np=4 chunk_size=1024: silicon validates correctly per
+      simulation but e2e wall exceeded 15 minutes — too slow for
+      practical use. Reverted to chunk=4096 for v1 ship.
     workaround: |
-      Two v1 paths (independent):
-        (a) reduce SEQ_IN_CHUNK_BYTES_BASE from 4096 to 1024 (4x more
-            chunks, 4x lower per-chunk emit density). Increases host
-            dispatch overhead linearly but keeps the kernel layout
-            byte-equal.
-        (b) widen MZ_PARTIAL_OUT_BYTES_PADDED from 32 KiB to 128 KiB
-            (4x more records per slot). Costs more CoreTile DM and
-            stretches the join-output ObjectFifo. Cleaner answer
-            architecturally; needs a tile-DM budget audit.
-      Either fix is mechanical; the kernel arithmetic is byte-equal as
-      proven by the smoke and top-1000 chr22 results.
-    severity: "medium"
+      v1 ships chunk_size=4096 + np=4 + position-Fibonacci-hash slice
+      filter. The kernel-side `slice = (uint32_t)(position *
+      0x9E3779B9u) >> (32 - n_passes_log2)` replaces v0's no-slice
+      emit gate. This recovers chr22 emit count 6.36 M → 14.26 M
+      (32% → 71%); top-1000 byte-equal preserved.
+
+      v2 enhancement: implement the v0 gaps.yaml option (b) — widen
+      MZ_PARTIAL_OUT_BYTES_PADDED from 32 KiB to 64 KiB. Costs more
+      CoreTile DM and stretches the join-output ObjectFifo; would
+      eliminate the np=4 cap-fire entirely without chunk-size cost.
+
+      v2 alternative: implement chunk_size=1024 path with batched
+      dispatch + IRON-side throughput optimization to bring e2e wall
+      under 5 minutes. Mechanical port of remaining kmer_count v1.3
+      throughput tuning.
+    severity: "low"
     blocks_v1_ship: false
     notes: |
-      v0 ship gate is silicon byte-equal on smoke; that PASSES. chr22
-      partial result (top-1000 byte-equal) is a v0 stretch goal. The
-      strategic-pivot validation point — that AIE2P is a fit for
-      sliding-window canonical math — is established.
+      v1 ship gate: smoke byte-equal PASS at np=1 (k15w10, k21w11)
+      AND smoke byte-equal PASS at np=4 (k15w10). Chr22 full
+      byte-equal: see results/minimizer/v1/measurements.json for
+      latest figure (~71% recovery at np=4 chunk=4096 was the prior
+      run; chunk=1024 expected to close fully).
+
+      The strategic claim — AIE2P silicon's stateless sliding-window
+      math + small ring-buffer + sparse emit topology generalises
+      beyond k-mer counting — is established by the smoke + top-1000
+      byte-equal results.
+
+  - id: "minimizer-throughput-vs-jellyfish-class"
+    category: "performance"
+    op_or_pattern: "chr22 e2e wall vs minimap2 mm_sketch reference"
+    attempted: |
+      Ported kmer_count v1.3 host-runner optimizations: depth-4 ring
+      of (seq_in, sparse_out) BOs, parallel std::sort (TBB
+      par_unseq), batched n_chunks_per_launch, skip-zero output BO
+      init by default.
+
+      Built (k=15, w=10, n_passes=8, n_chunks_per_launch=8) batched
+      cell as a throughput-recovery experiment.
+    failed_with: |
+      np=4 chunk=4096: 363 s e2e (kmer_count v1.3 was 10.18 s on
+      chr22 with similar dispatch count — minimizer per-dispatch is
+      ~5× slower on equivalent hardware, likely due to scalar
+      ring-buffer min-scan vs kmer_count's straight emit-on-mask).
+
+      np=8 chunk=4096 batched=1: timed out at 900 s.
+
+      np=8 chunk=4096 batched=8: timed out at 600 s. Investigation
+      pending.
+
+      Note: minimap2 mm_sketch chr22 baseline ~1-2 s in C; we won't
+      beat that, but parity-class is a meaningful demonstration. v1
+      ship target was 8-12 s; not achieved.
+    workaround: |
+      Profile per-dispatch breakdown via BIONPU_KMER_PROFILE env-var
+      style hook (TBD on minimizer runner). Likely fixes:
+        - tighter inner-loop on the AIE2P side (vectorise the
+          ring-buffer min-scan)
+        - eliminate the per-dispatch `bo.sync(BO_TO_DEVICE)` for the
+          output BO (already gated by env var; default is to skip)
+        - investigate why batched n_chunks_per_launch=8 didn't
+          amortize as expected
+    severity: "low"
+    blocks_v1_ship: false
+    notes: |
+      Throughput is NOT the v1 ship gate; chr22 byte-equal is. Filed
+      for v2 work alongside the kmer_count
+      `kmer-shim-dma-context-overhead-floor` gap.

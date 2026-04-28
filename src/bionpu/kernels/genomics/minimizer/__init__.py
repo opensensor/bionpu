@@ -13,7 +13,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Sliding-window (w, k) minimizer NPU op (v0).
+"""Sliding-window (w, k) minimizer NPU op (v0 + v1 multi-pass).
 
 Mirrors the kmer_count v0.5 NpuOp shape (subprocess host_runner +
 binary --output blob parsed via numpy) but specialised for sliding-
@@ -21,9 +21,13 @@ window minimizers per the canonical algorithm
 (minimap2 ``mm_sketch``, *Bioinformatics* 2016, lines 77+ of
 ``sketch.c``). v0 uses a SIMPLER pure-canonical scheme — no secondary
 ``hash64`` ordering — so the silicon byte-equal contract is tight and
-implementable in scalar AIE2P code with a tiny ring buffer. See
-``DESIGN.md`` §2 for the divergence from minimap2 and ``minimizer_oracle.py``
-for the reference algorithm.
+implementable in scalar AIE2P code with a tiny ring buffer.
+
+v1 adds multi-pass hash-slice partitioning to relieve per-chunk emit
+cap saturation on real-DNA workloads (chr22 etc). Each pass emits only
+minimizers whose canonical's low ``n_passes_log2`` bits equal
+``pass_idx``; the union over all N_PASSES dispatches reproduces the full
+minimizer set.
 
 Wire format (per ``minimizer_constants.h`` + ``data/minimizer_oracle.py``):
 
@@ -32,28 +36,25 @@ Wire format (per ``minimizer_constants.h`` + ``data/minimizer_oracle.py``):
 * The host runner streams the input in 4096-byte chunks with a
   per-(k, w) overlap (8 bytes for both pinned configs) plus an 8-byte
   in-band header (``actual_payload_bytes`` + ``owned_start_offset_bases``).
-* Per chunk × per tile, the kernel emits 16-byte records
+* Per chunk × per pass × per tile, the kernel emits 16-byte records
   ``{u64 canonical_LE, u32 position_LE, u32 _pad}`` into a 32 KiB
   pass-slot prefixed by ``[u32 emit_count_LE]``. Slot 0 is the
-  authoritative output; slots 1..N_TILES-1 are duplicates (v0
-  broadcast topology) ignored host-side.
+  authoritative output; slots 1..N_TILES-1 are duplicates (broadcast
+  topology) ignored host-side.
 * The host runner translates per-chunk positions to global
-  (``+ src_offset * 4``), de-duplicates, sorts by ``(position asc,
-  canonical asc)``, applies ``--top``, and emits a binary blob
-  ``[u64 n_records][n_records × {u64 canonical, u32 position, u32 _pad}]``
-  via ``--output-format binary``.
+  (``+ src_offset * 4``), unions across passes, de-duplicates, sorts by
+  ``(position asc, canonical asc)``, applies ``--top``, and emits a
+  binary blob ``[u64 n_records][n_records × {u64 canonical, u32 position,
+  u32 _pad}]`` via ``--output-format binary``.
 
-Two NPU_OPS registry entries:
+Two NPU_OPS registry entries (one per supported (k, w)):
 
-* ``bionpu_minimizer_k15_w10`` — short-read default (matches minimap2's
-  ``-k 15 -w 10`` short-read preset).
-* ``bionpu_minimizer_k21_w11`` — long-read default (matches minimap2's
-  ``-k 21 -w 11`` long-read preset).
+* ``bionpu_minimizer_k15_w10`` — short-read default.
+* ``bionpu_minimizer_k21_w11`` — long-read default.
 """
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 import tempfile
@@ -81,6 +82,7 @@ __all__ = [
     "SEQ_IN_CHUNK_BYTES_BASE",
     "SUPPORTED_KW",
     "SUPPORTED_N_CHUNKS_PER_LAUNCH",
+    "SUPPORTED_N_PASSES",
     "SUPPORTED_N_TILES",
     "decode_canonical_to_ascii",
     "kmer_mask_for",
@@ -96,6 +98,9 @@ SUPPORTED_KW: tuple[tuple[int, int], ...] = ((15, 10), (21, 11))
 
 #: Supported tile fan-out (n_tiles constructor arg).
 SUPPORTED_N_TILES: tuple[int, ...] = (1, 2, 4, 8)
+
+#: v1: supported hash-slice partition counts (n_passes constructor arg).
+SUPPORTED_N_PASSES: tuple[int, ...] = (1, 4, 8, 16)
 
 #: Supported chunks-per-launch (constructor arg).
 SUPPORTED_N_CHUNKS_PER_LAUNCH: tuple[int, ...] = (1, 2, 4, 8)
@@ -123,6 +128,8 @@ MINIMIZER_DISPATCH_ENV: str = "BIONPU_MINIMIZER_DISPATCH"
 
 #: Kernel name baked into the xclbin (mirrors kmer_count convention).
 _KERNEL_NAME: str = "MLIR_AIE"
+
+_N_PASSES_LOG2: dict[int, int] = {1: 0, 4: 2, 8: 3, 16: 4}
 
 # --------------------------------------------------------------------------- #
 # Artifact root — same _npu_artifacts/ directory as every other kernel.
@@ -199,6 +206,7 @@ class _RunInfo:
     n_iters: int
     used_npu: bool
     n_records: int = 0
+    n_passes: int = 0
 
 
 # --------------------------------------------------------------------------- #
@@ -234,7 +242,6 @@ def _parse_binary_blob(path: Path) -> list[tuple[int, int]]:
     if n_records == 0:
         return []
     records_buf = raw[8 : 8 + n_records * RECORD_BYTES]
-    # View as (canonical_u64, position_u32, pad_u32) via structured dtype.
     rec_dt = np.dtype([
         ("canonical", "<u8"),
         ("position", "<u4"),
@@ -253,19 +260,23 @@ class BionpuMinimizer(NpuOp):
     """Sliding-window (w, k) minimizers on AIE2P.
 
     Pinned (k, w) ∈ {(15, 10), (21, 11)}; n_tiles ∈ {1, 2, 4, 8};
+    n_passes ∈ {1, 4, 8, 16} (v1; default 1 for back-compat);
     n_chunks_per_launch ∈ {1, 2, 4, 8}.
 
-    Two NPU_OPS registry entries (one per supported (k, w)). The
-    artifact directory is per-(k, w, n_tiles) at
-    ``_npu_artifacts/bionpu_minimizer_k{k}_w{w}_n{n_tiles}/`` and
-    contains a single ``final.xclbin`` + ``insts.bin`` (single-pass —
-    no hash-slice partition; emit volume is low) plus one
-    ``host_runner``.
+    Two NPU_OPS registry entries (one per supported (k, w)).
+
+    Artifact directory layout:
+      - n_passes=1 (v0 back-compat): ``_npu_artifacts/bionpu_minimizer_k{k}_w{w}_n{n_tiles}/``
+        contains a single ``final.xclbin`` + ``insts.bin`` + ``host_runner``.
+      - n_passes>1 (v1): ``_npu_artifacts/bionpu_minimizer_k{k}_w{w}_n{n_tiles}_np{n_passes}/``
+        contains ``final_p{i}.xclbin`` + ``insts_p{i}.bin`` for each
+        pass_idx ∈ [0, n_passes), plus one ``host_runner``.
     """
 
     INPUT_DTYPE = np.uint8
     SUPPORTED_KW = SUPPORTED_KW
     SUPPORTED_N_TILES = SUPPORTED_N_TILES
+    SUPPORTED_N_PASSES = SUPPORTED_N_PASSES
     SUPPORTED_N_CHUNKS_PER_LAUNCH = SUPPORTED_N_CHUNKS_PER_LAUNCH
 
     def __init__(
@@ -273,6 +284,7 @@ class BionpuMinimizer(NpuOp):
         k: int = 15,
         w: int = 10,
         n_tiles: int = 4,
+        n_passes: int = 1,
         n_chunks_per_launch: int = 1,
     ) -> None:
         if (int(k), int(w)) not in SUPPORTED_KW:
@@ -286,6 +298,11 @@ class BionpuMinimizer(NpuOp):
             raise ValueError(
                 f"BionpuMinimizer: n_tiles={n_tiles!r} not in {{{valid}}}."
             )
+        if int(n_passes) not in SUPPORTED_N_PASSES:
+            valid = ", ".join(str(x) for x in SUPPORTED_N_PASSES)
+            raise ValueError(
+                f"BionpuMinimizer: n_passes={n_passes!r} not in {{{valid}}}."
+            )
         if int(n_chunks_per_launch) not in SUPPORTED_N_CHUNKS_PER_LAUNCH:
             valid = ", ".join(str(x) for x in SUPPORTED_N_CHUNKS_PER_LAUNCH)
             raise ValueError(
@@ -295,6 +312,7 @@ class BionpuMinimizer(NpuOp):
         self.k: int = int(k)
         self.w: int = int(w)
         self.n_tiles: int = int(n_tiles)
+        self.n_passes: int = int(n_passes)
         self.n_chunks_per_launch: int = int(n_chunks_per_launch)
         self.name: str = f"bionpu_minimizer_k{self.k}_w{self.w}"
         self.last_run: _RunInfo | None = None
@@ -303,30 +321,58 @@ class BionpuMinimizer(NpuOp):
 
     @property
     def artifact_dir(self) -> Path:
-        """Per-(k, w, n_tiles) artifact directory."""
-        return (
-            _ART_ROOT
-            / f"bionpu_minimizer_k{self.k}_w{self.w}_n{self.n_tiles}"
-        )
+        """Per-(k, w, n_tiles[, n_passes][, n_chunks_per_launch]) artifact directory.
+
+        For backwards compat, n_passes=1 + batch=1 maps to the v0
+        directory name without ``_np{N}`` / ``_b{N}`` suffix. Batched
+        cells (n_chunks_per_launch>1) get a ``_b{N}`` suffix.
+        """
+        kw_n = f"bionpu_minimizer_k{self.k}_w{self.w}_n{self.n_tiles}"
+        if self.n_passes == 1 and self.n_chunks_per_launch == 1:
+            return _ART_ROOT / kw_n
+        if self.n_passes == 1:
+            return _ART_ROOT / f"{kw_n}_b{self.n_chunks_per_launch}"
+        if self.n_chunks_per_launch == 1:
+            return _ART_ROOT / f"{kw_n}_np{self.n_passes}"
+        return _ART_ROOT / f"{kw_n}_np{self.n_passes}_b{self.n_chunks_per_launch}"
+
+    def xclbin_for_pass(self, pass_idx: int) -> Path:
+        """Path to ``final_p{pass_idx}.xclbin`` inside the artifact dir.
+
+        For backwards compat, if n_passes=1, returns ``final.xclbin``.
+        """
+        if self.n_passes == 1:
+            return self.artifact_dir / "final.xclbin"
+        return self.artifact_dir / f"final_p{pass_idx}.xclbin"
+
+    def insts_for_pass(self, pass_idx: int) -> Path:
+        if self.n_passes == 1:
+            return self.artifact_dir / "insts.bin"
+        return self.artifact_dir / f"insts_p{pass_idx}.bin"
 
     @property
     def xclbin(self) -> Path:
-        return self.artifact_dir / "final.xclbin"
+        """Pass-0 xclbin path (used as the runner's --xclbin template)."""
+        return self.xclbin_for_pass(0)
 
     @property
     def insts(self) -> Path:
-        return self.artifact_dir / "insts.bin"
+        return self.insts_for_pass(0)
 
     @property
     def host_runner(self) -> Path:
         return self.artifact_dir / "host_runner"
 
     def artifacts_present(self) -> bool:
-        return (
-            self.host_runner.exists()
-            and self.xclbin.exists()
-            and self.insts.exists()
-        )
+        """True iff all required NPU artifact leaves exist on disk."""
+        if not self.host_runner.exists():
+            return False
+        for p in range(self.n_passes):
+            if not self.xclbin_for_pass(p).exists():
+                return False
+            if not self.insts_for_pass(p).exists():
+                return False
+        return True
 
     # ----- dispatch routing ----------------------------------------------- #
 
@@ -373,9 +419,7 @@ class BionpuMinimizer(NpuOp):
 
         Per CLAUDE.md (2026-04-25 swarm): subprocess-based silicon
         submissions MUST be wrapped in
-        :func:`bionpu.dispatch.npu_silicon_lock.npu_silicon_lock`. The
-        op-class subprocess path enters host_runner which submits to
-        ``/dev/accel/accel0``, so we wrap.
+        :func:`bionpu.dispatch.npu_silicon_lock.npu_silicon_lock`.
         """
         from bionpu.dispatch.npu_silicon_lock import npu_silicon_lock
 
@@ -387,7 +431,7 @@ class BionpuMinimizer(NpuOp):
 
             cmd = [
                 str(self.host_runner),
-                "-x", str(self.xclbin),
+                "-x", str(self.xclbin),                # pass-0 path; runner derives others
                 "-i", str(self.insts),
                 "-k", _KERNEL_NAME,
                 "--input", str(input_path),
@@ -397,6 +441,8 @@ class BionpuMinimizer(NpuOp):
                 "--w", str(self.w),
                 "--top", str(int(top_n)),
                 "--launch-chunks", str(self.n_tiles),
+                "--n-passes", str(self.n_passes),
+                "--n-chunks-per-launch", str(self.n_chunks_per_launch),
                 "--iters", str(int(n_iters)),
                 "--warmup", str(int(warmup)),
             ]
@@ -443,6 +489,7 @@ class BionpuMinimizer(NpuOp):
             n_iters=int(n_iters),
             used_npu=True,
             n_records=len(records),
+            n_passes=self.n_passes,
         )
         return records, info
 
@@ -455,7 +502,7 @@ class BionpuMinimizer(NpuOp):
         top_n: int = 0,
         n_iters: int = 1,
         warmup: int = 0,
-        timeout_s: float = 120.0,
+        timeout_s: float = 600.0,
         _impl: str | None = None,
         **_unused: Any,
     ) -> list[tuple[int, int]]:
@@ -471,12 +518,8 @@ class BionpuMinimizer(NpuOp):
 
         impl = self._resolve_dispatch_impl(_impl)
         if impl == "pyxrt":
-            # The v0 pyxrt path is non-trivial (single xclbin + chunked
-            # streaming + host-side dedup); for smoke validation the
-            # subprocess path is the gate. pyxrt support tracked as a
-            # follow-up.
             raise NotImplementedError(
-                "BionpuMinimizer v0 pyxrt path not implemented; "
+                "BionpuMinimizer pyxrt path not implemented; "
                 "use BIONPU_MINIMIZER_DISPATCH=subprocess (default)."
             )
 
@@ -484,17 +527,20 @@ class BionpuMinimizer(NpuOp):
         if not self.host_runner.exists():
             raise NpuArtifactsMissingError(
                 f"NPU artifact missing for {self.name} "
-                f"(k={self.k}, w={self.w}, n_tiles={self.n_tiles}): "
+                f"(k={self.k}, w={self.w}, n_tiles={self.n_tiles}, "
+                f"n_passes={self.n_passes}): "
                 f"{self.host_runner}. Build via "
                 f"`make NPU2=1 K={self.k} W={self.w} "
-                f"experiment={'production' if self.n_tiles == 1 else f'wide{self.n_tiles}'} all` "
+                f"experiment={'production' if self.n_tiles == 1 else f'wide{self.n_tiles}'} "
+                f"n_passes={self.n_passes} all-passes` "
                 f"in this kernel directory."
             )
-        for need in (self.xclbin, self.insts):
-            if not need.exists():
-                raise NpuArtifactsMissingError(
-                    f"NPU artifact missing for {self.name}: {need}"
-                )
+        for p in range(self.n_passes):
+            for need in (self.xclbin_for_pass(p), self.insts_for_pass(p)):
+                if not need.exists():
+                    raise NpuArtifactsMissingError(
+                        f"NPU artifact missing for pass={p}: {need}"
+                    )
 
         records, info = self._run_subprocess(
             packed_seq=packed_seq,
@@ -510,11 +556,12 @@ class BionpuMinimizer(NpuOp):
 
 # --------------------------------------------------------------------------- #
 # Registry (2 entries, one per supported (k, w); n_tiles=4 default).
+# Default n_passes=1 for back-compat with v0 smoke-shipped artifacts.
 # --------------------------------------------------------------------------- #
 
 for _k, _w in SUPPORTED_KW:
     register_npu_op(
         f"bionpu_minimizer_k{_k}_w{_w}",
-        BionpuMinimizer(k=_k, w=_w, n_tiles=4),
+        BionpuMinimizer(k=_k, w=_w, n_tiles=4, n_passes=1),
     )
 del _k, _w

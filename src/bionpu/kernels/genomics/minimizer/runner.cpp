@@ -5,7 +5,22 @@
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, version 3.
 //
-// runner.cpp — Host runner for the v0 minimizer kernel.
+// runner.cpp — Host runner for the (w, k) minimizer kernel.
+//
+// v1 host-side dataflow:
+//   1. Load N_PASSES xclbins (one per pass_idx; xclbin/insts paths are
+//      derived from --xclbin / --instr templates by appending _p{idx}).
+//   2. Plan input chunks (4096 + per-(k,w) overlap, chunk-aligned).
+//   3. v1.2 (b) batched dispatch: each silicon dispatch processes
+//      n_chunks_per_launch chunks (BO sized accordingly). Tail batch
+//      is padded with zero-actual-bytes chunks.
+//   4. v1.3 depth-4 ring of (seq_in, sparse_out) BOs to enable
+//      pipelined dispatch. While silicon is computing dispatch i, host
+//      accumulates dispatch i-1's output and stages dispatch i+1.
+//   5. Parse tile_0's slot per chunk per pass; translate positions to
+//      global; append to merged record list.
+//   6. After all chunks × all passes, parallel-sort by (position asc,
+//      canonical asc), de-duplicate, apply --top, emit binary blob.
 //
 // Wire format (per minimizer_constants.h):
 //   - Input: packed-2-bit DNA, MSB-first.
@@ -22,9 +37,6 @@
 //       [4 .. 4+16*emit_count]: emit_count × { uint64 canonical_LE,
 //                                              uint32 position_LE,
 //                                              uint32 _pad }
-//     Position is the chunk-local 0-indexed start offset (in bases).
-//     The runner translates to a global offset by adding chunk's
-//     ``src_offset * 4`` (src_offset is in bytes; ×4 for bases).
 //
 // Output formats:
 //   - tsv (default): "<position>\t<canonical_acgt>\n" per record.
@@ -54,7 +66,7 @@
 
 namespace {
 
-constexpr int32_t SEQ_IN_CHUNK_BYTES_BASE = 4096;
+constexpr int32_t SEQ_IN_CHUNK_BYTES_BASE = 4096;  // v0/v1 unchanged
 constexpr int32_t MZ_OVERLAP_K15_W10 = 8;
 constexpr int32_t MZ_OVERLAP_K21_W11 = 8;
 constexpr int32_t PARTIAL_OUT_BYTES_PADDED = 32768;
@@ -141,8 +153,11 @@ struct MinimizerRecord {
 };
 
 struct Args {
-    std::string xclbin_path;
-    std::string instr_path;
+    // Comma-separated list of xclbin paths NOT used; instead, --xclbin
+    // points at the pass-0 artifact and the runner derives _p<i> paths
+    // for additional passes (mirrors kmer_count).
+    std::string xclbin_template;
+    std::string instr_template;
     std::string kernel = "MLIR_AIE";
     std::string input_path;
     std::string output_path;
@@ -151,6 +166,8 @@ struct Args {
     int w = 10;
     int top = 0;            // 0 = all
     int launch_chunks = 4;
+    int n_passes = 1;
+    int n_chunks_per_launch = 1;
     int iters = 1;
     int warmup = 0;
 };
@@ -160,8 +177,12 @@ void print_usage(std::ostream &os) {
 "Usage: minimizer_runner [options]\n"
 "\n"
 "Required:\n"
-"  -x, --xclbin <path>         xclbin file (final.xclbin)\n"
-"  -i, --instr <path>          NPU instructions binary (insts.bin)\n"
+"  -x, --xclbin <path>         xclbin file (final.xclbin OR final_p0.xclbin)\n"
+"                              When --n-passes>1, the runner derives pass-i\n"
+"                              xclbin by replacing the final '_p0' token\n"
+"                              with '_p<i>' (mirrors kmer_count convention).\n"
+"  -i, --instr <path>          NPU instructions binary (insts*.bin) — same\n"
+"                              _p<i> substitution as --xclbin.\n"
 "  --input <packed_2bit>       packed-2-bit input (.2bit.bin)\n"
 "  --output <path>             output file (TSV or binary)\n"
 "  --k {15,21}                 minimizer k\n"
@@ -170,6 +191,12 @@ void print_usage(std::ostream &os) {
 "Optional:\n"
 "  -k, --kernel <name>         kernel name (default MLIR_AIE)\n"
 "  --launch-chunks {1,2,4,8}   tile fan-out (default 4)\n"
+"  --n-passes {1,4,8,16}       hash-slice partition count (default 1)\n"
+"  --n-chunks-per-launch {1,2,4,8}\n"
+"                              chunks processed per silicon dispatch\n"
+"                              (default 1; v1.2 (b) batched-dispatch knob.\n"
+"                              MUST match the value baked into the xclbin\n"
+"                              by IRON Python at build time).\n"
 "  --top <N>                   top-N records by position (default 0=all)\n"
 "  --iters <N>                 timed iterations (default 1)\n"
 "  --warmup <N>                untimed warmup iters (default 0)\n"
@@ -192,8 +219,8 @@ Args parse(int argc, char **argv) {
                 throw std::runtime_error("missing value for " + key);
             return argv[++i];
         };
-        if (key == "-x" || key == "--xclbin") a.xclbin_path = next();
-        else if (key == "-i" || key == "--instr") a.instr_path = next();
+        if (key == "-x" || key == "--xclbin") a.xclbin_template = next();
+        else if (key == "-i" || key == "--instr") a.instr_template = next();
         else if (key == "-k" || key == "--kernel") a.kernel = next();
         else if (key == "--input") a.input_path = next();
         else if (key == "--output") a.output_path = next();
@@ -201,12 +228,14 @@ Args parse(int argc, char **argv) {
         else if (key == "--w") a.w = std::stoi(next());
         else if (key == "--top") a.top = std::stoi(next());
         else if (key == "--launch-chunks") a.launch_chunks = std::stoi(next());
+        else if (key == "--n-passes") a.n_passes = std::stoi(next());
+        else if (key == "--n-chunks-per-launch") a.n_chunks_per_launch = std::stoi(next());
         else if (key == "--iters") a.iters = std::stoi(next());
         else if (key == "--warmup") a.warmup = std::stoi(next());
         else if (key == "--output-format") a.output_format = next();
         else throw std::runtime_error("unknown arg: " + key);
     }
-    if (a.xclbin_path.empty() || a.instr_path.empty() ||
+    if (a.xclbin_template.empty() || a.instr_template.empty() ||
         a.input_path.empty() || a.output_path.empty())
         throw std::runtime_error(
             "required: -x <xclbin> -i <instr> --input <path> "
@@ -217,6 +246,13 @@ Args parse(int argc, char **argv) {
     if (a.launch_chunks != 1 && a.launch_chunks != 2 &&
         a.launch_chunks != 4 && a.launch_chunks != 8)
         throw std::runtime_error("--launch-chunks must be one of {1,2,4,8}");
+    if (a.n_passes != 1 && a.n_passes != 4 &&
+        a.n_passes != 8 && a.n_passes != 16)
+        throw std::runtime_error("--n-passes must be one of {1, 4, 8, 16}");
+    if (a.n_chunks_per_launch != 1 && a.n_chunks_per_launch != 2 &&
+        a.n_chunks_per_launch != 4 && a.n_chunks_per_launch != 8)
+        throw std::runtime_error(
+            "--n-chunks-per-launch must be one of {1, 2, 4, 8}");
     if (a.iters <= 0) throw std::runtime_error("--iters must be > 0");
     if (a.warmup < 0) throw std::runtime_error("--warmup must be >= 0");
     if (a.top < 0) throw std::runtime_error("--top must be >= 0");
@@ -224,6 +260,36 @@ Args parse(int argc, char **argv) {
         throw std::runtime_error(
             "--output-format must be one of {tsv, binary}");
     return a;
+}
+
+// ---------------------------------------------------------------------
+// Per-pass artifact path resolver. Convention: --xclbin and --instr
+// point to either:
+//   - pass-0 artifacts (filename contains '_p0') — runner derives
+//     _p<i> paths for additional passes.
+//   - single-pass artifacts (filename WITHOUT '_p0') — only valid for
+//     --n-passes 1; passed through unchanged.
+// ---------------------------------------------------------------------
+std::string resolve_pass_path(const std::string &template_path,
+                              int pass_idx, int n_passes) {
+    if (n_passes == 1) {
+        return template_path;  // single pass; use template path as-is
+    }
+    std::string out = template_path;
+    std::string from = "_p0";
+    std::string to = "_p" + std::to_string(pass_idx);
+    auto pos = out.rfind(from);
+    if (pos != std::string::npos) {
+        out.replace(pos, from.size(), to);
+        return out;
+    }
+    auto dot = template_path.rfind('.');
+    if (dot != std::string::npos) {
+        out = template_path.substr(0, dot) + "_p" + std::to_string(pass_idx) +
+              template_path.substr(dot);
+        return out;
+    }
+    return template_path + "_p" + std::to_string(pass_idx);
 }
 
 struct ChunkPlan {
@@ -251,16 +317,17 @@ std::vector<ChunkPlan> plan_chunks(size_t input_bytes, int overlap_bytes) {
     return plan;
 }
 
-// Parse one chunk's tile_0 slot from the joined BO; append global-
-// position records to `out`. `chunk_global_base_bases` is the
-// chunk's first-base global offset (in bases).
-void parse_chunk_tile0(const uint8_t *blob, size_t blob_size,
+// Parse one tile_0 slot into the records vector. The slot is at the
+// start of the per-chunk-per-batch joined output blob; slots 1..N_TILES-1
+// are duplicates (broadcast topology) and ignored.
+//
+// `chunk_global_base_bases` is the CHUNK's first-base global offset (in
+// bases). Records' `position` is chunk-local; we add this to translate
+// to global.
+void parse_chunk_tile0(const uint8_t *blob,
                        size_t chunk_global_base_bases,
-                       int n_tiles,
                        std::vector<MinimizerRecord> &out,
                        uint32_t &max_emit_observed_io) {
-    (void)n_tiles;
-    if (blob_size < 4) return;
     uint32_t emit_count = 0;
     std::memcpy(&emit_count, blob, 4);
     if (emit_count > max_emit_observed_io) {
@@ -270,9 +337,6 @@ void parse_chunk_tile0(const uint8_t *blob, size_t blob_size,
         emit_count = static_cast<uint32_t>(MZ_MAX_EMIT_IDX);
     }
     const size_t payload_off = 4u;
-    const size_t need = static_cast<size_t>(emit_count) *
-                        static_cast<size_t>(MZ_RECORD_BYTES);
-    if (payload_off + need > blob_size) return;
     out.reserve(out.size() + emit_count);
     for (uint32_t e = 0; e < emit_count; ++e) {
         const uint8_t *rec = blob + payload_off +
@@ -312,6 +376,15 @@ void emit_binary_blob(const std::string &path,
     }
 }
 
+// Per-pass loaded artifacts.
+struct PassArtifacts {
+    xrt::xclbin xclbin;
+    xrt::hw_context context;
+    xrt::kernel kernel;
+    xrt::bo bo_instr;
+    std::vector<uint32_t> instr;
+};
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -328,7 +401,9 @@ int main(int argc, char **argv) {
     trace("k=" + std::to_string(args.k) +
           " w=" + std::to_string(args.w) +
           " overlap_bytes=" + std::to_string(overlap_bytes) +
-          " launch_chunks=" + std::to_string(args.launch_chunks));
+          " launch_chunks=" + std::to_string(args.launch_chunks) +
+          " n_passes=" + std::to_string(args.n_passes) +
+          " n_chunks_per_launch=" + std::to_string(args.n_chunks_per_launch));
 
     auto input_buf = read_packed_input(args.input_path);
     trace("input bytes=" + std::to_string(input_buf.size()));
@@ -339,37 +414,77 @@ int main(int argc, char **argv) {
 
     const size_t seq_in_slot_bytes =
         static_cast<size_t>(SEQ_IN_CHUNK_BYTES_BASE + overlap_bytes);
-    const size_t per_dispatch_seq_in_bytes = seq_in_slot_bytes;
-    const size_t per_dispatch_out_bytes =
+
+    // Per-batch BO sizes: each silicon dispatch processes
+    // n_chunks_per_launch chunks. seq_in BO = N_BATCH × slot bytes;
+    // partial_out BO = N_BATCH × (N_TILES × 32 KiB).
+    const int n_batch = args.n_chunks_per_launch;
+    const size_t per_batch_seq_in_bytes =
+        static_cast<size_t>(n_batch) * seq_in_slot_bytes;
+    const size_t per_pass_out_bytes =
+        static_cast<size_t>(n_batch) *
         static_cast<size_t>(args.launch_chunks) *
         static_cast<size_t>(PARTIAL_OUT_BYTES_PADDED);
 
+    const size_t n_batches =
+        (n_chunks_host + static_cast<size_t>(n_batch) - 1u) /
+        static_cast<size_t>(n_batch);
+    trace("planned batches=" + std::to_string(n_batches));
+
+    // ------------------------------------------------------------
+    // XRT setup — load N_PASSES xclbins.
+    // ------------------------------------------------------------
     trace("xrt device open");
     unsigned int device_index = 0;
     auto device = xrt::device(device_index);
 
-    auto xclbin = xrt::xclbin(args.xclbin_path);
-    device.register_xclbin(xclbin);
-    auto context = xrt::hw_context(device, xclbin.get_uuid());
-    auto kernel = xrt::kernel(context, args.kernel);
-    auto instr = read_instr_binary(args.instr_path);
+    std::vector<PassArtifacts> per_pass(static_cast<size_t>(args.n_passes));
+    for (int p = 0; p < args.n_passes; ++p) {
+        std::string xclbin_path =
+            resolve_pass_path(args.xclbin_template, p, args.n_passes);
+        std::string instr_path =
+            resolve_pass_path(args.instr_template, p, args.n_passes);
+        trace("pass=" + std::to_string(p) +
+              " xclbin=" + xclbin_path +
+              " instr=" + instr_path);
 
-    auto bo_instr = xrt::bo(
-        device, instr.size() * sizeof(uint32_t),
-        XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
-    {
-        auto *p_instr = bo_instr.map<uint32_t *>();
-        std::memcpy(p_instr, instr.data(), instr.size() * sizeof(uint32_t));
-        bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        per_pass[p].xclbin = xrt::xclbin(xclbin_path);
+        device.register_xclbin(per_pass[p].xclbin);
+        per_pass[p].context = xrt::hw_context(
+            device, per_pass[p].xclbin.get_uuid());
+        per_pass[p].kernel = xrt::kernel(per_pass[p].context, args.kernel);
+        per_pass[p].instr = read_instr_binary(instr_path);
+
+        per_pass[p].bo_instr = xrt::bo(
+            device, per_pass[p].instr.size() * sizeof(uint32_t),
+            XCL_BO_FLAGS_CACHEABLE, per_pass[p].kernel.group_id(1));
+        auto *p_instr = per_pass[p].bo_instr.map<uint32_t *>();
+        std::memcpy(p_instr, per_pass[p].instr.data(),
+                    per_pass[p].instr.size() * sizeof(uint32_t));
+        per_pass[p].bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     }
 
-    auto bo_seq_in = xrt::bo(device, per_dispatch_seq_in_bytes,
-                             XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
-    auto bo_sparse_out = xrt::bo(device, per_dispatch_out_bytes,
-                                 XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
-    auto *p_seq_in = bo_seq_in.map<uint8_t *>();
-    auto *p_sparse_out = bo_sparse_out.map<uint8_t *>();
+    // v1.3 ring-of-BOs for pipelined dispatch (mirrors kmer_count v1.3).
+    // RING=4 gives XRT 3-deep submit-ahead while host accumulates.
+    // seq_in is staged once per BATCH (re-used across all n_passes
+    // dispatches of that batch); ping-pongs at batch granularity.
+    // sparse_out ping-pongs PER DISPATCH.
+    const auto &k0 = per_pass[0].kernel;
+    constexpr int RING = 4;
+    xrt::bo bo_seq_in_ring[RING];
+    xrt::bo bo_sparse_out_ring[RING];
+    uint8_t *p_seq_in_ring[RING];
+    uint8_t *p_sparse_out_ring[RING];
+    for (int s = 0; s < RING; ++s) {
+        bo_seq_in_ring[s] = xrt::bo(device, per_batch_seq_in_bytes,
+                                    XRT_BO_FLAGS_HOST_ONLY, k0.group_id(3));
+        bo_sparse_out_ring[s] = xrt::bo(device, per_pass_out_bytes,
+                                        XRT_BO_FLAGS_HOST_ONLY, k0.group_id(4));
+        p_seq_in_ring[s] = bo_seq_in_ring[s].map<uint8_t *>();
+        p_sparse_out_ring[s] = bo_sparse_out_ring[s].map<uint8_t *>();
+    }
 
+    // Host-side accumulator.
     std::vector<MinimizerRecord> all_records;
     all_records.reserve(64 * 1024);
 
@@ -380,6 +495,43 @@ int main(int argc, char **argv) {
     int timed_dispatches = 0;
     uint32_t max_emit_observed = 0;
 
+    struct InflightSlot {
+        xrt::run run;
+        int seq_slot;
+        int out_slot;
+        size_t batch_idx;
+        int pass_idx;
+        int dispatch_idx;
+        bool valid;
+        std::chrono::high_resolution_clock::time_point t_dispatch;
+    };
+
+    // Accumulate one drained dispatch's blob into all_records.
+    auto accumulate = [&](const uint8_t *blob, size_t batch_idx,
+                          bool keep) {
+        if (!keep) return;
+        // Per-iteration block layout: N_BATCH × (N_TILES × PARTIAL_PADDED).
+        const size_t per_chunk_block_bytes =
+            static_cast<size_t>(args.launch_chunks) *
+            static_cast<size_t>(PARTIAL_OUT_BYTES_PADDED);
+        for (int slot = 0; slot < n_batch; ++slot) {
+            const size_t ci = batch_idx * static_cast<size_t>(n_batch) +
+                              static_cast<size_t>(slot);
+            if (ci >= n_chunks_host) break;  // tail-padded slot; skip
+            const ChunkPlan &c = chunks[ci];
+            // Tile 0 slot is the first PARTIAL_PADDED bytes of the
+            // chunk's per-tile-block. Slots 1..N_TILES-1 are duplicates
+            // and ignored.
+            const uint8_t *chunk_blob =
+                blob + static_cast<size_t>(slot) * per_chunk_block_bytes;
+            size_t chunk_global_base_bases = c.src_offset * 4u;
+            parse_chunk_tile0(chunk_blob,
+                              chunk_global_base_bases,
+                              all_records,
+                              max_emit_observed);
+        }
+    };
+
     const int total_iters = args.warmup + args.iters;
     for (int it = 0; it < total_iters; ++it) {
         const bool keep = (it >= args.warmup);
@@ -388,58 +540,171 @@ int main(int argc, char **argv) {
             max_emit_observed = 0;
         }
 
-        for (size_t ci = 0; ci < n_chunks_host; ++ci) {
-            const ChunkPlan &c = chunks[ci];
+        InflightSlot inflight[RING];
+        for (int s = 0; s < RING; ++s) inflight[s].valid = false;
 
-            // Stage chunk into seq_in BO.
-            std::memset(p_seq_in, 0, per_dispatch_seq_in_bytes);
-            uint32_t actual_bytes_le = static_cast<uint32_t>(c.bytes);
-            std::memcpy(p_seq_in, &actual_bytes_le, 4);
-            // owned_start_offset_bases:
-            //   chunk 0: 0 (full payload owned)
-            //   chunk i (i>0): overlap_bases - (k+w-2)
-            int32_t owned_start_offset_bases =
-                (ci == 0)
-                    ? 0
-                    : (overlap_bytes * 4) - (args.k + args.w - 2);
-            std::memcpy(p_seq_in + 4, &owned_start_offset_bases, 4);
-            std::memcpy(p_seq_in + HEADER_BYTES,
-                        input_buf.data() + c.src_offset, c.bytes);
-            bo_seq_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        size_t last_seq_batch[RING];
+        for (int s = 0; s < RING; ++s) {
+            last_seq_batch[s] = static_cast<size_t>(-1);
+        }
 
-            // Zero the output BO (defensive; v0 small fixture).
-            std::memset(p_sparse_out, 0, per_dispatch_out_bytes);
-            bo_sparse_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        // Linearise (batch, pass) into single dispatch index d.
+        const size_t total_dispatches =
+            n_batches * static_cast<size_t>(args.n_passes);
 
-            // Dispatch.
-            auto t0 = std::chrono::high_resolution_clock::now();
-            xrt::run run = kernel(
+        for (size_t d = 0; d < total_dispatches; ++d) {
+            const size_t bi = d / static_cast<size_t>(args.n_passes);
+            const int p = static_cast<int>(d % static_cast<size_t>(args.n_passes));
+            const int out_slot = static_cast<int>(d % static_cast<size_t>(RING));
+            const int seq_slot = static_cast<int>(bi % static_cast<size_t>(RING));
+
+            // (1) Drain ring slot we're about to overwrite.
+            if (inflight[out_slot].valid) {
+                inflight[out_slot].run.wait();
+                bo_sparse_out_ring[inflight[out_slot].out_slot].sync(
+                    XCL_BO_SYNC_BO_FROM_DEVICE);
+                auto t_drain1 = std::chrono::high_resolution_clock::now();
+
+                accumulate(
+                    p_sparse_out_ring[inflight[out_slot].out_slot],
+                    inflight[out_slot].batch_idx,
+                    keep);
+
+                if (keep) {
+                    auto td = std::chrono::duration_cast<
+                        std::chrono::microseconds>(
+                            t_drain1 - inflight[out_slot].t_dispatch).count();
+                    float us = static_cast<float>(td);
+                    total_us += us;
+                    if (us < min_us) min_us = us;
+                    if (us > max_us) max_us = us;
+                    timed_dispatches++;
+                }
+                inflight[out_slot].valid = false;
+            }
+
+            // (2) Stage seq_in for batch bi if not already staged.
+            if (last_seq_batch[seq_slot] != bi) {
+                // Drain any other in-flight dispatch reading from this
+                // seq_slot before we overwrite it.
+                for (int s = 0; s < RING; ++s) {
+                    if (inflight[s].valid && inflight[s].seq_slot == seq_slot) {
+                        inflight[s].run.wait();
+                        bo_sparse_out_ring[inflight[s].out_slot].sync(
+                            XCL_BO_SYNC_BO_FROM_DEVICE);
+                        accumulate(
+                            p_sparse_out_ring[inflight[s].out_slot],
+                            inflight[s].batch_idx,
+                            keep);
+                        if (keep) {
+                            auto td = std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                    std::chrono::high_resolution_clock::now() -
+                                    inflight[s].t_dispatch).count();
+                            float us = static_cast<float>(td);
+                            total_us += us;
+                            if (us < min_us) min_us = us;
+                            if (us > max_us) max_us = us;
+                            timed_dispatches++;
+                        }
+                        inflight[s].valid = false;
+                    }
+                }
+
+                const size_t batch_first_chunk =
+                    bi * static_cast<size_t>(n_batch);
+                uint8_t *p_seq_in = p_seq_in_ring[seq_slot];
+                std::memset(p_seq_in, 0, per_batch_seq_in_bytes);
+                for (int slot = 0; slot < n_batch; ++slot) {
+                    const size_t ci = batch_first_chunk +
+                                      static_cast<size_t>(slot);
+                    uint8_t *slot_base = p_seq_in +
+                                         static_cast<size_t>(slot) *
+                                             seq_in_slot_bytes;
+                    if (ci >= n_chunks_host) continue;  // tail-pad: zero
+                    const ChunkPlan &c = chunks[ci];
+                    uint32_t actual_bytes_le = static_cast<uint32_t>(c.bytes);
+                    std::memcpy(slot_base, &actual_bytes_le, 4);
+                    // owned_start_offset_bases for minimizers covers
+                    // (k + w - 1) prior bases (window seed). Formula:
+                    //   chunk 0: 0 (full payload owned)
+                    //   chunk i>0: overlap_bases - (k + w - 2)
+                    int32_t owned_start_offset_bases =
+                        (ci == 0)
+                            ? 0
+                            : (overlap_bytes * 4) - (args.k + args.w - 2);
+                    std::memcpy(slot_base + 4, &owned_start_offset_bases, 4);
+                    std::memcpy(slot_base + HEADER_BYTES,
+                                input_buf.data() + c.src_offset,
+                                c.bytes);
+                }
+                bo_seq_in_ring[seq_slot].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                last_seq_batch[seq_slot] = bi;
+            }
+
+            // (3) Skip the per-dispatch zero-output (kernel writes
+            //     emit_count prefix unconditionally; parser reads only
+            //     exactly emit_count records). Restore via
+            //     BIONPU_MZ_OUTPUT_ZERO=1 env if a regression suspected.
+            const bool output_zero_enabled =
+                (std::getenv("BIONPU_MZ_OUTPUT_ZERO") != nullptr) &&
+                std::string(std::getenv("BIONPU_MZ_OUTPUT_ZERO")) == "1";
+            if (output_zero_enabled) {
+                std::memset(p_sparse_out_ring[out_slot], 0, per_pass_out_bytes);
+                bo_sparse_out_ring[out_slot].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            }
+
+            // (4) Issue the kernel — non-blocking.
+            auto t_disp = std::chrono::high_resolution_clock::now();
+            xrt::run run = per_pass[p].kernel(
                 opcode,
-                bo_instr,
-                static_cast<unsigned>(instr.size()),
-                bo_seq_in,
-                bo_sparse_out,
-                static_cast<int>(per_dispatch_seq_in_bytes));
-            run.wait();
-            bo_sparse_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            auto t1 = std::chrono::high_resolution_clock::now();
+                per_pass[p].bo_instr,
+                static_cast<unsigned>(per_pass[p].instr.size()),
+                bo_seq_in_ring[seq_slot],
+                bo_sparse_out_ring[out_slot],
+                static_cast<int>(per_batch_seq_in_bytes));
 
-            if (keep) {
-                // Tile 0 slot starts at offset 0 of the joined output.
-                size_t chunk_global_base_bases = c.src_offset * 4u;
-                parse_chunk_tile0(p_sparse_out,
-                                  static_cast<size_t>(PARTIAL_OUT_BYTES_PADDED),
-                                  chunk_global_base_bases,
-                                  args.launch_chunks,
-                                  all_records,
-                                  max_emit_observed);
-                auto td = std::chrono::duration_cast<
-                    std::chrono::microseconds>(t1 - t0).count();
-                float us = static_cast<float>(td);
-                total_us += us;
-                if (us < min_us) min_us = us;
-                if (us > max_us) max_us = us;
-                timed_dispatches++;
+            inflight[out_slot].run = std::move(run);
+            inflight[out_slot].seq_slot = seq_slot;
+            inflight[out_slot].out_slot = out_slot;
+            inflight[out_slot].batch_idx = bi;
+            inflight[out_slot].pass_idx = p;
+            inflight[out_slot].dispatch_idx = static_cast<int>(d);
+            inflight[out_slot].valid = true;
+            inflight[out_slot].t_dispatch = t_disp;
+        }
+
+        // (5) Drain remaining in-flight slots in dispatch-issue order.
+        {
+            std::vector<int> drain_order;
+            for (int s = 0; s < RING; ++s) {
+                if (inflight[s].valid) drain_order.push_back(s);
+            }
+            std::sort(drain_order.begin(), drain_order.end(),
+                      [&](int a, int b) {
+                          return inflight[a].dispatch_idx <
+                                 inflight[b].dispatch_idx;
+                      });
+            for (int s : drain_order) {
+                inflight[s].run.wait();
+                bo_sparse_out_ring[inflight[s].out_slot].sync(
+                    XCL_BO_SYNC_BO_FROM_DEVICE);
+                auto t_drain1 = std::chrono::high_resolution_clock::now();
+                accumulate(
+                    p_sparse_out_ring[inflight[s].out_slot],
+                    inflight[s].batch_idx,
+                    keep);
+                if (keep) {
+                    auto td = std::chrono::duration_cast<
+                        std::chrono::microseconds>(
+                            t_drain1 - inflight[s].t_dispatch).count();
+                    float us = static_cast<float>(td);
+                    total_us += us;
+                    if (us < min_us) min_us = us;
+                    if (us > max_us) max_us = us;
+                    timed_dispatches++;
+                }
+                inflight[s].valid = false;
             }
         }
     }
@@ -449,13 +714,14 @@ int main(int argc, char **argv) {
               std::to_string(max_emit_observed) +
               " hit cap MZ_MAX_EMIT_IDX=" +
               std::to_string(MZ_MAX_EMIT_IDX) +
-              " — kernel dropped emits; use smaller chunks.");
+              " — kernel dropped emits; increase --n-passes or use smaller chunks.");
     }
     trace("total minimizer records=" + std::to_string(all_records.size()));
 
-    // De-duplicate adjacent records that may straddle chunk boundaries
-    // (the owned-range gate should prevent these but we belt-and-brace).
-    // Sort by position; equal-position equal-canonical records collapse.
+    // Sort by (position asc, canonical asc); de-duplicate adjacent
+    // records (defensive — owned-range gate should already prevent
+    // overlap dupes; multi-pass is partition-disjoint by design).
+    auto t_sort0 = std::chrono::high_resolution_clock::now();
     std::sort(std::execution::par_unseq,
               all_records.begin(), all_records.end(),
               [](const MinimizerRecord &a, const MinimizerRecord &b) {
@@ -471,7 +737,11 @@ int main(int argc, char **argv) {
             });
         all_records.erase(last, all_records.end());
     }
-    trace("unique minimizer records=" + std::to_string(all_records.size()));
+    auto t_sort1 = std::chrono::high_resolution_clock::now();
+    auto sort_us = std::chrono::duration_cast<
+        std::chrono::microseconds>(t_sort1 - t_sort0).count();
+    trace("unique minimizer records=" + std::to_string(all_records.size()) +
+          " sort+dedup wall=" + std::to_string(sort_us) + "us");
 
     if (args.top > 0 && static_cast<size_t>(args.top) < all_records.size()) {
         all_records.resize(static_cast<size_t>(args.top));

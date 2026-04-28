@@ -1,12 +1,18 @@
 ##===- Makefile -----------------------------------------------------------===##
-# Build the AIE2P xclbin for the bionpu (w, k) minimizer kernel (v0).
+# Build the AIE2P xclbin for the bionpu (w, k) minimizer kernel.
 #
-# v0 BUILD-TIME parameter list:
+# v1 BUILD-TIME parameter list:
 #   K, W       — pinned (k=15, w=10) or (k=21, w=11)
 #   experiment ∈ {production, wide2, wide4, wide8} → n_tiles ∈ {1, 2, 4, 8}
+#   n_passes   ∈ {1, 4, 8, 16}     — hash-slice partition count
+#   pass_idx   ∈ {0..n_passes-1}   — which slice this xclbin handles
+#   n_chunks_per_launch ∈ {1, 2, 4, 8} — batched dispatch knob
 #   seq        — fixture length tag (artifact suffix only)
 #
-# v0 produces ONE xclbin/insts pair per (k, w, n_tiles) cell — single pass.
+# v1 produces N_PASSES xclbin/insts pairs per (k, w, n_tiles, n_passes)
+# install. The single-xclbin target builds ONE specific (pass_idx)
+# xclbin; the `all-passes` target loops pass_idx ∈ [0, n_passes).
+#
 # Build invocations (from this directory):
 #
 #   source /opt/xilinx/xrt/setup.sh
@@ -14,8 +20,11 @@
 #   export MLIR_AIE_DIR=/home/matteius/genetics/third_party/mlir-aie
 #   export PEANO_INSTALL_DIR=/home/matteius/xdna-bringup/ironenv/lib/python3.14/site-packages/llvm-aie
 #
+#   # v0 back-compat single-pass build:
 #   make NPU2=1 K=15 W=10 experiment=wide4 seq=10000 all
-#   make NPU2=1 K=21 W=11 experiment=wide4 seq=10000 all
+#
+#   # v1 multi-pass (4 xclbins + 1 host_runner):
+#   make NPU2=1 K=15 W=10 experiment=wide4 n_passes=4 seq=10000 all-passes
 #
 # `NPU2=1` is required (AIE2P).
 #
@@ -44,6 +53,9 @@ seq ?= 10000
 experiment ?= production
 K ?= 15
 W ?= 10
+n_passes ?= 1
+pass_idx ?= 0
+n_chunks_per_launch ?= 1
 
 # Sanity-check (K, W).
 ifeq ($(K)_$(W),15_10)
@@ -72,7 +84,23 @@ endif
 
 targetname = bionpu_minimizer
 
-artifact_suffix = k${K}_w${W}_n${n_tiles}_L${seq}
+# Per-(k, w, n_tiles, n_passes, pass_idx, [batch], seq) artifact suffix.
+# At n_passes=1 we keep the legacy v0 suffix (k_w_n_L) for back-compat;
+# multi-pass and batched cells extend it.
+ifeq ($(n_passes),1)
+  ifeq ($(n_chunks_per_launch),1)
+    artifact_suffix = k${K}_w${W}_n${n_tiles}_L${seq}
+  else
+    artifact_suffix = k${K}_w${W}_n${n_tiles}_b${n_chunks_per_launch}_L${seq}
+  endif
+else
+  ifeq ($(n_chunks_per_launch),1)
+    artifact_suffix = k${K}_w${W}_n${n_tiles}_np${n_passes}_p${pass_idx}_L${seq}
+  else
+    artifact_suffix = k${K}_w${W}_n${n_tiles}_np${n_passes}_b${n_chunks_per_launch}_p${pass_idx}_L${seq}
+  endif
+endif
+
 kw_obj_suffix = k${K}_w${W}
 
 aie_py_src        = minimizer.py
@@ -99,22 +127,30 @@ else
 	$(error devicename=$(devicename) not supported; use NPU2=1)
 endif
 
-# IRON Python lowering → MLIR.
+# IRON Python lowering → MLIR. n_passes + pass_idx are baked in at IRON-emit
+# time as compile-time arith.constants (so each pass's xclbin filters on
+# its own slice).
 build/aie_${artifact_suffix}.mlir: ${aie_py_src}
 	mkdir -p $(@D)
 	BIONPU_MINIMIZER_LAUNCH_CHUNKS=${launch_chunks} \
 	  BIONPU_MINIMIZER_K=${K} \
 	  BIONPU_MINIMIZER_W=${W} \
+	  BIONPU_MINIMIZER_N_PASSES=${n_passes} \
+	  BIONPU_MINIMIZER_PASS_IDX=${pass_idx} \
+	  BIONPU_MINIMIZER_N_CHUNKS_PER_LAUNCH=${n_chunks_per_launch} \
 	  ${PYTHON} ${srcdir}/${aie_py_src} \
 	    -d ${devicename} \
 	    --k ${K} \
 	    --w ${W} \
 	    --launch-chunks ${launch_chunks} \
+	    --n-passes ${n_passes} \
+	    --pass-idx ${pass_idx} \
+	    --n-chunks-per-launch ${n_chunks_per_launch} \
 	    > $@.tmp
 	mv $@.tmp $@
 
-# Per-(K, W, n_tiles) xclbin. The per-(K,W) tile object is aliased
-# under the canonical name `minimizer_tile.o` so aiecc finds it.
+# Per-(K, W, n_tiles, n_passes, pass_idx) xclbin. The per-(K,W) tile object is
+# aliased under the canonical name `minimizer_tile.o` so aiecc finds it.
 build/final_${artifact_suffix}.xclbin: build/aie_${artifact_suffix}.mlir build/${aie_tile_obj}
 	mkdir -p $(@D)
 	cp build/${aie_tile_obj} build/minimizer_tile.o
@@ -142,7 +178,23 @@ ${targetname}: ${runner_cc_src}
 	  -lxrt_coreutil -luuid -ltbb \
 	  -o ${targetname}
 
+# all-passes: build N_PASSES xclbin/insts pairs for the active
+# (K, W, n_tiles, n_passes, seq) tuple, plus the host_runner.
+#
+# Iterates pass_idx ∈ [0, n_passes) by recursively invoking $(MAKE)
+# with pass_idx overridden. Each recursive build produces one xclbin/
+# insts pair.
+all-passes: ${targetname}
+	@for p in $$(seq 0 $$(( ${n_passes} - 1 ))); do \
+	  echo "==> building pass_idx=$$p (n_passes=${n_passes} n_chunks_per_launch=${n_chunks_per_launch})"; \
+	  $(MAKE) -f $(firstword $(MAKEFILE_LIST)) \
+	    NPU2=${NPU2} K=${K} W=${W} experiment=${experiment} \
+	    n_passes=${n_passes} pass_idx=$$p seq=${seq} \
+	    n_chunks_per_launch=${n_chunks_per_launch} \
+	    || exit 1; \
+	done
+
 clean:
 	rm -rf build ${targetname}
 
-.PHONY: all clean
+.PHONY: all all-passes clean

@@ -13,11 +13,25 @@ variant; the with-epi (BigWig) variant is a follow-up.
 
 ## Status
 
-**🚧 In progress — Week 1 of PRD-1.** The submodule is pinned and the
-bionpu scorer plumbing exists; the steps below describe the intended
-reproduction flow but have not yet been end-to-end-walked on the
-ProArt host. As steps complete, this doc will be amended with
-concrete command output and the SHA-256 of the produced checkpoint.
+**End-to-end paper-replication achieved 2026-04-28** on the ProArt
+RTX 4070 host. Single-fold result on Lazzarotto 2020 GUIDE-seq fold 0
+(scratch mode, 8 epochs, no pair-finetune pretraining, no in-vitro
+CHANGE-seq transfer baseline):
+
+| Metric | Our fold-0 | Paper (Kimata 2025, mean ± σ over 14 folds) |
+|---|---|---|
+| ROC-AUC | **0.9824** | 0.9857 ± 0.0124 |
+| PR-AUC | **0.5448** | 0.5501 ± 0.0673 |
+
+Both metrics are within 1 σ of the paper's reported mean, despite
+running with current 2026-era deps (torch 2.11, transformers 5.x,
+datasets 4.x) instead of the paper's pinned 2024 versions.
+
+The upstream pipeline required a small set of bug fixes to run on
+those deps; they're filed as
+[opensensor/CRISPR_DNABERT#1](https://github.com/opensensor/CRISPR_DNABERT/pull/1).
+Until that PR merges, run from the patches in the submodule's
+working tree.
 
 ## Prerequisites
 

@@ -32,14 +32,22 @@ static constexpr uint64_t KMER_MASK_K31 = (1ULL << 62) - 1ULL;
 // pairs. The packed RC mask (apply XOR before bit-reverse) for k bases
 // is exactly the per-k mask above (every 2-bit pair flipped).
 
-// Per-tile count-table geometry. 1024 buckets * 12 bytes = 12 KiB.
-// Combined with the depth=2 ping-pong on the partial ObjectFifo
-// (24 KiB) and seq_in chunk (~8 KiB), total tile DM ~50 KiB fits
-// in 64 KiB AIE2P L1 with comfortable headroom for stack + code.
-// Was 4096 in the initial T1 contract; T11 silicon build failed
-// due to depth=2 ping-pong doubling the partial buffer to 96 KiB,
-// exceeding the 64 KiB cap (2026-04-28). See T1 contract revision.
-static constexpr int32_t HASH_BUCKETS_PER_TILE = 1024;
+// Per-tile count-table geometry. 512 buckets * 12 bytes = 6 KiB.
+// Tile DM layout (per IRON-emitted ld.script for n_tiles=4 at k=21):
+//   stack             : 0x70000-0x70400 (1 KiB)
+//   partial_count_0_buff_0: 0x70400-0x73400 (12 KiB)
+//   partial_count_0_buff_1: 0x74000-0x77000 (12 KiB)
+//   seq_in_0_cons_buff_0  : 0x78000-0x79008 (4104 B)
+//   seq_in_0_cons_buff_1  : 0x7C000-0x7D008 (4104 B)
+//   .bss (count_table)    : 0x7D008-0x80000 (12,280 B available)
+// Was 4096 in initial T1 contract (T11 build OOM, ld.lld); revised
+// to 1024 (still 8 B over the 12,280 B BSS hole due to alignment of
+// the IRON-allocated buffers); final v1 sizing 512 fits with 6 KiB
+// margin. Trade-off: smaller table → more emit-on-evict cycling at
+// chr22 scale (~50M unique k-mers); host re-aggregation absorbs the
+// bandwidth correctly but T18 documents the concern; v1.1 follow-on
+// is memtile-resident larger table.
+static constexpr int32_t HASH_BUCKETS_PER_TILE = 512;
 
 // Open-addressed linear probing — emit-on-evict overflow.
 static constexpr int32_t OVERFLOW_THRESHOLD = 8;

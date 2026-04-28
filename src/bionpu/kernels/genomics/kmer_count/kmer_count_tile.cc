@@ -238,8 +238,36 @@ static inline void kmer_count_tile_impl(uint8_t* __restrict packed_in,
 
 }  // anonymous namespace
 
+// =====================================================================
+// Per-build single-k entry point (T11 fix, 2026-04-28).
+//
+// The original design instantiated all three template specialisations
+// (k=15, k=21, k=31) in a single TU and exported all three extern "C"
+// symbols from every artifact. Each specialisation owns its own
+// `static CountRecord table[HASH_BUCKETS_PER_TILE]` (12 KiB BSS), so
+// the 3-instantiation TU produced 36 KiB of BSS — overflowing the
+// 64 KiB AIE2P CoreTile DM by 8 bytes after stack + ObjectFifo
+// double-buffers + code (`ld.lld: section '.bss' will not fit`).
+//
+// Each xclbin is single-k anyway (Makefile builds 12 artifacts =
+// 3 k × 4 n_tiles, and the IRON-Python references ONE
+// kmer_count_tile_k{K} symbol per build). Gate the entry points on
+// the build-time macro KMER_K_ACTIVE so each TU instantiates exactly
+// one specialisation. BSS drops back to 12 KiB.
+//
+// Makefile passes -DKMER_K_ACTIVE={15,21,31}. The IRON-Python's
+// external function reference matches the active symbol per artifact.
+// =====================================================================
+
+#ifndef KMER_K_ACTIVE
+#define KMER_K_ACTIVE 21  // default for standalone compile probes
+#endif
+static_assert(KMER_K_ACTIVE == 15 || KMER_K_ACTIVE == 21 || KMER_K_ACTIVE == 31,
+              "KMER_K_ACTIVE must be 15, 21, or 31");
+
 extern "C" {
 
+#if KMER_K_ACTIVE == 15
 // ============================================================================
 // Per-tile k-mer counter — k=15 (30-bit canonical, KMER_MASK_K15)
 // ============================================================================
@@ -252,7 +280,9 @@ void kmer_count_tile_k15(uint8_t* __restrict packed_in,
                                             n_input_bytes,
                                             bucket_lo, bucket_hi);
 }
+#endif
 
+#if KMER_K_ACTIVE == 21
 // ============================================================================
 // Per-tile k-mer counter — k=21 (42-bit canonical, KMER_MASK_K21)
 // ============================================================================
@@ -265,7 +295,9 @@ void kmer_count_tile_k21(uint8_t* __restrict packed_in,
                                             n_input_bytes,
                                             bucket_lo, bucket_hi);
 }
+#endif
 
+#if KMER_K_ACTIVE == 31
 // ============================================================================
 // Per-tile k-mer counter — k=31 (62-bit canonical, KMER_MASK_K31)
 // ============================================================================
@@ -283,5 +315,6 @@ void kmer_count_tile_k31(uint8_t* __restrict packed_in,
                                             n_input_bytes,
                                             bucket_lo, bucket_hi);
 }
+#endif
 
 }  // extern "C"

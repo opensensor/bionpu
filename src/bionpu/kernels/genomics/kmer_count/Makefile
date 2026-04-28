@@ -89,7 +89,12 @@ else
 endif
 
 targetname = bionpu_kmer_count
-artifact_suffix = n${n_tiles}_L${seq}
+# K is part of the artifact suffix so 12 (k, n_tiles) builds coexist
+# under build/ and don't clobber each other's .o files. T11 fix
+# 2026-04-28: per-tile-object instantiates only the active K's
+# template specialisation (gated on -DKMER_K_ACTIVE=$(K) below) to
+# stay within the 64 KiB CoreTile DM cap.
+artifact_suffix = k${K}_n${n_tiles}_L${seq}
 
 aie_py_src        = kmer_count.py
 aie_tile_cc_src   = kmer_count_tile.cc
@@ -112,11 +117,13 @@ build/${aie_tile_obj}: ${aie_tile_cc_src}
 	mkdir -p $(@D)
 ifeq ($(devicename),npu2)
 	cd $(@D) && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} \
+	  -DKMER_K_ACTIVE=${K} \
 	  -I${mlir_aie_dir}/aie_kernels \
 	  ${AIE_API_INCLUDE} \
 	  -c ${srcdir}/${aie_tile_cc_src} -o ${aie_tile_obj}
 else ifeq ($(devicename),npu)
 	cd $(@D) && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2_FLAGS} \
+	  -DKMER_K_ACTIVE=${K} \
 	  -I${mlir_aie_dir}/aie_kernels \
 	  ${AIE_API_INCLUDE} \
 	  -c ${srcdir}/${aie_tile_cc_src} -o ${aie_tile_obj}

@@ -194,6 +194,12 @@ The row-slab topology deliberately trades more K chunks for a memtile
 join that is already row-major. `K_CHUNK=8` keeps the full 768-output
 row-slab state inside tile DM.
 
+The build passes `aiecc --alloc-scheme=basic-sequential` intentionally:
+large contiguous buffers such as `qkvo_acc` and the head `x_in` span
+multiple 16 KiB banks. Bank-aware allocation only places one logical
+buffer inside one bank, so it warns and falls back to the same
+sequential layout.
+
 ### Build artifacts (v0.4-beta, qkvo specialization)
 
 | file | bytes | role |

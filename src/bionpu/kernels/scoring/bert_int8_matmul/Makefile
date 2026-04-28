@@ -57,6 +57,12 @@ N_TILES ?= 4
 AIE_API_INCLUDE ?= -I${MLIR_AIE_DIR}/install/include -I${MLIR_AIE_DIR}/third_party/aie_api/include
 SHAPE_FLAGS = -DBIONPU_BERT_M=$(M) -DBIONPU_BERT_K=$(K) -DBIONPU_BERT_N=$(N) \
               -DBIONPU_BERT_N_TILES=$(N_TILES) -DBIONPU_BERT_K_CHUNK=$(K_CHUNK)
+# Large contiguous ObjectFifo/Buffer allocations (head x, qkvo/ffn acc)
+# intentionally span 16 KiB tile-memory banks. Request sequential
+# allocation directly instead of the aiecc default "bank-aware then
+# fallback" path, which emits noisy warnings before producing the same
+# valid layout.
+AIE_ALLOC_SCHEME ?= basic-sequential
 
 all: build/$(V)/final.xclbin build/$(V)/insts.bin ${targetname}
 
@@ -83,6 +89,7 @@ build/$(V)/final.xclbin: build/$(V)/aie.mlir build/$(V)/bert_int8_matmul.o
 	mkdir -p ${@D}
 	cd ${@D} && aiecc --aie-generate-xclbin --no-compile-host \
 	    --xclbin-name=$(@F) \
+	    --alloc-scheme=$(AIE_ALLOC_SCHEME) \
 	    --no-xchesscc --no-xbridge \
 	    --aie-generate-npu-insts --npu-insts-name=insts.bin aie.mlir
 

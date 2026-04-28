@@ -333,6 +333,40 @@ def get_cpg_island_op(
     return BionpuCpgIsland(n_tiles=int(n_tiles))
 
 
+# --------------------------------------------------------------------------- #
+# Tandem repeat (STR) helper (v0 — single registry entry).
+# --------------------------------------------------------------------------- #
+
+TANDEM_REPEAT_VALID_N_TILES: tuple[int, ...] = (1, 2, 4, 8)
+TANDEM_REPEAT_DEFAULT_N_TILES: int = 4
+
+
+def get_tandem_repeat_op(
+    n_tiles: int | None = None,
+):
+    """Return the short tandem repeat (STR) scanner :class:`NpuOp`."""
+    from bionpu.dispatch.npu import NPU_OPS
+    import bionpu.kernels.genomics.tandem_repeat as _tr  # noqa: F401
+
+    if n_tiles is None:
+        n_tiles = TANDEM_REPEAT_DEFAULT_N_TILES
+    if int(n_tiles) not in TANDEM_REPEAT_VALID_N_TILES:
+        valid = ", ".join(str(x) for x in TANDEM_REPEAT_VALID_N_TILES)
+        raise ValueError(
+            f"get_tandem_repeat_op: n_tiles={n_tiles!r} not in {{{valid}}}."
+        )
+
+    op_name = "bionpu_tandem_repeat"
+    if op_name not in NPU_OPS:
+        raise KeyError(
+            "tandem_repeat op is not registered in NPU_OPS. "
+            "Import bionpu.kernels.genomics.tandem_repeat first."
+        )
+
+    BionpuTandemRepeat = type(NPU_OPS[op_name])
+    return BionpuTandemRepeat(n_tiles=int(n_tiles))
+
+
 __all__ = [
     "CPG_ISLAND_DEFAULT_N_TILES",
     "CPG_ISLAND_VALID_N_TILES",
@@ -351,8 +385,11 @@ __all__ = [
     "PRIMER_SCAN_DEFAULT_PRIMER",
     "PRIMER_SCAN_VALID_N_TILES",
     "PRIMER_SCAN_VALID_P",
+    "TANDEM_REPEAT_DEFAULT_N_TILES",
+    "TANDEM_REPEAT_VALID_N_TILES",
     "get_kmer_count_op",
     "get_minimizer_op",
     "get_cpg_island_op",
     "get_primer_scan_op",
+    "get_tandem_repeat_op",
 ]

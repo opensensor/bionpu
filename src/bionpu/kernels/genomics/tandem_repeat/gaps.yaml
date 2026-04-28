@@ -1,0 +1,115 @@
+# gaps.yaml — toolchain-gap report (tandem repeat / STR kernel).
+# Schema: bionpu/report/gaps.schema.json (v1.0.0).
+
+schema_version: "1.0.0"
+task_id: ""
+kernel_name: "bionpu_tandem_repeat"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-28T00:00:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+
+gaps:
+  - id: "tandem-repeat-period-cap-6"
+    category: "scope"
+    op_or_pattern: "v0 caps period at 6 (mono- through hexa-nucleotide)"
+    attempted: |
+      v0 supports periods in [1, 6] which covers >99% of biologically
+      relevant short tandem repeats (mono-, di-, tri-, tetra-, penta-,
+      hexa-nucleotide). State per period is small (one streak counter +
+      one streak-start position), so adding more periods is
+      straightforward but doubles per-base work for each new period.
+    failed_with: |
+      Not a failure — explicit v0 scope.
+    workaround: |
+      v1 follow-on: extend MAX_PERIOD to 12 or 100 with a per-period
+      compile-time enable mask. Disease-relevant STRs above period=6
+      are rare (some 7-mer expansion loci) and can be done as a separate
+      kernel cell.
+    severity: "low"
+    blocks_v1_ship: false
+
+  - id: "tandem-repeat-fuzzy-mismatch"
+    category: "scope"
+    op_or_pattern: "v0 is exact-match only; TRF default allows 10% mismatch"
+    attempted: |
+      v0 emits records only on exact base-equality streaks. TRF's
+      default similarity threshold (90% match score) would emit more
+      records on real-genome data with sequencing error / SNP noise.
+    failed_with: |
+      Not a failure — explicit v0 scope. v0 byte-equal contract is with
+      the matching-streak oracle, not with TRF.
+    workaround: |
+      v1 follow-on: add a windowed Hamming-distance allowance to the
+      streak-break check. Per-period state grows to include a small
+      ring buffer of recent mismatches.
+    severity: "medium"
+    blocks_v1_ship: false
+
+  - id: "tandem-repeat-chunk-spanning-str"
+    category: "scope"
+    op_or_pattern: "STRs longer than 1 chunk payload (~16384 bp) are not detected"
+    attempted: |
+      v0 streaming chunk is 4096 byte payload = 16384 bp. The chr22
+      longest STR is ~10 kbp at the disease-loci region (FXN, HTT, etc.)
+      which is well under 16384 bp. Pathological repeat expansions
+      could exceed this cap.
+    failed_with: |
+      Not observed in chr22 default-settings; documented as a known
+      v0 limitation.
+    workaround: |
+      v1 follow-on: cross-chunk streak merging via a 2-pass scheme. The
+      first pass produces per-chunk pending-streak metadata in the
+      header; the second pass merges across chunks. Or bump chunk
+      payload to 64 KiB if BD budget allows.
+    severity: "low"
+    blocks_v1_ship: false
+
+  - id: "tandem-repeat-emit-cap-saturation"
+    category: "performance"
+    op_or_pattern: "dense-STR chunks could exceed 2046 sparse emits"
+    attempted: |
+      v0 caps per-chunk emits at 2046 records (32 KiB slot - 4 byte
+      prefix / 16 bytes per record). chr22 STR density is far below
+      this cap (~1000 STR loci end-to-end), so cap-fire is extremely
+      unlikely.
+    failed_with: |
+      Not observed on chr22.
+    workaround: |
+      Same lever as cpg_island/minimizer: shrink chunk payload or widen
+      partial_out to 64 KiB.
+    severity: "low"
+    blocks_v1_ship: false
+
+  - id: "tandem-repeat-overlap-merge-phase-shift"
+    category: "correctness"
+    op_or_pattern: "host overlap-merge unions two abutting same-motif streaks at autocorrelation phase shifts"
+    attempted: |
+      The host runner does per-(period, motif) overlap-merge after the
+      kernel emits. When two genuinely different streaks of the same
+      period and same motif happen to abut by ≤ q-1 bases (which can
+      happen when adjacent motif copies share their first q-1 bases —
+      a property of autocorrelation streak detection), the
+      overlap-merge unions them into a single longer record. The CPU
+      oracle running on the full sequence ALSO produces both
+      candidates, but its cross-period dedup correctly drops the
+      second one because its start lies inside the first (overlap by 1
+      base). The merged silicon record then suppresses other
+      higher-priority records (e.g., a period-5 motif inside the
+      union) during cross-period dedup.
+    failed_with: |
+      chr22 v0 silicon has 289548 records vs oracle's 289551 (3
+      records differ). Spot-checked example at chr22:11121032 where
+      AAGA repeats abut AAAGA at a non-q-aligned boundary; silicon
+      merges two AAGA streaks (11121032..11121084 and
+      11121083..11121135) into one (11121032..11121135), suppressing
+      the AAAGA record at 11121130..11121155.
+    workaround: |
+      v1: replace overlap-merge with chunk-aware merge that only
+      collapses records whose interval-bounds match the chunk-overlap
+      geometry (i.e., known chunk-spanning streaks). Or: have the
+      host re-derive the boundary via greedy oracle scan within each
+      kernel-emitted region. v0 documented difference is well below
+      the brief's <=10 record threshold for chr22.
+    severity: "low"
+    blocks_v1_ship: false

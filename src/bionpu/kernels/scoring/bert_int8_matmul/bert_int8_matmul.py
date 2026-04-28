@@ -4,22 +4,39 @@
 #
 # bert_int8_matmul — IRON-Python lowering for the BERT body INT8 matmul.
 #
-# The workhorse kernel of the DNABERT-Epi AIE2P scorer port. v0 is a
-# single-compute-tile correctness path; the weight matrix is
-# tile-resident (works for the classifier head: M=47, K=768, N=2).
-# Memtile streaming for larger N (qkvo: 768; ffn1/2: 3072) is the
-# v0.5 follow-up — see MANIFEST.md.
+# The workhorse kernel of the DNABERT-Epi AIE2P scorer port. Two
+# variants are supported:
 #
-# Shapes (per CLI flags, default = head specialization):
+# * ``head`` (default; v0.4-alpha):
+#   single compute tile, weights resident on tile. Works for the
+#   classifier-head specialization (M=47, K=768, N=2 — total tile DM
+#   ~38 KB / 64 KB).
+#
+# * ``qkvo`` (v0.4-beta):
+#   four compute tiles, N-axis fan-out (192 channels per tile),
+#   K-chunked along the reduction axis (K_CHUNK=64 → 12 chunks per
+#   launch). Memtile splits the per-K-chunk weight tile into 4 N-slices
+#   (one per compute tile) and broadcasts the per-K-chunk x slice to
+#   all four. Memtile joins the four 47×192 INT8 partial outputs into
+#   the final 47×768 INT8 result.
+#
+# Shapes (per CLI flags):
 #   x:           M × K  int8           (token-major)
 #   w:           N × K  int8           (output-channel-major)
 #   scales:      N + 1  fp32           (combined per-output FP32 scales)
 #   y:           M × N  int8           (token-major)
 #
-# Topology (single column, single compute tile):
+# Topology (v0.4-alpha — head):
 #   shim ──x── compute_tile ──y── shim
-#   shim ──w── compute_tile
-#   shim ──s── compute_tile
+#   shim ──ws── compute_tile
+#
+# Topology (v0.4-beta — qkvo):
+#   shim ──xs_chunk──→ broadcast to 4 compute tiles (1 shim MM2S)
+#       (xs = M×K_CHUNK x slab + (N+1) fp32 scales prefix; same scales
+#        prefix is duplicated on every chunk to keep ObjectFifo elements
+#        uniform-sized while still fitting NPU2Col1's 2-MM2S shim budget)
+#   shim ──w_chunk──→ memtile ──split(N)──→ 4 compute tiles (1 shim MM2S)
+#   compute_0..3 ──y_partial──→ memtile ──join(N)──→ shim (1 shim S2MM)
 
 from __future__ import annotations
 
@@ -28,23 +45,18 @@ import sys
 
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron.controlflow import range_
 from aie.iron.device import NPU1Col1, NPU2Col1
 
 
-def emit_mlir(M: int, K: int, N: int, target: str = "npu2") -> str:
-    """Emit IRON Python -> MLIR-AIE for the given matmul shape.
+def _round4(n: int) -> int:
+    """Round up to a multiple of 4 (AIE2P shim DMA requirement)."""
+    return ((n + 3) // 4) * 4
 
-    Returns the MLIR-AIE module as a string. Caller pipes to
-    aiecc to produce the xclbin.
-    """
-    if target == "npu2":
-        dev = NPU2Col1()
-    elif target == "npu":
-        dev = NPU1Col1()
-    else:
-        raise ValueError(f"unknown device target: {target!r}")
 
+def emit_mlir_head(M: int, K: int, N: int, dev) -> str:
+    """v0.4-alpha single-tile path. Weights tile-resident."""
     # ObjectFifo element types — flat byte arrays per IRON convention.
     #
     # AIE2P CoreTiles only have 2 input + 2 output DMA channels, so
@@ -59,9 +71,6 @@ def emit_mlir(M: int, K: int, N: int, target: str = "npu2") -> str:
     # next multiple of 4 so the lowering succeeds. The kernel C++
     # writes only the useful prefix; the host runner reads the same
     # useful prefix and ignores any trailing pad bytes.
-    def _round4(n: int) -> int:
-        return ((n + 3) // 4) * 4
-
     x_size = _round4(M * K)
     ws_bytes = _round4(N * K + (N + 1) * 4)   # int8 weights + float32 scales
     y_size = _round4(M * N)
@@ -71,8 +80,7 @@ def emit_mlir(M: int, K: int, N: int, target: str = "npu2") -> str:
 
     # depth=1 in v0 — there's only one chunk per launch and the
     # 36 KB x buffer is large enough that depth=2 (72 KB) blows the
-    # 64 KB tile DM cap. v0.5 will introduce K-chunking so each
-    # ObjectFifo holds a small slice and depth=2 fits comfortably.
+    # 64 KB tile DM cap.
     of_x  = ObjectFifo(x_ty,  name="x_in",  depth=1)
     of_ws = ObjectFifo(ws_ty, name="ws_in", depth=1)
     of_y  = ObjectFifo(y_ty,  name="y_out", depth=1)
@@ -87,10 +95,9 @@ def emit_mlir(M: int, K: int, N: int, target: str = "npu2") -> str:
         [x_ty, ws_ty, y_ty],
     )
 
-    # v0 = one chunk in / one chunk out per launch. v0.5 will
-    # iterate K-chunks here for the larger qkvo / ffn shapes. The
-    # Kernel must be passed *into* the body as an arg (not closed
-    # over) so the IRON resolver can bind the symbol at lower-time.
+    # one chunk in / one chunk out per launch. The Kernel must be passed
+    # *into* the body as an arg (not closed over) so the IRON resolver
+    # can bind the symbol at lower-time.
     def core_body(of_x, of_ws, of_y, matmul_kernel):
         x_buf  = of_x.acquire(1)
         ws_buf = of_ws.acquire(1)
@@ -115,14 +122,324 @@ def emit_mlir(M: int, K: int, N: int, target: str = "npu2") -> str:
     return Program(dev, rt).resolve_program()
 
 
+def emit_mlir_qkvo(M: int, K: int, N: int, K_CHUNK: int, dev) -> str:
+    """v0.4-beta multi-tile + memtile-split + K-chunked path.
+
+    Topology:
+        shim ──xs_chunk──→ broadcast to 4 compute tiles  (1 shim MM2S)
+        shim ──w_chunk───→ memtile ──split(N)──→ 4 cores (1 shim MM2S)
+        4 cores ──y_part──→ memtile ──join(N)──→ shim    (1 shim S2MM)
+
+    Each launch streams K_CHUNKS=12 K-chunks (K=768 / K_CHUNK=64) through
+    the xs and w ObjectFifos; the four compute tiles each accumulate into
+    a tile-local INT32 Buffer (qkvo_acc, 47×192=36 KB), then finalize to
+    INT8 once the K loop is done. Scales ride along the xs stream
+    (packed into the trailing bytes of each xs_chunk); the kernel
+    re-stashes the per-tile slice on every call into a tile-local fp32
+    Buffer (qkvo_scales, 192+1 entries = 772 B).
+
+    Per-tile DM budget (actual, observed in linker layout, depth=1):
+
+      qkvo_acc i32          :  47 × 192 × 4   = 36,096 B
+      w_to_core i8 (slice)  : 192 × 64        = 12,288 B
+      y_part out i8         :  47 × 192       =  9,024 B
+      xs_in i8 (+scales)    : 47×64 + 769×4   =  6,084 B
+      qkvo_scales fp32      : 192+1 fp32      =    772 B
+      stack                 : —               =  1,024 B
+      ──────────────────────────────────────────
+      total                                   = 65,288 B  (~99.6% of 64 KiB)
+
+    Memtile budget (out of 512 KB):
+      S2MM  : w_in (1) + 4× y_part_i (4)     = 5/6 channels
+      MM2S  : 4× w_to_core_i (4) + y_out (1) = 5/6 channels
+      Memory: w_chunk (49152) + 4× y_part_buf (9024)
+            + y_total (36096) + scratch     ≈ 122 KB / 512 KB
+
+    Shim budget (out of 2 MM2S + 2 S2MM):
+      MM2S: xs (1) + w (1)                   = 2/2 channels
+      S2MM: y_out (1)                        = 1/2 channels
+    """
+    if N % 4 != 0:
+        raise ValueError(
+            f"qkvo variant requires N divisible by 4 (one slice per compute "
+            f"tile), got N={N}"
+        )
+    if K % K_CHUNK != 0:
+        raise ValueError(
+            f"qkvo variant requires K divisible by K_CHUNK, got K={K}, "
+            f"K_CHUNK={K_CHUNK}"
+        )
+
+    N_TILES = 4
+    N_PER_TILE = N // N_TILES        # 192 for qkvo
+    K_CHUNKS = K // K_CHUNK          # 12 for qkvo
+
+    # ─── Whole-runtime tensor types (host-visible flat buffers) ───
+    # Streaming layout — host writes them in chunk-major order so the
+    # shim DMA stride math stays linear-1D:
+    #   xs_total : K_CHUNKS * (M*K_CHUNK + (N+1)*4) bytes — each chunk is
+    #              one M×K_CHUNK slab of x followed by the (redundantly
+    #              repeated) scales fp32 array. Trick lets us collapse 3
+    #              shim MM2S streams (x, w, s) into 2 (xs, w), fitting
+    #              the NPU2Col1 shim's 2-MM2S budget.
+    #   w_total  : K_CHUNKS * (N * K_CHUNK) bytes — one N×K_CHUNK slab per
+    #              chunk (N-major within each slab so memtile-split works).
+    #   y_total  : M * N int8 — final output, joined N-axis from 4 partials.
+    #              Slice-major layout: tile i owns bytes
+    #              [i*M*N_PER_TILE .. (i+1)*M*N_PER_TILE).
+    w_total_bytes      = _round4(K_CHUNKS * N * K_CHUNK)
+    y_total_bytes      = _round4(M * N)
+
+    w_total_ty      = np.ndarray[(w_total_bytes,), np.dtype[np.int8]]
+    y_total_ty      = np.ndarray[(y_total_bytes,), np.dtype[np.int8]]
+
+    # ─── Per-chunk types (visible to memtile + compute tiles) ───
+    # xs_chunk: x slab + scales packing (see big block comment further down
+    # in the ObjectFifos section for rationale).
+    xs_chunk_size      = _round4(M * K_CHUNK + (N + 1) * 4)  # 6084 bytes
+    xs_total_bytes     = _round4(K_CHUNKS * xs_chunk_size)
+    w_chunk_size       = _round4(N * K_CHUNK)               # 49152 (768×64) — full w_chunk on memtile
+    w_slice_chunk_size = _round4(N_PER_TILE * K_CHUNK)      # 12288 (192×64) — per-tile w slice
+    y_part_size        = _round4(M * N_PER_TILE)            # 9024 (47×192)
+
+    xs_chunk_ty      = np.ndarray[(xs_chunk_size,),      np.dtype[np.int8]]
+    xs_total_ty      = np.ndarray[(xs_total_bytes,),     np.dtype[np.int8]]
+    w_chunk_ty       = np.ndarray[(w_chunk_size,),       np.dtype[np.int8]]
+    w_slice_chunk_ty = np.ndarray[(w_slice_chunk_size,), np.dtype[np.int8]]
+    y_part_ty        = np.ndarray[(y_part_size,),        np.dtype[np.int8]]
+
+    # ─── Compute kernels — three symbols for the K-chunked accumulator pattern.
+    # The IRON `range_` loop yields an `index`-typed loop variable that
+    # would clash with the kernel's `i32` arg (operand type mismatch
+    # at MLIR verify time), so rather than pass `k_iter` we split the
+    # work into three lifecycle stages and pass tile-local persistent
+    # state through IRON `Buffer` objects (placed on the tile by the
+    # Worker that consumes them):
+    #
+    #   bert_int8_matmul_qkvo_init     — zero the i32 accumulator
+    #   bert_int8_matmul_qkvo_acc      — i32 += i8 × i8 over the K_CHUNK,
+    #                                     stashes scales (from xs tail) on
+    #                                     the first call
+    #   bert_int8_matmul_qkvo_finalize — fused-scale + INT8 saturate → y
+    #
+    # The accumulator and scales-stash are tile-local Buffers. They occupy
+    # tile DM allocated by IRON (sized appropriately, not via the linker
+    # script's tight `data` region — Buffers map onto AIE buffer ops which
+    # live in their own DM segment). This is the canonical pattern for
+    # tile-resident scratch state; static C++ arrays would land in `.bss`
+    # which is squeezed by the ObjectFifo buffer placements.
+    # Per-tile stashed scales: only this tile's N_PER_TILE entries plus
+    # one trailing fp32 slot reserved for the bias (matching the host
+    # contract where scales_combined has length N+1). 192+1 fp32 = 772 B.
+    acc_ty        = np.ndarray[(M * N_PER_TILE,),    np.dtype[np.int32]]
+    scales_buf_ty = np.ndarray[((N_PER_TILE + 1),), np.dtype[np.float32]]
+
+    matmul_init = Kernel(
+        "bert_int8_matmul_qkvo_init",
+        "bert_int8_matmul.o",
+        [acc_ty],                  # i32 accumulator only (zeroes it)
+    )
+    matmul_acc = Kernel(
+        "bert_int8_matmul_qkvo_acc",
+        "bert_int8_matmul.o",
+        [
+            xs_chunk_ty,           # x slab for this K_CHUNK + trailing scales
+            w_slice_chunk_ty,      # this tile's w slice for this K_CHUNK
+            acc_ty,                # tile-local i32 accumulator
+            scales_buf_ty,         # tile-local fp32 scales-stash (acc_k
+                                   # writes the per-tile slice every call —
+                                   # last write wins; only the last call's
+                                   # values are read by finalize, so this is
+                                   # correct without a "first-call" gate)
+            np.int32,              # tile_idx (0..3) — selects which N_PER_TILE
+                                   # slice of the xs_chunk scales prefix to stash
+        ],
+    )
+    matmul_finalize = Kernel(
+        "bert_int8_matmul_qkvo_finalize",
+        "bert_int8_matmul.o",
+        [
+            acc_ty,                # tile-local i32 accumulator
+            scales_buf_ty,         # tile-local fp32 scales-stash (per-tile slice)
+            y_part_ty,             # int8 output partial
+        ],
+    )
+
+    # ─── ObjectFifos ───
+    #
+    # Resource budget (NPU2Col1):
+    #   shim   : 2 source (MM2S) + 2 dest (S2MM)  channels
+    #   memtile: 6 MM2S + 6 S2MM  channels        (one memtile total)
+    #   compute: 2 MM2S + 2 S2MM  channels each
+    #
+    # Naive layout uses 3 shim MM2S streams (x, w, scales) — exceeds
+    # the 2/2 shim MM2S budget. To fit, we PACK scales into the trailing
+    # bytes of every x_chunk slab (x_chunk_with_scales = x_chunk +
+    # scales). Cost: 12× duplicated 3076-byte scales = 36 KB extra
+    # host→shim transfer per launch (negligible vs. 576 KB weights).
+    # The kernel reads scales out of the FIRST chunk only and stashes
+    # them in static memory for the finalize stage.
+    #
+    # This collapses the shim MM2S budget to 2 (x_with_scales + w),
+    # frees a memtile MM2S slot, and keeps the kernel logic simple
+    # (no k_iter scalar arg required).
+    #
+    # Element layout per x_chunk transfer (3008 + 3076 = 6084 B, padded
+    # to mult of 4 → 6084 already aligned):
+    #   xs_chunk[0          .. M*K_CHUNK - 1]                  = x int8
+    #   xs_chunk[M*K_CHUNK  .. M*K_CHUNK + (N+1)*4 - 1]        = scales fp32
+    #
+    # Shim budget after packing:
+    #   MM2S: xs (1) + w (1) = 2/2  ✓
+    #   S2MM: y_out (1)      = 1/2  ✓
+    #
+    # Memtile budget:
+    #   S2MM: w_in (1) + 4× y_part_i (4)            = 5/6
+    #   MM2S: 4× w_to_core_i (4) + y_out (1)        = 5/6
+    #   Memory: w_chunk (49152) + 4× y_part (9024)
+    #         + y_total (36096) + scratch          ≈ 122 KB / 512 KB
+
+    # xs: shim → 4 compute tiles (direct switchbox broadcast).
+    of_xs = ObjectFifo(xs_chunk_ty, name="xs_in", depth=1)
+
+    # w_chunk: shim → memtile → split into 4 N-slices → 4 compute tiles.
+    of_w_in  = ObjectFifo(w_chunk_ty, name="w_in",  depth=1)
+    of_y_out = ObjectFifo(y_total_ty, name="y_out", depth=1)
+
+    w_split_offsets = [i * N_PER_TILE * K_CHUNK for i in range(N_TILES)]
+    of_w_to_cores = of_w_in.cons().split(
+        w_split_offsets,
+        obj_types=[w_slice_chunk_ty] * N_TILES,
+        names=[f"w_to_core{i}" for i in range(N_TILES)],
+    )
+
+    # y output: 4 compute tiles → memtile → join along N → shim.
+    # Each tile's 47×192 partial lands at byte offset i*y_part_size in the
+    # joined 47×768 output. This produces a slice-major layout (tile i
+    # owns the contiguous byte block at offset i*y_part_size). The host
+    # emulation reorders y back to row-major to match the simple einsum
+    # reference.
+    y_join_offsets = [i * y_part_size for i in range(N_TILES)]
+    of_y_partials = of_y_out.prod().join(
+        y_join_offsets,
+        obj_types=[y_part_ty] * N_TILES,
+        names=[f"y_part_{i}" for i in range(N_TILES)],
+    )
+
+    # ─── Per-tile worker body ───
+    # Each worker has its own pair of tile-local Buffers (acc + scales)
+    # passed in as fn_args. They are persistent across the K loop:
+    #   1. init zeroes the i32 accumulator
+    #   2. K loop accumulates; first call also stashes scales out of
+    #      the xs_chunk tail into the scales_buf
+    #   3. finalize applies fused-scale + INT8 saturate using scales_buf
+    def core_body(of_xs, of_w, of_y, acc_buf, scales_buf, init_k, acc_k, fin_k, tile_idx):
+        init_k(acc_buf)
+        for _ in range_(K_CHUNKS):
+            xs_buf = of_xs.acquire(1)
+            w_buf  = of_w.acquire(1)
+            acc_k(xs_buf, w_buf, acc_buf, scales_buf, tile_idx)
+            of_xs.release(1)
+            of_w.release(1)
+        y_buf = of_y.acquire(1)
+        fin_k(acc_buf, scales_buf, y_buf)
+        of_y.release(1)
+
+    workers = []
+    for i in range(N_TILES):
+        # Per-tile Buffer for the i32 accumulator and the fp32 scales
+        # stash. IRON places these on the Worker's tile when consumed
+        # via fn_args (Worker._buffers handling). Distinct names so the
+        # MLIR remains tile-unique.
+        acc_buf = Buffer(type=acc_ty, name=f"qkvo_acc_{i}")
+        scales_buf = Buffer(type=scales_buf_ty, name=f"qkvo_scales_{i}")
+        workers.append(Worker(
+            core_body,
+            fn_args=[
+                of_xs.cons(),                 # direct shim-broadcast xs consumer
+                of_w_to_cores[i].cons(),      # per-tile w slice consumer (memtile-split)
+                of_y_partials[i].prod(),      # per-tile output producer (memtile-join)
+                acc_buf,
+                scales_buf,
+                matmul_init,
+                matmul_acc,
+                matmul_finalize,
+                int(i),                       # tile_idx 0..3
+            ],
+        ))
+
+    # ─── Runtime sequence (shim-side DMAs) ───
+    # The host pre-stages:
+    #   x_total: K_CHUNKS contiguous slabs of M×K_CHUNK each (chunk-major)
+    #   w_total: K_CHUNKS contiguous slabs of N×K_CHUNK each (chunk-major,
+    #            with N-major stride within each slab so memtile-split works)
+    #   scales : (N+1) fp32 in one shot
+    # Runtime sequence: shim drives 2 input streams and 1 output stream.
+    #   xs_total : K_CHUNKS × xs_chunk_size bytes (x_chunk + scales)
+    #   w_total  : K_CHUNKS × w_chunk_size bytes  (full N×K_CHUNK slabs)
+    #   y_total  : M × N bytes (slice-major joined output)
+    rt = Runtime()
+    with rt.sequence(xs_total_ty, w_total_ty, y_total_ty) as (
+        xs_total, w_total, y_total,
+    ):
+        rt.start(*workers)
+        rt.fill(of_xs.prod(),   xs_total)
+        rt.fill(of_w_in.prod(), w_total)
+        rt.drain(of_y_out.cons(), y_total, wait=True)
+
+    return Program(dev, rt).resolve_program()
+
+
+def emit_mlir(
+    M: int,
+    K: int,
+    N: int,
+    target: str = "npu2",
+    variant: str = "head",
+    K_CHUNK: int = 64,
+) -> str:
+    """Emit IRON Python -> MLIR-AIE for the given matmul shape.
+
+    Returns the MLIR-AIE module as a string. Caller pipes to
+    aiecc to produce the xclbin.
+
+    Args:
+        M, K, N: matmul shape.
+        target: "npu" (NPU1, Phoenix) or "npu2" (NPU2 / AIE2P / Strix).
+        variant: "head" (single-tile, weights resident) or
+                 "qkvo" (4-tile fan-out + K-chunked memtile streaming).
+        K_CHUNK: K-axis chunk size for the qkvo variant. Default 64
+                 hits the per-tile DM budget for M=47, N=192/tile.
+    """
+    if target == "npu2":
+        dev = NPU2Col1()
+    elif target == "npu":
+        dev = NPU1Col1()
+    else:
+        raise ValueError(f"unknown device target: {target!r}")
+
+    if variant == "head":
+        return emit_mlir_head(M=M, K=K, N=N, dev=dev)
+    elif variant == "qkvo":
+        return emit_mlir_qkvo(M=M, K=K, N=N, K_CHUNK=K_CHUNK, dev=dev)
+    else:
+        raise ValueError(f"unknown variant: {variant!r} (expected 'head' or 'qkvo')")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-d", "--target", choices=["npu", "npu2"], default="npu2")
     p.add_argument("--M", type=int, default=47)
     p.add_argument("--K", type=int, default=768)
     p.add_argument("--N", type=int, default=2)
+    p.add_argument("--variant", choices=["head", "qkvo"], default="head")
+    p.add_argument("--K-chunk", type=int, default=64,
+                   help="K-axis chunk size for the qkvo variant (default 64).")
     args = p.parse_args()
-    sys.stdout.write(str(emit_mlir(M=args.M, K=args.K, N=args.N, target=args.target)))
+    sys.stdout.write(str(emit_mlir(
+        M=args.M, K=args.K, N=args.N, target=args.target,
+        variant=args.variant, K_CHUNK=args.K_chunk,
+    )))
 
 
 if __name__ == "__main__":

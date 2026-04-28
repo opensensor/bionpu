@@ -43,9 +43,14 @@ M ?= 47
 K ?= 768
 N ?= 2
 V ?= head
+# qkvo K-axis chunk size (only used when V=qkvo). Default 64 hits the
+# per-tile DM budget (~51 KB / 64 KB) for M=47, N=192/tile.
+K_CHUNK ?= 64
+N_TILES ?= 4
 
 AIE_API_INCLUDE ?= -I${MLIR_AIE_DIR}/install/include -I${MLIR_AIE_DIR}/third_party/aie_api/include
-SHAPE_FLAGS = -DBIONPU_BERT_M=$(M) -DBIONPU_BERT_K=$(K) -DBIONPU_BERT_N=$(N)
+SHAPE_FLAGS = -DBIONPU_BERT_M=$(M) -DBIONPU_BERT_K=$(K) -DBIONPU_BERT_N=$(N) \
+              -DBIONPU_BERT_N_TILES=$(N_TILES) -DBIONPU_BERT_K_CHUNK=$(K_CHUNK)
 
 all: build/$(V)/final.xclbin build/$(V)/insts.bin ${targetname}
 
@@ -64,7 +69,8 @@ endif
 # IRON lowering output → MLIR.
 build/$(V)/aie.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< -d ${devicename} --M $(M) --K $(K) --N $(N) > $@
+	python3 $< -d ${devicename} --M $(M) --K $(K) --N $(N) \
+	    --variant $(V) --K-chunk $(K_CHUNK) > $@
 
 # xclbin + instruction stream from aiecc.
 build/$(V)/final.xclbin: build/$(V)/aie.mlir build/$(V)/bert_int8_matmul.o

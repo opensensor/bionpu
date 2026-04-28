@@ -174,8 +174,10 @@ Minimal viable port:
 3. End-to-end dispatch glue in `bionpu.scoring.dnabert_epi` for
    `device='npu'` (head only; BERT body still on torch CPU) —
    **DONE 2026-04-28**, NUMERIC_EPSILON@0.05 EQUAL vs CPU
-4. `bert_int8_matmul` qkvo specialization (N=768) — **NEXT** (multi-tile
-   + K-chunking, see § below)
+4. `bert_int8_matmul` qkvo specialization (N=768) — **DONE 2026-04-28**,
+   byte-equivalent on silicon. 4 compute tiles + memtile split/join +
+   K-chunked accumulator. See § "v0.4-beta" below for the as-built
+   topology and DM utilization vs predicted.
 5. `bert_int8_matmul` ffn1/ffn2 specializations (N=3072, K=3072) —
    DDR-streamed weights (~5 days)
 6. `bert_attn_softmax_av` IRON Python kernel (1 week)
@@ -228,16 +230,69 @@ compute tiles. The output is concatenated by the memtile into a
 single shim-DMA-out blob.
 
 **Implementation notes:**
-- Same `bionpu_int8_matmul.cc` symbol body, parameterised on M / K /
-  N / N_per_tile / K_chunk via Makefile macros.
+- Same `bert_int8_matmul.cc` source, three new entry points
+  (`bert_int8_matmul_qkvo_init` / `_acc` / `_finalize`) for the
+  K-chunked accumulator pattern.
 - New IRON-Python `--variant qkvo` flag emits the multi-tile
   topology with the four compute-tile workers.
-- Host runner stays the same shape: file-backed x.bin / ws.bin /
-  y.bin; the host pre-stages w + scales into ws.bin.
+- Host runner takes a `--variant {head,qkvo}` flag; qkvo path uses
+  `--xs FILE --w FILE` instead of the head's `--x FILE --ws FILE`.
+
+**As-built topology (2026-04-28):** the design doc's predicted budget
+of 51 KB / tile underestimated by 13 KB. Actual budget: 65,288 B
+(99.6% of 64 KiB tile DM). The two unmodelled costs:
+
+1. **scales packing into xs_chunk** — to fit the NPU2Col1 shim's
+   2-MM2S budget, scales are packed into the trailing bytes of every
+   xs_chunk (3076 B per chunk × K_CHUNKS = 36 KB total redundant scales
+   in the host→shim transfer). xs_chunk grew from 3008 B → 6084 B
+   (+3 KB per-tile DM cost).
+2. **per-tile fp32 scales-stash + stack** — 772 B (192+1 fp32) +
+   1024 B = 1,796 B not in the original budget.
+
+**Per-tile DM (actual):**
+
+| resident | bytes | % of 64 KiB |
+|---|---|---|
+| qkvo_acc (i32 accumulator) | 36,096 | 55.0% |
+| w_to_core slice (i8) | 12,288 | 18.7% |
+| xs_in (i8 + scales suffix) | 6,084 | 9.3% |
+| y_part out (i8) | 9,024 | 13.8% |
+| qkvo_scales (fp32, per-tile) | 772 | 1.2% |
+| stack | 1,024 | 1.6% |
+| **total** | **65,288** | **99.6%** |
 
 **Estimated effort:** 2-3 days for first build attempt + iteration.
 The IRON Python topology is the big lift; the kernel C++ is
 incremental over the v0.4-alpha scalar path.
+
+**IRON API surprises learned during the v0.4-beta build (extending
+the v0.4-alpha lessons):**
+
+1. **`range_` loop var is `index`-typed**, not i32. Passing it to a
+   kernel with `np.int32` arg causes a verify-time op-type-mismatch
+   crash. The fix: split the K loop into `init / acc / finalize`
+   kernel symbols and pass per-tile state via IRON `Buffer` objects
+   instead of relying on a runtime `k_iter` index.
+2. **NPU2Col1 has 2/2 shim DMA channels**, not 3. Naive 3-stream
+   designs (x, w, scales as separate ObjectFifos) overflow the shim
+   budget. Pack scales into the trailing bytes of x or w to collapse
+   3 streams into 2.
+3. **Static C++ globals share the kernel's tight `data` region**
+   (~26 KB after the linker reserves space for ObjectFifo slot
+   allocations). For per-tile persistent state larger than that,
+   declare `iron.Buffer` objects in fn_args — IRON places them on
+   the worker's tile and they get their own DM segment outside the
+   `.bss` region.
+4. **NPU2Col1 has 1 memtile (512 KB) with 6/6 MM2S+S2MM**, not
+   multiple memtiles. The `aie.iron.Program.resolve_program` will
+   try to satisfy memtile-routed flows by allocating extra logical
+   memtiles, but the device only has 1 physical — the verify error
+   is "no MemTile with sufficient DMA capacity" rather than a count
+   error. Solve by routing only flows that semantically need
+   shape-changing DMA (split/join) through the memtile; broadcast
+   ObjectFifos with multiple `.cons()` calls go shim → cores
+   directly via switchbox replication.
 
 ## v0.4-rc: scaling to N=3072 (ffn1/ffn2)
 

@@ -20,37 +20,83 @@
 # env-var policy are all pinned by that contract. The IRON Python here
 # is the consumer of those pins; the external Kernel(...) declarations
 # below MUST agree byte-for-byte with the C++ symbols T5 emits in
-# kmer_count_tile.cc and T6 emits in kmer_count_aggregator.cc.
+# kmer_count_tile.cc.
 #
-# Topology (mirrors CRISPR pam_filter's multi-tile fan-out, with
-# kmer-counting-specific deviations spelled out in the contract's
-# "Deviations from CRISPR pattern" section):
+# ---------------------------------------------------------------------------
+# Topology revision (2026-04-28, T11-driven; codified in T1 contract
+# "Topology revision (2026-04-28)" section).
+# ---------------------------------------------------------------------------
 #
-#   shim ──seq_in── (broadcast) ──→ tile_0 .. tile_{N-1}
-#                                       │
-#                                       ▼
-#                                   partial_count_<i>
-#                                       │
-#                                       ▼
-#                                   aggregator
-#                                       │
-#                                       ▼
-#                                   sparse_out ── shim
+# The original T8 wired N_TILES per-tile partial ObjectFifos directly into
+# a single aggregator CoreTile worker. T11's silicon build at n_tiles=4
+# failed with:
 #
-# Per-tile body invokes external Kernel ``kmer_count_tile_k{K}`` (one
-# of three k values — 15, 21, 31). Aggregator body invokes the
-# k-independent external Kernel ``kmer_count_aggregator``.
+#     'aie.tile' op number of input DMA channel exceeded!
 #
-# Multi-tile fan-out is governed by ``BIONPU_KMER_COUNT_LAUNCH_CHUNKS``
-# (default 4, valid in {1, 2, 4, 8}) — same shape as
-# pam_filter.py:235-240 but with a different default (kmer's production
-# fan-out is 4-tile vs CRISPR's 1-tile per the contract's deviation
-# table).
+# AM020 Ch. 2 p. 27 documents the AIE2P CoreTile DMA budget as 2 input
+# (S2MM) channels per tile. Direct fan-in of >2 partial FIFOs to one
+# CoreTile is therefore unbuildable. The contract now mandates routing
+# the partial fan-in through the **memtile** instead — AM020 Ch. 5 p. 74
+# documents memtile DMA as 6 S2MM + 6 MM2S channels with native 5D
+# address-generation concatenation (Figure 22).
 #
-# Burst-length monkey-patch ``_maybe_install_burst_length_override()``
-# mirrors pam_filter.py:187-233. The allowed-values set is
-# {0, 64, 128, 256, 512} — note the exclusion of 1024 per the AM020
-# falsification finding (memory: cascade-burst-length-falsified-2026-04-28).
+# The memtile-aggregated combine pattern is silicon-validated in
+#   bionpu-public/src/bionpu/kernels/crispr/match_multitile_memtile/
+#       multitile_memtile.py        (the .prod().join() call, lines 195-199)
+#       DESIGN.md                   (the 4-into-1 budget rationale)
+#
+# We mirror it exactly here:
+#
+#   shim ──seq_in── (broadcast) ──→ tile_0 .. tile_{N_TILES-1}
+#   tile_i ──sparse_out (slot i, named "partial_count_<i>")── memtile
+#                                                                  │
+#                                                                  ▼
+#                                                     memtile reorganises
+#                                                     via 5D addr-gen
+#                                                                  │
+#                                                                  ▼
+#                                                              shim
+#
+# The memtile slot for tile i is named "partial_count_<i>" so the
+# pinned ObjectFifo names in T1 §"ObjectFifo names" remain stable from
+# the producer's perspective. The aggregator CoreTile (T6's
+# kmer_count_aggregator.cc) is bypassed for v1 — its source file remains
+# on disk for a possible v1.1 (memtile-resident table partition) but it
+# is NOT linked into the v1 xclbin. Host runner T7 performs ALL
+# host-side dedup-by-canonical_u64 across n_tiles partial slots via its
+# existing reaggregate_records() pass.
+#
+# ---------------------------------------------------------------------------
+# Per-k chunk alignment fix (T11-driven, 2026-04-28).
+# ---------------------------------------------------------------------------
+#
+# The aiecc lowering enforces a 4-byte alignment on `aie.dma_bd` payload
+# sizes. The original SEQ_IN_OVERLAP_K21=5 yielded a chunk size of
+# 4096+5=4101 (not 4-byte aligned) and aiecc rejected it. Bumped to 8
+# (which still covers all 20 needed overlap bases for k=21 with slack);
+# k=15 stays at 4 (4096+4=4100, 4-aligned); k=31 stays at 8 (4096+8=4104,
+# 4-aligned). All three chunk sizes now satisfy the alignment constraint.
+#
+# ---------------------------------------------------------------------------
+# Per-tile count-table sizing fix (T11-driven, 2026-04-28).
+# ---------------------------------------------------------------------------
+#
+# The original HASH_BUCKETS_PER_TILE=4096 produced a 49152-byte partial
+# ObjectFifo element. With depth=2 ping-pong that is 96 KiB on the
+# producer tile — exceeds the 64 KiB AIE2P CoreTile DM cap. Reduced to
+# 1024 buckets * 12 B = 12 KiB; depth=2 ping-pong is 24 KiB; total tile
+# DM ~50 KiB fits with comfortable headroom. The collision rate is
+# higher at this sizing but the emit-on-evict overflow policy + host
+# re-aggregation absorb it (T17 measures the realised rate).
+#
+# ---------------------------------------------------------------------------
+# Burst-length monkey-patch.
+# ---------------------------------------------------------------------------
+#
+# Activate by setting BIONPU_KMER_COUNT_SHIM_BURST_LENGTH in the
+# environment to one of {0, 64, 128, 256, 512} (NOT 1024 — see memory
+# `cascade-burst-length-falsified-2026-04-28`). Default behaviour
+# preserves the IRON default.
 #
 # CLI: ``python3 kmer_count.py -d npu2 --k 21 --launch-chunks 4`` emits
 # MLIR to stdout. The Makefile (T10) drives it for all 12 (k, n_tiles)
@@ -60,9 +106,10 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
 # (c) Copyright 2026 Matt Davis. Derived from
-# bionpu/kernels/crispr/pam_filter/pam_filter.py — same multi-tile
-# dataflow shape, with PAM-filter and match-tile machinery replaced
-# by the per-tile k-mer counting + aggregator pair.
+# bionpu/kernels/crispr/pam_filter/pam_filter.py (multi-tile fan-out
+# scaffold) and bionpu/kernels/crispr/match_multitile_memtile/
+# multitile_memtile.py (memtile-aggregated combine; the proven 4-into-1
+# fan-in pattern this file mirrors).
 
 import argparse
 import os as _os
@@ -77,20 +124,6 @@ from aie.iron.device import NPU2, NPU1Col1
 # ---------------------------------------------------------------------------
 # Burst-length override (per pam_filter.py:187-233 + AM020 falsification).
 # ---------------------------------------------------------------------------
-#
-# Item 3's dispatch_overhead_bisector found AIE2P shim DMA exhibits a
-# ~2.37 s/launch firmware-TDR penalty per shim BD whose payload is
-# <=256 B, additive across BDs in one launch. AM020 documents AIE-ML
-# shim DMA burst lengths {64, 256, 512, 1024} B. The IRON
-# `aiex.shim_dma_single_bd_task` wrapper hardcodes burst_length=0
-# (firmware interprets as "highest available" = 1024 B). The cliff
-# aligns with the 256/512-byte burst-length boundary.
-#
-# Activate by setting ``BIONPU_KMER_COUNT_SHIM_BURST_LENGTH`` in the
-# environment to one of {0, 64, 128, 256, 512} (NOT 1024 — see memory
-# `cascade-burst-length-falsified-2026-04-28` for the falsification
-# log). Default behaviour (no env var, or =0) preserves the IRON
-# default of 1024 B.
 def _maybe_install_burst_length_override() -> int:
     """Install a DMATask.resolve override per BIONPU_KMER_COUNT_SHIM_BURST_LENGTH.
 
@@ -117,11 +150,6 @@ def _maybe_install_burst_length_override() -> int:
     if bl == 0:
         return 0
 
-    # Monkey-patch DMATask.resolve. Identical structure to
-    # pam_filter.py:_maybe_install_burst_length_override — the original
-    # IRON implementation calls shim_dma_single_bd_task(...) with a
-    # hardcoded burst_length=0; we replace it with one that forwards
-    # the env-var value.
     from aie.dialects._aiex_ops_gen import dma_start_task  # type: ignore
     from aie.dialects.aiex import shim_dma_single_bd_task
     from aie.iron.runtime import dmatask as _dmatask_mod  # type: ignore
@@ -146,30 +174,25 @@ def _maybe_install_burst_length_override() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Pinned constants (per state/kmer_count_interface_contract.md).
+# Pinned constants (per state/kmer_count_interface_contract.md REVISED 2026-04-28).
 # ---------------------------------------------------------------------------
 
-# Multi-tile fan-out. Default 4 (kmer's production fan-out per the
-# contract's deviation table — CRISPR defaults to 1 because its
-# downstream consumer is host-side; kmer's hash-table-bound per-tile
-# work parallelises naturally).
 LAUNCH_CHUNKS = int(_os.environ.get("BIONPU_KMER_COUNT_LAUNCH_CHUNKS", "4"))
 if LAUNCH_CHUNKS not in (1, 2, 4, 8):
     raise ValueError(
         f"BIONPU_KMER_COUNT_LAUNCH_CHUNKS={LAUNCH_CHUNKS} not in {{1, 2, 4, 8}}"
     )
 
-# N_TILES is the per-launch number of match tiles (the per-tile body
-# pinned by `kmer_count_tile_k{K}`). Mirrors pam_filter.py's N_MATCH_TILES
-# but here it is driven by the LAUNCH_CHUNKS env var so the same source
-# emits all four artifact variants ({n1, n2, n4, n8}).
+# N_TILES is the per-launch number of match tiles (one CoreTile per tile,
+# all writing into per-slot memtile buffers via the .join() fan-in).
 N_TILES = LAUNCH_CHUNKS
 
-# Streaming chunk + overlap protocol.
+# Streaming chunk + overlap protocol (REVISED 2026-04-28 for 4-byte
+# aiecc alignment — k=21 was 5, now 8).
 SEQ_CHUNK_BYTES = 4096       # base chunk (matches T1 + T7's runner)
-SEQ_OVERLAP_K15 = 4          # ceil((15-1)/4)
-SEQ_OVERLAP_K21 = 5          # ceil((21-1)/4)
-SEQ_OVERLAP_K31 = 8          # ceil((31-1)/4)
+SEQ_OVERLAP_K15 = 4          # 4096+4 = 4100 (4-byte aligned)
+SEQ_OVERLAP_K21 = 8          # 4096+8 = 4104 (4-byte aligned, was 5 — bumped)
+SEQ_OVERLAP_K31 = 8          # 4096+8 = 4104 (4-byte aligned)
 
 _OVERLAP_BY_K = {
     15: SEQ_OVERLAP_K15,
@@ -177,24 +200,25 @@ _OVERLAP_BY_K = {
     31: SEQ_OVERLAP_K31,
 }
 
-# Per-tile count-table geometry (matches kmer_count_constants.h).
-# 4096 buckets * 12 B/record = 48 KiB. Drained per-chunk into the
-# partial_count_<i> ObjectFifo; the aggregator merges + length-prefixes
-# into the sparse_out ring slot.
-HASH_BUCKETS_PER_TILE = 4096
+# Per-tile count-table geometry (REVISED 2026-04-28: 4096 -> 1024
+# buckets, see top-of-file note + T1 §"Per-tile element types and shapes").
+# 1024 buckets * 12 B/record = 12 KiB primary table; with depth=2 ping-pong
+# on the partial ObjectFifo (24 KiB) and seq_in chunk (~8 KiB) total tile
+# DM is ~50 KiB — fits the 64 KiB AIE2P CoreTile DM cap with headroom for
+# stack and code.
+HASH_BUCKETS_PER_TILE = 1024
 COUNT_RECORD_BYTES = 12
-PARTIAL_OUT_BYTES = HASH_BUCKETS_PER_TILE * COUNT_RECORD_BYTES   # 49152
+PARTIAL_OUT_BYTES = HASH_BUCKETS_PER_TILE * COUNT_RECORD_BYTES   # 12288
 
-# Sparse-emit ring slot (Tile Z output). 1024 records * 16 B/record =
-# 16384 B per slot. Mirrors CRISPR post-fix EMIT_SLOT_RECORDS=1024.
+# Sparse-emit ring slot constants — preserved for documentation /
+# host-side parity but NO LONGER USED in the v1 dataflow. The memtile
+# join writes raw partials of PARTIAL_OUT_BYTES per slot directly to
+# the shim; T7 host runner performs the dedup-by-canonical_u64 pass.
 EMIT_RECORD_BYTES = 16
 EMIT_SLOT_RECORDS = 1024
 EMIT_SLOT_BYTES = EMIT_RECORD_BYTES * EMIT_SLOT_RECORDS          # 16384
 
-# How many input chunks one xclbin launch processes. The host runner
-# (T7) submits one launch per (n_chunks_in_input // LAUNCH_CHUNKS)
-# stride. Per-chunk we read SEQ_CHUNK_BYTES + overlap bytes from
-# seq_in.
+# How many input chunks one xclbin launch processes.
 N_CHUNKS_PER_LAUNCH = LAUNCH_CHUNKS
 
 
@@ -210,79 +234,71 @@ def kmer_count(dev, *, k: int = 21):
         k: One of {15, 21, 31}. Selects the per-tile external Kernel
             symbol ``kmer_count_tile_k{k}``.
 
-    Topology:
+    Topology (memtile-aggregated combine — see top-of-file rationale):
 
         shim ──seq_in── (broadcast) ──→ tile_0 .. tile_{N_TILES-1}
-                                            │
-                                            ▼
-                                        partial_count_<i>
-                                            │
-                                            ▼
-                                        aggregator
-                                            │
-                                            ▼
-                                        sparse_out ── shim
+        tile_i ──partial_count_<i> (slot i of joined sparse_out)── memtile
+                                                                       │
+                                                                       ▼
+                                                                  shim drain
+
+    Mirrors `crispr/match_multitile_memtile/multitile_memtile.py`'s
+    `outC.prod().join(of_offsets, obj_types=[partial_ty]*n_cores,
+    names=...)` call exactly.
     """
     if k not in (15, 21, 31):
         raise ValueError(f"k must be in {{15, 21, 31}}, got {k!r}")
 
     overlap_bytes = _OVERLAP_BY_K[k]
-    seq_in_chunk_bytes = SEQ_CHUNK_BYTES + overlap_bytes
+    seq_in_chunk_bytes = SEQ_CHUNK_BYTES + overlap_bytes  # 4100 / 4104 / 4104
+    if seq_in_chunk_bytes % 4 != 0:
+        raise AssertionError(
+            f"seq_in chunk size {seq_in_chunk_bytes} not 4-byte aligned "
+            f"(k={k}, overlap={overlap_bytes}); aiecc dma_bd will reject"
+        )
 
     # ----- whole-runtime tensor types (host-visible flat buffers) -----
     # Per-launch input buffer holds N_CHUNKS_PER_LAUNCH chunks, each of
-    # (SEQ_CHUNK_BYTES + overlap) bytes. The host runner (T7) prepares
-    # the overlap copies between adjacent chunks before submitting the
-    # BO so no inter-chunk fixup is required on-tile.
+    # (SEQ_CHUNK_BYTES + overlap) bytes.
     seq_in_size = N_CHUNKS_PER_LAUNCH * seq_in_chunk_bytes
 
-    # Sparse output is drained as one fixed-size ring slot per
-    # (tile, chunk) pair. The aggregator emits one slot per chunk that
-    # carries up to EMIT_SLOT_RECORDS records merged across all
-    # N_TILES partials.
-    sparse_out_size = N_CHUNKS_PER_LAUNCH * EMIT_SLOT_BYTES
+    # Sparse output is the joined memtile buffer — N_TILES partials of
+    # PARTIAL_OUT_BYTES each, contiguous. The host runner reads this as
+    # `n_tiles` discrete count-table blobs and performs the dedup-merge
+    # by canonical_u64 host-side.
+    joined_partial_bytes = N_TILES * PARTIAL_OUT_BYTES               # n_tiles * 12288
+    sparse_out_size = N_CHUNKS_PER_LAUNCH * joined_partial_bytes
 
     seq_in_ty = np.ndarray[(seq_in_size,), np.dtype[np.uint8]]
     sparse_out_ty = np.ndarray[(sparse_out_size,), np.dtype[np.uint8]]
 
     # ----- per-tile element types -----
     seq_chunk_ty = np.ndarray[(seq_in_chunk_bytes,), np.dtype[np.uint8]]
-    partial_chunk_ty = np.ndarray[(PARTIAL_OUT_BYTES,), np.dtype[np.uint8]]
-    sparse_chunk_ty = np.ndarray[(EMIT_SLOT_BYTES,), np.dtype[np.uint8]]
+    partial_chunk_ty = np.ndarray[(PARTIAL_OUT_BYTES,), np.dtype[np.uint8]]   # 12288
+    joined_chunk_ty = np.ndarray[(joined_partial_bytes,), np.dtype[np.uint8]]  # n_tiles*12288
 
-    # ----- external kernel functions (compiled C++) -----
+    # ----- external kernel function (compiled C++) -----
     # Per-tile kernel: one symbol per supported k. T1 contract pins
     # the signature as
     #   (uint8* packed_in, uint8* partial_out, int32 n_input_bytes,
     #    int32 bucket_lo, int32 bucket_hi)
-    # which matches the IRON Kernel(...) declaration here byte-for-byte.
     tile_symbol = f"kmer_count_tile_k{k}"
     tile_fn = Kernel(
         tile_symbol,
         "kmer_count_tile.o",
         [
             seq_chunk_ty,                  # packed_in (chunk + overlap bytes)
-            partial_chunk_ty,              # partial_out (48 KiB count table)
+            partial_chunk_ty,              # partial_out (12 KiB count table)
             np.int32,                      # n_input_bytes
             np.int32,                      # bucket_lo
             np.int32,                      # bucket_hi
         ],
     )
 
-    # Aggregator kernel — k-independent. T1 contract pins the
-    # signature as up to MAX_TILES=8 partial inputs + sparse_out + n_tiles_active.
-    # We declare exactly N_TILES partial-input arguments here (the
-    # aggregator's static signature widens at compile time per
-    # the `partial_chunk_ty * N_TILES` expansion). Unused inputs
-    # in <8-tile builds are not declared at this layer; the C++ side
-    # has the wider 8-input signature and zeros unused inputs at
-    # host-dispatch time per the contract.
-    agg_args = [partial_chunk_ty] * N_TILES + [sparse_chunk_ty, np.int32]
-    agg_fn = Kernel(
-        "kmer_count_aggregator",
-        "kmer_count_aggregator.o",
-        agg_args,
-    )
+    # NOTE: kmer_count_aggregator is intentionally NOT declared as a
+    # Kernel here — the v1 build bypasses the aggregator CoreTile in
+    # favour of memtile-aggregated combine. The C++ source remains on
+    # disk for a possible v1.1 (memtile-resident table partition).
 
     # ----- ObjectFifos -----
     # seq_in: shim → broadcast to all N_TILES match tiles. depth=2 so
@@ -290,22 +306,29 @@ def kmer_count(dev, *, k: int = 21):
     # chunk.
     of_seq_in = ObjectFifo(seq_chunk_ty, name="seq_in", depth=2)
 
-    # partial_count_<i>: per-tile → aggregator. Names pinned by T1.
-    of_partials = [
-        ObjectFifo(partial_chunk_ty, name=f"partial_count_{i}", depth=2)
-        for i in range(N_TILES)
-    ]
+    # sparse_out: memtile-aggregated joiner FIFO. Memtile is the fan-in
+    # target (NOT a CoreTile aggregator). `.prod().join(...)` splits the
+    # producer side into N_TILES per-tile slots, each named
+    # `partial_count_<i>`; memtile reorganises via 5D address generation
+    # into a single contiguous joined_chunk_ty, which is MM2S'd to shim.
+    of_sparse = ObjectFifo(joined_chunk_ty, name="sparse_out", depth=2)
 
-    # sparse_out: aggregator → shim. depth=2 to keep the drain BD
-    # in flight.
-    of_sparse = ObjectFifo(sparse_chunk_ty, name="sparse_out", depth=2)
+    # Per-tile join offsets in bytes: tile i's PARTIAL_OUT_BYTES partial
+    # lands at byte offset i * PARTIAL_OUT_BYTES in the joined buffer.
+    join_offsets = [i * PARTIAL_OUT_BYTES for i in range(N_TILES)]
+
+    partial_fifos = of_sparse.prod().join(
+        join_offsets,
+        obj_types=[partial_chunk_ty] * N_TILES,
+        names=[f"partial_count_{i}" for i in range(N_TILES)],
+    )
 
     # ----- per-tile worker bodies (one per match tile) -----
     # Each tile owns the full HASH_BUCKETS_PER_TILE bucket range for
     # its share of input chunks. The bucket_lo / bucket_hi args are
     # there for a future memtile-resident table partition (gaps.yaml
     # T18); for v1 each tile uses [0, HASH_BUCKETS_PER_TILE) and the
-    # aggregator dedups by canonical_u64.
+    # host runner dedups by canonical_u64.
     def tile_body(of_seq, of_partial, kernel_fn):
         for _ in range_(N_CHUNKS_PER_LAUNCH):
             elem_seq = of_seq.acquire(1)
@@ -325,44 +348,19 @@ def kmer_count(dev, *, k: int = 21):
             tile_body,
             fn_args=[
                 of_seq_in.cons(),
-                of_partials[i].prod(),
+                partial_fifos[i].prod(),
                 tile_fn,
             ],
         )
         for i in range(N_TILES)
     ]
 
-    # ----- aggregator worker body -----
-    # Drains one partial-table-per-tile per chunk, dedup-merges by
-    # canonical_u64, and emits a length-prefixed sparse ring slot to
-    # the shim. The C++ aggregator handles eviction-flag passthrough
-    # and host-side re-aggregation per the T1 contract.
-    def aggregator_body(*args):
-        # args layout (matches agg_args declaration order):
-        #   partial_0..partial_{N_TILES-1}, sparse_out, agg_kernel
-        partials_in = args[:N_TILES]
-        of_out = args[N_TILES]
-        kernel_fn = args[N_TILES + 1]
-        for _ in range_(N_CHUNKS_PER_LAUNCH):
-            partial_elems = [p.acquire(1) for p in partials_in]
-            elem_out = of_out.acquire(1)
-            kernel_fn(*partial_elems, elem_out, N_TILES)
-            for p in partials_in:
-                p.release(1)
-            of_out.release(1)
-
-    aggregator_worker = Worker(
-        aggregator_body,
-        fn_args=(
-            [of_partials[i].cons() for i in range(N_TILES)]
-            + [of_sparse.prod(), agg_fn]
-        ),
-    )
-
     # ----- runtime sequence (shim DMA in/out) -----
+    # Memtile MM2S → shim drains the joined buffer directly, mirroring
+    # `multitile_memtile.py:236` (`rt.drain(of_out.cons(), Out, wait=True)`).
     rt = Runtime()
     with rt.sequence(seq_in_ty, sparse_out_ty) as (S, Out):  # noqa: N806
-        rt.start(*tile_workers, aggregator_worker)
+        rt.start(*tile_workers)
         rt.fill(of_seq_in.prod(), S)
         rt.drain(of_sparse.cons(), Out, wait=True)
 
@@ -403,11 +401,7 @@ def main():
     )
     opts = p.parse_args(sys.argv[1:])
 
-    # CLI flag overrides the env-var-driven module-level default. We
-    # rebind the module-level globals so the IRON builder picks up the
-    # CLI value. (This mirrors pam_filter.py's pattern of reading the
-    # env var at import time but allowing the builder to consume the
-    # current value.)
+    # CLI flag overrides the env-var-driven module-level default.
     if opts.launch_chunks is not None:
         LAUNCH_CHUNKS = opts.launch_chunks
         N_TILES = LAUNCH_CHUNKS

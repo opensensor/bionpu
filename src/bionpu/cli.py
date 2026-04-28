@@ -679,6 +679,115 @@ def _cmd_kmer_count(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_trim(args: argparse.Namespace) -> int:
+    """Trim 3' adapters from FASTQ reads (bionpu trim v0).
+
+    First production composition built on top of the
+    silicon-validated CRISPR-shape primitives. Wraps
+    :class:`bionpu.kernels.genomics.primer_scan.BionpuPrimerScan` v0
+    with FASTQ I/O and per-read trim post-processing. Mirrors
+    ``cutadapt -a ADAPTER --no-indels -e 0`` semantics:
+
+    * Forward-strand exact match anywhere in the read.
+    * Trim at the leftmost match position (drop adapter + 3' tail).
+    * Per-read silicon dispatch (subprocess; npu_silicon_lock-wrapped).
+    * Reads with non-ACGT bases fall back to the CPU oracle so
+      cutadapt's "non-ACGT resets the rolling state" semantic is
+      preserved.
+
+    See :mod:`bionpu.genomics.adapter_trim` for the in-process API.
+    """
+    from .genomics.adapter_trim.cli import run_cli
+
+    return run_cli(args)
+
+
+def _cmd_crispr_design(args: argparse.Namespace) -> int:
+    """End-to-end CRISPR guide design (PRD-guide-design-on-xdna v0.2 Tier 1).
+
+    Wires the five-stage pipeline (target resolution -> PAM scan ->
+    off-target scan -> on/off-target scoring -> rank+emit) for
+    Mode A (gene symbol) input and TSV output. See
+    :func:`bionpu.genomics.crispr_design.design_guides_for_target` for
+    the in-process API and the Tier 1 scope-narrowing notes.
+    """
+    from .genomics.crispr_design import (
+        DEFAULT_GC_MAX,
+        DEFAULT_GC_MIN,
+        DEFAULT_MAX_MISMATCHES,
+        DEFAULT_TOP_N,
+        GeneNotFoundError,
+        design_guides_for_target,
+    )
+
+    fasta_path = pathlib.Path(args.fasta or _default_grch38_fasta())
+    if not fasta_path.is_file():
+        print(
+            f"bionpu crispr design: reference FASTA not found at "
+            f"{fasta_path!s}. Pass --fasta <path-to-grch38.fa> to override "
+            f"(Tier 1 default looks at "
+            f"data_cache/genomes/grch38/hg38.fa).",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        result = design_guides_for_target(
+            target=args.target,
+            genome=args.genome,
+            fasta_path=fasta_path,
+            top_n=int(args.top),
+            max_mismatches=int(args.mismatches),
+            gc_min=float(args.gc_min),
+            gc_max=float(args.gc_max),
+            device=args.device,
+            rank_by=args.rank_by,
+            silicon_lock_label=args.silicon_lock_label,
+        )
+    except GeneNotFoundError as exc:
+        print(f"bionpu crispr design: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"bionpu crispr design: {exc}", file=sys.stderr)
+        return 2
+
+    if args.output and args.output != "-":
+        out_path = pathlib.Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(result.tsv_bytes)
+        print(
+            f"bionpu crispr design: wrote {len(result.ranked)} ranked "
+            f"guides to {out_path} "
+            f"(target={result.target.gene} "
+            f"{result.target.chrom}:{result.target.start}-{result.target.end}, "
+            f"locus={result.target.length:,} bp, "
+            f"candidates={result.n_candidates_total}, "
+            f"off_target_hits={result.n_off_target_hits})",
+            file=sys.stderr,
+        )
+        for stage, secs in result.stage_timings_s.items():
+            print(f"  stage {stage}: {secs:.3f}s", file=sys.stderr)
+    else:
+        sys.stdout.buffer.write(result.tsv_bytes)
+    return 0
+
+
+def _default_grch38_fasta() -> pathlib.Path:
+    """Tier 1 default reference path.
+
+    Resolves to ``$BIONPU_GRCH38_FASTA`` if set, else the in-tree cache
+    path ``data_cache/genomes/grch38/hg38.fa``. Production callers
+    should pass ``--fasta`` explicitly; this default is a developer
+    convenience.
+    """
+    import os
+
+    env = os.environ.get("BIONPU_GRCH38_FASTA")
+    if env:
+        return pathlib.Path(env)
+    return pathlib.Path("data_cache/genomes/grch38/hg38.fa")
+
+
 def _cmd_not_implemented(args: argparse.Namespace) -> int:
     print(
         f"bionpu {args.cmd}: not yet implemented in v0.1. "
@@ -1128,6 +1237,161 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_kmer.set_defaults(func=_cmd_kmer_count)
 
+    # trim — adapter trimming (bionpu trim v0; primer_scan composition).
+    # The arg flags mirror the standalone CLI in
+    # bionpu.genomics.adapter_trim.cli so users can swap freely.
+    p_trim = sub.add_parser(
+        "trim",
+        help=(
+            "Trim 3' adapters from FASTQ reads using AIE2P silicon "
+            "(primer_scan v0 composition). cutadapt -a compatible."
+        ),
+    )
+    p_trim.add_argument(
+        "--adapter", "-a",
+        default="AGATCGGAAGAGC",
+        help=(
+            "Adapter sequence to trim. Length must be 13, 20, or 25 "
+            "(silicon-pinned primer lengths). Default: AGATCGGAAGAGC "
+            "(TruSeq P5)."
+        ),
+    )
+    p_trim.add_argument(
+        "--in", dest="in_path", required=True,
+        help="Input FASTQ path. Gzip auto-detected by .gz suffix.",
+    )
+    p_trim.add_argument(
+        "--out", dest="out_path", required=True,
+        help="Output FASTQ path. Gzip auto-detected by .gz suffix.",
+    )
+    p_trim.add_argument(
+        "--device", choices=["cpu", "npu"], default="npu",
+        help=(
+            "Compute device. cpu = CPU oracle reference; "
+            "npu = AIE2P silicon (subprocess host_runner; "
+            "npu_silicon_lock-wrapped). Default: npu."
+        ),
+    )
+    p_trim.add_argument(
+        "--n-tiles", type=int, choices=[1, 2, 4, 8], default=4,
+        help="NPU tile fan-out (ignored on --device cpu). Default: 4.",
+    )
+    p_trim.add_argument(
+        "--no-progress", action="store_true",
+        help="Suppress periodic progress reports on stderr.",
+    )
+    p_trim.add_argument(
+        "--quiet", action="store_true",
+        help="Also suppress the post-run summary on stderr.",
+    )
+    p_trim.set_defaults(func=_cmd_trim)
+
+    # crispr — umbrella for the end-to-end guide design wrapper
+    # (PRD-guide-design-on-xdna v0.2). The two-level shape (`bionpu
+    # crispr design ...`) leaves room for siblings (`bionpu crispr
+    # screen`, `bionpu crispr verify`, ...) without further reshuffles.
+    p_crispr = sub.add_parser(
+        "crispr",
+        help=(
+            "CRISPR end-to-end guide design wrapper (Tier 1: BRCA1 only, "
+            "TSV output, locus-scope off-target scan)."
+        ),
+    )
+    sub_crispr = p_crispr.add_subparsers(dest="crispr_kind")
+
+    p_c_design = sub_crispr.add_parser(
+        "design",
+        help=(
+            "Enumerate candidate guides for a target gene, score on/off-"
+            "target activity, and emit a ranked TSV."
+        ),
+    )
+    p_c_design.add_argument(
+        "--target",
+        required=True,
+        help=(
+            "Gene symbol (Mode A; PRD §3.1). Tier 1: BRCA1 is the only "
+            "gene wired into the resolver. Mode B (chrN:start-end) and "
+            "Mode C (--target-fasta) are deferred to follow-up agents."
+        ),
+    )
+    p_c_design.add_argument(
+        "--genome",
+        default="GRCh38",
+        choices=["GRCh38"],
+        help="Reference build. Tier 1: only GRCh38 is wired.",
+    )
+    p_c_design.add_argument(
+        "--fasta",
+        default=None,
+        help=(
+            "Path to the GRCh38 reference FASTA. Defaults to "
+            "$BIONPU_GRCH38_FASTA, then to the in-tree cache "
+            "data_cache/genomes/grch38/hg38.fa."
+        ),
+    )
+    p_c_design.add_argument(
+        "--top",
+        type=int,
+        default=10,  # Tier 1 brief; PRD §3.1 default is 20.
+        help="Emit the top-N ranked guides. Default 10 (Tier 1).",
+    )
+    p_c_design.add_argument(
+        "--mismatches",
+        type=int,
+        default=4,
+        help="Maximum off-target mismatches considered. Default 4.",
+    )
+    p_c_design.add_argument(
+        "--gc-min",
+        type=float,
+        default=25.0,
+        help="GC%% lower bound for the LOW_GC advisory flag. Default 25.",
+    )
+    p_c_design.add_argument(
+        "--gc-max",
+        type=float,
+        default=75.0,
+        help="GC%% upper bound for the HIGH_GC advisory flag. Default 75.",
+    )
+    p_c_design.add_argument(
+        "--rank-by",
+        default="crispor",
+        choices=["crispor", "bionpu"],
+        help=(
+            "Composite score that drives the top-N sort. Default "
+            "'crispor' (mimic CRISPOR's CLI). 'bionpu' uses the "
+            "v1 baseline linear re-weight of RS1+CFD (PRD §7.1 Q5)."
+        ),
+    )
+    p_c_design.add_argument(
+        "--device",
+        default="cpu",
+        choices=["cpu", "npu"],
+        help=(
+            "Compute device for the PAM/off-target scan stages. Default "
+            "'cpu' (numpy reference path) for Tier 1; 'npu' wraps every "
+            "silicon submission in bionpu.dispatch.npu_silicon_lock per "
+            "CLAUDE.md non-negotiable, and requires the precompiled "
+            "CRISPR xclbins under bionpu/dispatch/_npu_artifacts/."
+        ),
+    )
+    p_c_design.add_argument(
+        "--silicon-lock-label",
+        default=None,
+        help=(
+            "Optional label written to the NPU silicon lock PID sidecar "
+            "(/tmp/bionpu-npu-silicon.pid). Defaults to "
+            "`bionpu_crispr_design:{gene}`."
+        ),
+    )
+    p_c_design.add_argument(
+        "--output",
+        default="-",
+        help="Output TSV path. '-' (default) writes to stdout.",
+    )
+    p_c_design.set_defaults(func=_cmd_crispr_design)
+
     # placeholders — scope for v0.3+
     for name, help_text in (
         ("basecall", "Nanopore basecalling (v0.2+ scope)"),
@@ -1145,7 +1409,11 @@ def main(argv: list[str] | None = None) -> int:
         p.print_help()
         return 0
     # Print sub-subcommand help when invoked without one.
-    for parent_cmd, kind_attr in (("verify", "verify_kind"), ("bench", "bench_kind")):
+    for parent_cmd, kind_attr in (
+        ("verify", "verify_kind"),
+        ("bench", "bench_kind"),
+        ("crispr", "crispr_kind"),
+    ):
         if args.cmd == parent_cmd and getattr(args, kind_attr, None) is None:
             for action in p._subparsers._actions:  # type: ignore[attr-defined]
                 if isinstance(action, argparse._SubParsersAction):

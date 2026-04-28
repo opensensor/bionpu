@@ -1,0 +1,57 @@
+# gaps.yaml — toolchain-gap report (minimizer kernel).
+# Schema: bionpu/report/gaps.schema.json (v1.0.0).
+# Convention: bionpu/kernels/GAPS-CONVENTION.md.
+#
+# v0 ships two silicon-validated cells (k=15, w=10) and (k=21, w=11)
+# at n_tiles=4. Smoke byte-equal: PASS for both. chr22 (k=15, w=10)
+# top-1000 byte-equal: PASS. Full chr22 byte-equal blocked by the
+# per-chunk emit cap below (a kernel-design issue, not a toolchain
+# gap, but recorded here for v1 routing).
+
+schema_version: "1.0.0"
+task_id: ""
+kernel_name: "bionpu_minimizer"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-28T12:30:07+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+
+gaps:
+  - id: "minimizer-emit-cap-saturation"
+    category: "expressibility"
+    op_or_pattern: "per-tile MZ_MAX_EMIT_IDX cap on real DNA"
+    attempted: |
+      v0 builds the kernel with MZ_PARTIAL_OUT_BYTES_PADDED=32768 and
+      MZ_RECORD_BYTES=16, leaving a per-slot capacity of (32768 - 4) /
+      16 = 2047 records. We round down to MZ_MAX_EMIT_IDX=2046 for
+      header-tail safety. On synthetic smoke_10kbp this fits (1983
+      records at k=15,w=10; 1836 at k=21,w=11). On chr22 the oracle
+      averages 6451 records per 16K-base chunk (3.15x over-cap; max
+      observed 16384 — full saturation). The kernel correctly emits
+      the FIRST 2046 records per chunk and drops the rest, producing
+      a top-N byte-equal result but a 68%-truncated full output.
+    failed_with: |
+      First divergence at output index 2046 (chunk 0 boundary). Full
+      chr22 silicon emits = 6,358,968 vs oracle 20,011,268 (silicon
+      ≈ 3102 chunks × 2046 cap). Top-1000 byte-equal: 1000/1000.
+      Smoke (k=15, w=10) byte-equal: 1983/1983 PASS.
+      Smoke (k=21, w=11) byte-equal: 1836/1836 PASS.
+    workaround: |
+      Two v1 paths (independent):
+        (a) reduce SEQ_IN_CHUNK_BYTES_BASE from 4096 to 1024 (4x more
+            chunks, 4x lower per-chunk emit density). Increases host
+            dispatch overhead linearly but keeps the kernel layout
+            byte-equal.
+        (b) widen MZ_PARTIAL_OUT_BYTES_PADDED from 32 KiB to 128 KiB
+            (4x more records per slot). Costs more CoreTile DM and
+            stretches the join-output ObjectFifo. Cleaner answer
+            architecturally; needs a tile-DM budget audit.
+      Either fix is mechanical; the kernel arithmetic is byte-equal as
+      proven by the smoke and top-1000 chr22 results.
+    severity: "medium"
+    blocks_v1_ship: false
+    notes: |
+      v0 ship gate is silicon byte-equal on smoke; that PASSES. chr22
+      partial result (top-1000 byte-equal) is a v0 stretch goal. The
+      strategic-pivot validation point — that AIE2P is a fit for
+      sliding-window canonical math — is established.

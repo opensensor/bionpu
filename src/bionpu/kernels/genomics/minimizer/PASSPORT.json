@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0.0",
+  "kernel_name": "bionpu_minimizer",
+  "target": "aie2p",
+  "compiler": "peano",
+  "build_date": "2026-04-28T12:30:07Z",
+  "host": "matteius-ProArt-P16-H7606WI",
+  "hardware_signature": "x86_64;Ryzen-AI-9-HX-370;npu=AIE2P;6x8",
+  "generated_at_iso8601": "2026-04-28T12:30:07Z",
+  "supported_kw": [[15, 10], [21, 11]],
+  "supported_n_tiles": [1, 2, 4, 8]
+}

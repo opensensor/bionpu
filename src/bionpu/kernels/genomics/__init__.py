@@ -140,11 +140,112 @@ def get_kmer_count_op(
     return BionpuKmerCount(k=int(k), n_tiles=int(n_tiles))
 
 
+# --------------------------------------------------------------------------- #
+# Minimizer kernel helper (v0 — 2 registry entries: (k=15,w=10) + (k=21,w=11)).
+# --------------------------------------------------------------------------- #
+
+MINIMIZER_LAUNCH_CHUNKS_ENV = "BIONPU_MINIMIZER_LAUNCH_CHUNKS"
+MINIMIZER_VALID_KW: tuple[tuple[int, int], ...] = ((15, 10), (21, 11))
+MINIMIZER_VALID_N_TILES: tuple[int, ...] = (1, 2, 4, 8)
+MINIMIZER_DEFAULT_K: int = 15
+MINIMIZER_DEFAULT_W: int = 10
+MINIMIZER_DEFAULT_N_TILES: int = 4
+
+
+def _minimizer_op_name(k: int, w: int) -> str:
+    """Return the ``NPU_OPS`` registry key for (k, w) minimizer extraction."""
+    return f"bionpu_minimizer_k{int(k)}_w{int(w)}"
+
+
+def get_minimizer_op(
+    k: int = MINIMIZER_DEFAULT_K,
+    w: int | None = None,
+    n_tiles: int | None = None,
+):
+    """Return the minimizer :class:`NpuOp` for the requested ``(k, w, n_tiles)``.
+
+    Mirrors :func:`get_kmer_count_op`. Two registry entries (one per
+    supported ``(k, w)`` pinned pair) and a per-(k, w, n_tiles) artifact
+    directory matrix.
+
+    Args:
+        k: minimizer ``k``. Must be a value in :data:`MINIMIZER_VALID_KW`
+            (``15`` or ``21``). Defaults to ``15``.
+        w: minimizer ``w``. ``None`` (default) selects the canonical
+            partner from :data:`MINIMIZER_VALID_KW` (``10`` for ``k=15``;
+            ``11`` for ``k=21``).
+        n_tiles: tile fan-out. ``None`` (default) consults
+            ``BIONPU_MINIMIZER_LAUNCH_CHUNKS`` and falls back to
+            :data:`MINIMIZER_DEFAULT_N_TILES` (``4``).
+
+    Returns:
+        A freshly-constructed ``BionpuMinimizer(k, w, n_tiles)``.
+    """
+    from bionpu.dispatch.npu import NPU_OPS
+    import bionpu.kernels.genomics.minimizer as _mz  # noqa: F401
+
+    # Resolve w default from the (k, w) pinning table.
+    if w is None:
+        match = [pair for pair in MINIMIZER_VALID_KW if pair[0] == int(k)]
+        if not match:
+            valid = ", ".join(f"({a},{b})" for a, b in MINIMIZER_VALID_KW)
+            raise ValueError(
+                f"get_minimizer_op: k={k!r} has no canonical w; "
+                f"pinned (k, w) ∈ {{{valid}}}."
+            )
+        w = match[0][1]
+
+    if (int(k), int(w)) not in MINIMIZER_VALID_KW:
+        valid = ", ".join(f"({a},{b})" for a, b in MINIMIZER_VALID_KW)
+        raise ValueError(
+            f"get_minimizer_op: (k, w)=({k!r}, {w!r}) not supported; "
+            f"expected one of {{{valid}}}."
+        )
+
+    if n_tiles is None:
+        env_val = os.environ.get(MINIMIZER_LAUNCH_CHUNKS_ENV)
+        if env_val is None or env_val == "":
+            n_tiles = MINIMIZER_DEFAULT_N_TILES
+        else:
+            try:
+                n_tiles = int(env_val)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{MINIMIZER_LAUNCH_CHUNKS_ENV}={env_val!r} is not a "
+                    f"valid integer; expected one of "
+                    f"{MINIMIZER_VALID_N_TILES}."
+                ) from exc
+
+    if int(n_tiles) not in MINIMIZER_VALID_N_TILES:
+        valid = ", ".join(str(x) for x in MINIMIZER_VALID_N_TILES)
+        raise ValueError(
+            f"get_minimizer_op: n_tiles={n_tiles!r} is not supported; "
+            f"expected one of {{{valid}}}."
+        )
+
+    op_name = _minimizer_op_name(k, w)
+    if op_name not in NPU_OPS:
+        raise KeyError(
+            f"minimizer op {op_name!r} is not registered in NPU_OPS. "
+            f"Import bionpu.kernels.genomics.minimizer first."
+        )
+
+    BionpuMinimizer = type(NPU_OPS[op_name])
+    return BionpuMinimizer(k=int(k), w=int(w), n_tiles=int(n_tiles))
+
+
 __all__ = [
     "KMER_COUNT_DEFAULT_K",
     "KMER_COUNT_DEFAULT_N_TILES",
     "KMER_COUNT_LAUNCH_CHUNKS_ENV",
     "KMER_COUNT_VALID_K",
     "KMER_COUNT_VALID_N_TILES",
+    "MINIMIZER_DEFAULT_K",
+    "MINIMIZER_DEFAULT_N_TILES",
+    "MINIMIZER_DEFAULT_W",
+    "MINIMIZER_LAUNCH_CHUNKS_ENV",
+    "MINIMIZER_VALID_KW",
+    "MINIMIZER_VALID_N_TILES",
     "get_kmer_count_op",
+    "get_minimizer_op",
 ]

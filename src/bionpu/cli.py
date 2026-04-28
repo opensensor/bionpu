@@ -412,6 +412,162 @@ def _cmd_bench_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_kmer_count(args: argparse.Namespace) -> int:
+    """Count canonical k-mers from a packed-2-bit DNA binary (T16).
+
+    Two device paths share an output formatter so byte-equality
+    between CPU oracle (T2 ``count_kmers_canonical``) and NPU silicon
+    (T9 ``BionpuKmerCount`` via ``get_kmer_count_op``) is verifiable
+    on the smoke fixture.
+
+    Wire format (input): packed-2-bit MSB-first bytes per T1's
+    contract — the T3 fixture builder produces these with no header
+    or trailer, so ``n_bases = file_size_bytes * 4`` is exact for the
+    standard fixtures (smoke / synthetic_1mbp / chr22).
+
+    Output (Jellyfish-FASTA per Q5): interleaved
+    ``>count\\nACGT-kmer\\n`` records sorted by
+    ``(count desc, canonical asc)`` matching T7 runner format.
+    """
+    import numpy as np
+
+    from .data.kmer_oracle import count_kmers_canonical, unpack_dna_2bit
+    from .kernels.genomics import (
+        KMER_COUNT_VALID_K,
+        KMER_COUNT_VALID_N_TILES,
+        get_kmer_count_op,
+    )
+    from .kernels.genomics.kmer_count import decode_packed_kmer_to_ascii
+
+    # n=8 is in the helper's KMER_COUNT_VALID_N_TILES but the v1 PRD
+    # deferral (gaps.yaml `kmer-n8-memtile-dma-cap`) drops it from the
+    # CLI-allowed set. Reject explicitly with a clear error before the
+    # helper would happily accept it.
+    if int(args.launch_chunks) == 8:
+        print(
+            "bionpu kmer-count: --launch-chunks 8 is rejected: deferred for "
+            "v1 (gaps.yaml `kmer-n8-memtile-dma-cap` — n=8 exceeds the "
+            "memtile DMA capacity in the current toolchain). Allowed "
+            "values: 1, 2, 4.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # argparse `choices` already constrains k and launch_chunks; this
+    # is a defensive belt-and-braces against future arg typo.
+    if int(args.k) not in KMER_COUNT_VALID_K:
+        print(
+            f"bionpu kmer-count: unsupported --k {args.k!r}; expected one "
+            f"of {KMER_COUNT_VALID_K}.",
+            file=sys.stderr,
+        )
+        return 2
+    if int(args.launch_chunks) not in KMER_COUNT_VALID_N_TILES:
+        print(
+            f"bionpu kmer-count: unsupported --launch-chunks "
+            f"{args.launch_chunks!r}; expected one of "
+            f"{KMER_COUNT_VALID_N_TILES}.",
+            file=sys.stderr,
+        )
+        return 2
+
+    input_path = pathlib.Path(args.input)
+    if not input_path.is_file():
+        print(
+            f"bionpu kmer-count: input file not found: {input_path}",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Load the packed-2-bit binary. T3 fixture builder produces
+    # header-less output; n_bases = file_size_bytes * 4 (full bytes,
+    # no slack).
+    buf = np.fromfile(input_path, dtype=np.uint8)
+    n_bases = int(buf.size) * 4
+
+    print(
+        f"bionpu kmer-count [{args.device}]: input={input_path} "
+        f"({buf.size:,} bytes / {n_bases:,} bases), k={args.k}, "
+        f"top={args.top}, threshold={args.threshold}, "
+        f"launch_chunks={args.launch_chunks}",
+        file=sys.stderr,
+    )
+
+    # ---- compute (canonical, count) records ------------------------------ #
+    if args.device == "npu":
+        from .dispatch.npu import NpuArtifactsMissingError
+        from .dispatch.npu_silicon_lock import npu_silicon_lock
+
+        try:
+            op = get_kmer_count_op(k=int(args.k), n_tiles=int(args.launch_chunks))
+        except (KeyError, ValueError) as exc:
+            print(f"bionpu kmer-count: {exc}", file=sys.stderr)
+            return 3
+
+        label = (
+            args.silicon_lock_label
+            or f"bionpu_kmer_count:k{args.k}_n{args.launch_chunks}"
+        )
+        try:
+            with npu_silicon_lock(label=label):
+                records = op(
+                    packed_seq=buf,
+                    top_n=int(args.top),
+                    threshold=int(args.threshold),
+                )
+        except NpuArtifactsMissingError as exc:
+            print(
+                f"bionpu kmer-count --device npu: kernel artifacts missing.\n"
+                f"  {exc}",
+                file=sys.stderr,
+            )
+            return 3
+    elif args.device == "cpu":
+        # Decode the packed input back to ACGT for the oracle. The
+        # task warns that chr22 is 50 MB as a string — for fixtures of
+        # that size users should prefer --device npu. Smoke + 1 Mbp
+        # fixture decode quickly.
+        seq = unpack_dna_2bit(buf, n_bases)
+        counts = count_kmers_canonical(seq, int(args.k))
+        # Match T9's host post-pass: threshold + sort + topN.
+        items = [
+            (canonical, count)
+            for canonical, count in counts.items()
+            if count >= int(args.threshold)
+        ]
+        items.sort(key=lambda kv: (-kv[1], kv[0]))
+        if int(args.top) > 0:
+            items = items[: int(args.top)]
+        records = items
+    else:  # pragma: no cover — argparse `choices` already constrains
+        print(
+            f"bionpu kmer-count: unknown --device {args.device!r}",
+            file=sys.stderr,
+        )
+        return 2
+
+    # ---- format Jellyfish-FASTA output ----------------------------------- #
+    lines: list[str] = []
+    for canonical, count in records:
+        kmer_ascii = decode_packed_kmer_to_ascii(int(canonical), int(args.k))
+        lines.append(f">{int(count)}")
+        lines.append(kmer_ascii)
+    body = "".join(line + "\n" for line in lines)
+
+    if args.output:
+        out_path = pathlib.Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(body)
+        print(
+            f"bionpu kmer-count: wrote {len(records)} k-mer records to "
+            f"{out_path}",
+            file=sys.stderr,
+        )
+    else:
+        sys.stdout.write(body)
+    return 0
+
+
 def _cmd_not_implemented(args: argparse.Namespace) -> int:
     print(
         f"bionpu {args.cmd}: not yet implemented in v0.1. "
@@ -724,6 +880,62 @@ def _build_parser() -> argparse.ArgumentParser:
     p_b_scan.add_argument("--pam", default="NGG", help="PAM template.")
     p_b_scan.add_argument("--max-mismatches", type=int, default=4)
     p_b_scan.set_defaults(func=_cmd_bench_scan)
+
+    # kmer-count — canonical k-mer counting on CPU (oracle) or NPU silicon.
+    p_kmer = sub.add_parser(
+        "kmer-count",
+        help=(
+            "Count canonical k-mers from a packed-2-bit DNA binary "
+            "(CPU oracle via T2 count_kmers_canonical or NPU silicon "
+            "via T9 BionpuKmerCount). Output is Jellyfish-FASTA "
+            "(>count\\nkmer\\n) sorted by (count desc, canonical asc)."
+        ),
+    )
+    p_kmer.add_argument(
+        "input",
+        help=(
+            "Path to a packed-2-bit DNA binary (T3 fixture format: "
+            "MSB-first 2-bit packing, A=00, C=01, G=10, T=11; "
+            "n_bases = file_size_bytes * 4)."
+        ),
+    )
+    p_kmer.add_argument(
+        "--k", type=int, choices=[15, 21, 31], default=21,
+        help="K-mer width. Default: 21.",
+    )
+    p_kmer.add_argument(
+        "--output", default=None,
+        help="Output Jellyfish-FASTA path. Default: stdout.",
+    )
+    p_kmer.add_argument(
+        "--top", type=int, default=1000,
+        help="Keep only the top-N most-frequent k-mers (0 = no cap). Default: 1000.",
+    )
+    p_kmer.add_argument(
+        "--threshold", type=int, default=1,
+        help="Drop k-mers with count below this. Default: 1.",
+    )
+    p_kmer.add_argument(
+        "--device", choices=["cpu", "npu"], default="npu",
+        help="Compute device. cpu = T2 numpy oracle; npu = AIE2P silicon. Default: npu.",
+    )
+    p_kmer.add_argument(
+        "--launch-chunks", type=int, choices=[1, 2, 4, 8], default=4,
+        help=(
+            "Tile fan-out for the NPU dispatch (ignored on --device cpu). "
+            "Default: 4. Note: n=8 is rejected at runtime per the v1 "
+            "deferral (gaps.yaml `kmer-n8-memtile-dma-cap`)."
+        ),
+    )
+    p_kmer.add_argument(
+        "--silicon-lock-label", default=None,
+        help=(
+            "Optional label written to the NPU silicon lock PID sidecar "
+            "(/tmp/bionpu-npu-silicon.pid) for diagnostic. Defaults to "
+            "`bionpu_kmer_count:k{K}_n{N}`."
+        ),
+    )
+    p_kmer.set_defaults(func=_cmd_kmer_count)
 
     # placeholders — scope for v0.3+
     for name, help_text in (

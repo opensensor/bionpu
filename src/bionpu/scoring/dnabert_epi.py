@@ -121,26 +121,26 @@ class DNABERTEpiScorer:
         *,
         device: Device = "cpu",
         weights_path: Path | None = None,
+        passport_dir: Path | None = None,
         base_model: str = "zhihan1996/DNA_bert_3",
         smoke: bool = False,
         seed: int = 0,
+        npu_output_scale: float = 0.05,
     ) -> None:
         if device not in ("cpu", "gpu", "npu"):
             raise ValueError(
                 f"device must be 'cpu', 'gpu', or 'npu'; got {device!r}"
             )
-        if device == "npu" and not smoke:
-            raise DNABERTEpiNpuNotImplementedError(
-                "device='npu' real-mode scoring is the v0.4 milestone "
-                "(see docs/aie2p-scorer-port-design.md). Use "
-                "device='cpu' or device='gpu' for now, or smoke=True "
-                "for the torch-free placeholder path."
-            )
         self.device = device
         self.weights_path = Path(weights_path) if weights_path else None
+        self.passport_dir = Path(passport_dir) if passport_dir else None
         self.base_model = base_model
         self.smoke = smoke
         self.seed = int(seed)
+        # Output activation scale for the head's INT8 logits. DNABERT-Epi
+        # binary classifier logits are typically in [-3, 3] FP32; 0.05
+        # covers int8 [-128, 127] = [-6.4, 6.35] with margin.
+        self.npu_output_scale = float(npu_output_scale)
 
         # Lazy: torch + transformers + the model are loaded on first
         # `score()` call when `smoke=False`. This keeps `import bionpu`
@@ -149,6 +149,13 @@ class DNABERTEpiScorer:
         self._tokenizer = None
         self._torch = None
         self._torch_device = None
+        # NPU-specific lazy state.
+        self._npu_loaded = False
+        self._npu_bert = None
+        self._npu_head_w = None
+        self._npu_head_w_scales = None
+        self._npu_head_act_scale = None
+        self._npu_head_scales_combined = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -164,6 +171,9 @@ class DNABERTEpiScorer:
         rows_list = list(rows)
         if self.smoke:
             yield from self._score_smoke(rows_list)
+            return
+        if self.device == "npu":
+            yield from self._score_npu(rows_list)
             return
         yield from self._score_real(rows_list)
 
@@ -266,4 +276,121 @@ class DNABERTEpiScorer:
                 logits = head(cls)
                 # Binary classifier: index 1 = off-target probability.
                 prob = torch.softmax(logits, dim=-1)[0, 1].item()
+                yield ScoreRow.from_row(r, prob)
+
+    # ------------------------------------------------------------------
+    # NPU backend — torch BERT body on CPU + INT8 head dispatched via
+    # bionpu.kernels.scoring.bert_int8_matmul.
+    #
+    # When the silicon xclbin is built and present at the canonical
+    # artifacts dir, the head op runs on AIE2P silicon. When absent,
+    # the same NpuOp falls through to a host-emulation reference that
+    # is byte-equivalent to the silicon path by construction.
+    # ------------------------------------------------------------------
+
+    def _ensure_npu_loaded(self) -> None:
+        if self._npu_loaded:
+            return
+        try:
+            import torch
+            from transformers import AutoModel, AutoTokenizer
+        except ImportError as exc:
+            raise DNABERTEpiUnavailableError(
+                "device='npu' real-mode requires `torch` and "
+                "`transformers` to be installed. Install them or "
+                "use `smoke=True`."
+            ) from exc
+        if self.passport_dir is None or not (
+            self.passport_dir / "passport.json"
+        ).exists():
+            raise DNABERTEpiUnavailableError(
+                "device='npu' real-mode requires --passport-dir "
+                "produced by `bionpu score-quantize` (path must "
+                "contain passport.json + weights.npz)."
+            )
+
+        import numpy as np
+
+        from .quantize import load_passport
+
+        passport = load_passport(self.passport_dir / "passport.json")
+        weights_npz = np.load(self.passport_dir / "weights.npz")
+
+        head_w_record = next(
+            (w for w in passport.weights if w.name == "head.1.weight"),
+            None,
+        )
+        head_act = next(
+            (a for a in passport.activations if a.layer_name == "head.1.weight"),
+            None,
+        )
+        if head_w_record is None or head_act is None:
+            raise DNABERTEpiUnavailableError(
+                "passport is missing the 'head.1.weight' entry; rerun "
+                "`bionpu score-quantize` against the same checkpoint "
+                "that produced this scorer's expected head shape."
+            )
+
+        self._npu_head_w = weights_npz[head_w_record.int8_path]    # (2, 768) int8
+        self._npu_head_w_scales = np.asarray(
+            head_w_record.scale_per_channel, dtype=np.float32
+        )
+        self._npu_head_act_scale = float(head_act.scale)
+
+        # combined[n] = (input_scale * weight_scale[n]) / output_scale
+        combined = (
+            self._npu_head_act_scale * self._npu_head_w_scales
+            / self.npu_output_scale
+        ).astype(np.float32)
+        self._npu_head_scales_combined = np.zeros((3,), dtype=np.float32)
+        self._npu_head_scales_combined[:2] = combined
+        # combined[2] reserved for bias term; unused in v0.
+
+        self._tokenizer = AutoTokenizer.from_pretrained(self.base_model)
+        # BERT body always runs on CPU when device='npu' — only the
+        # final head goes through NPU. Pinning to CPU here matches the
+        # byte-equivalence verify expectation.
+        self._npu_bert = AutoModel.from_pretrained(self.base_model).eval()
+        self._torch = torch
+        self._npu_loaded = True
+
+    def _score_npu(self, rows: list[CasOFFinderRow]) -> Iterator[ScoreRow]:
+        """NPU path: torch BERT body on CPU, classifier head on AIE2P."""
+        import numpy as np
+
+        self._ensure_npu_loaded()
+        torch = self._torch
+
+        from ._tokenize import tokenize_pair
+        from bionpu.kernels.scoring.bert_int8_matmul import bert_int8_matmul_head
+
+        with torch.inference_mode():
+            for r in rows:
+                ids, mask, types = tokenize_pair(self._tokenizer, r.crrna, r.dna)
+                bert_out = self._npu_bert(
+                    input_ids=ids,
+                    attention_mask=mask,
+                    token_type_ids=types,
+                )
+                # CLS embedding (single-token, FP32). Shape: (1, 768).
+                cls = bert_out.last_hidden_state[0:1, 0, :].cpu().numpy().astype(np.float32)
+
+                # Quantize CLS to int8 via the passport's activation scale.
+                cls_int8 = np.clip(
+                    np.round(cls / self._npu_head_act_scale), -128, 127,
+                ).astype(np.int8)
+
+                # Dispatch through the bionpu NpuOp. Currently emulation
+                # by default; flips to silicon when the xclbin is wired.
+                y_int8 = bert_int8_matmul_head(
+                    cls_int8,
+                    self._npu_head_w,
+                    self._npu_head_scales_combined,
+                )
+
+                # Dequantize to FP32 logits, then softmax for the
+                # off-target probability (index 1 of the binary head).
+                logits = y_int8.astype(np.float32) * self.npu_output_scale
+                exp = np.exp(logits - logits.max())
+                prob = float(exp[0, 1] / exp.sum())
                 yield ScoreRow.from_row(r, prob)

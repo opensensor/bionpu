@@ -80,8 +80,10 @@ class _BertInt8MatmulHead(NpuOp):
         )
 
 
-# Pinned head shape (see MANIFEST.md).
-_M = 47
+# Pinned head shape for the silicon build (see MANIFEST.md). The
+# emulation reference accepts any M ≤ _MAX_M and any N — the silicon
+# build pins them via Makefile macros, but the math is identical.
+_MAX_M = 47
 _K = 768
 _N = 2
 
@@ -95,13 +97,19 @@ def _emulate(
 
     Used by the dispatch layer when the silicon xclbin isn't built;
     produces output byte-equal to the silicon path by construction.
+
+    Accepts any M ≤ _MAX_M (the silicon build's pinned upper bound).
+    For the DNABERT-Epi classifier head invocation M=1 (CLS-only).
     """
     if x.dtype != np.int8 or w.dtype != np.int8:
         raise TypeError("bert_int8_matmul: x and w must be int8")
     if scales_combined.dtype != np.float32:
         raise TypeError("bert_int8_matmul: scales_combined must be float32")
-    if x.shape != (_M, _K):
-        raise ValueError(f"x shape mismatch: expected ({_M}, {_K}), got {x.shape}")
+    if x.ndim != 2 or x.shape[1] != _K or x.shape[0] > _MAX_M:
+        raise ValueError(
+            f"x shape mismatch: expected (M, {_K}) with M <= {_MAX_M}, "
+            f"got {x.shape}"
+        )
     if w.shape != (_N, _K):
         raise ValueError(f"w shape mismatch: expected ({_N}, {_K}), got {w.shape}")
     if scales_combined.shape != (_N + 1,):

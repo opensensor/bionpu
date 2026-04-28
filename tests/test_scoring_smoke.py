@@ -126,13 +126,14 @@ def test_smoke_scorer_accepts_npu_label() -> None:
     assert scorer.device == "npu"
 
 
-def test_real_mode_npu_raises_not_implemented(tmp_path) -> None:
-    """device='npu' in real mode (smoke=False) must raise
-    DNABERTEpiNpuNotImplementedError loud rather than silently falling
-    back to CPU. The v0.4 port lands here later."""
-    from bionpu.scoring.dnabert_epi import DNABERTEpiNpuNotImplementedError
+def test_real_mode_npu_without_passport_raises_unavailable(tmp_path) -> None:
+    """device='npu' in real mode (smoke=False) without --passport-dir
+    must raise DNABERTEpiUnavailableError loud — the NPU path needs the
+    quantization passport produced by `bionpu score-quantize`."""
+    from bionpu.scoring.dnabert_epi import DNABERTEpiUnavailableError
 
-    fake_weights = tmp_path / "fake.pt"
-    fake_weights.write_bytes(b"not used; constructor rejects before loading")
-    with pytest.raises(DNABERTEpiNpuNotImplementedError, match="v0.4 milestone"):
-        DNABERTEpiScorer(device="npu", weights_path=fake_weights, smoke=False)
+    # Constructor accepts device='npu' (v0.4-alpha); the loud error
+    # surfaces on first .score() call when no passport is configured.
+    scorer = DNABERTEpiScorer(device="npu", smoke=False)
+    with pytest.raises(DNABERTEpiUnavailableError, match="passport-dir"):
+        list(scorer.score([_row()]))

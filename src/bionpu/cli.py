@@ -190,10 +190,12 @@ def _cmd_score(args: argparse.Namespace) -> int:
         return 2
 
     weights = pathlib.Path(args.weights) if args.weights else None
+    passport = pathlib.Path(args.passport_dir) if args.passport_dir else None
     try:
         scorer = DNABERTEpiScorer(
             device=args.device,
             weights_path=weights,
+            passport_dir=passport,
             smoke=args.smoke,
             seed=args.seed,
         )
@@ -558,9 +560,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--weights",
         default=None,
         help=(
-            "Path to a fine-tuned classifier checkpoint. Required unless "
-            "--smoke is set. See docs/model-selection-audit.md for the "
-            "current state of trained-weights availability."
+            "Path to a fine-tuned classifier checkpoint. Required for "
+            "--device cpu / gpu unless --smoke is set."
+        ),
+    )
+    p_score.add_argument(
+        "--passport-dir",
+        default=None,
+        help=(
+            "Directory produced by `bionpu score-quantize` (contains "
+            "passport.json + weights.npz). Required for --device npu."
         ),
     )
     p_score.add_argument(

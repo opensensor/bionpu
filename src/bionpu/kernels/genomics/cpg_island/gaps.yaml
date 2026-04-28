@@ -1,0 +1,30 @@
+# gaps.yaml — toolchain-gap report (CpG island kernel).
+# Schema: bionpu/report/gaps.schema.json (v1.0.0).
+
+schema_version: "1.0.0"
+task_id: ""
+kernel_name: "bionpu_cpg_island"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-28T00:00:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+
+gaps:
+  - id: "cpg-island-emit-cap-saturation"
+    category: "performance"
+    op_or_pattern: "dense candidate-window chunks can exceed 8190 sparse emits"
+    attempted: |
+      v0 uses the sibling sparse-output geometry: 32 KiB slot, uint32
+      count prefix, uint32 candidate positions. This caps one chunk at
+      8190 candidate window starts.
+    failed_with: |
+      Not observed yet. A synthetic all-CG chunk can exceed the cap
+      because every length-200 window is a candidate. Real chr22 CpG
+      islands are expected to be sparse enough for v0 validation, but
+      this must be checked during silicon bring-up.
+    workaround: |
+      If cap-fire appears, shrink chunk payload or widen the partial
+      output slot to 64 KiB. This is the same lever as the minimizer
+      emit-cap-saturation follow-up.
+    severity: "low"
+    blocks_v1_ship: false

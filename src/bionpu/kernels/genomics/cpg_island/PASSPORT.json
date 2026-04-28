@@ -1,0 +1,11 @@
+{
+  "kernel_name": "bionpu_cpg_island",
+  "version": "v0",
+  "target": "aie2p",
+  "algorithm": "Gardiner-Garden CpG island candidate window scan",
+  "window_bases": 200,
+  "gc_threshold": "1/2",
+  "obs_exp_threshold": "3/5",
+  "record_format": "uint32 candidate_window_start",
+  "status": "source-complete; silicon validation pending"
+}

@@ -243,6 +243,8 @@ PRIMER_SCAN_VALID_P: tuple[int, ...] = (13, 20, 25)
 PRIMER_SCAN_VALID_N_TILES: tuple[int, ...] = (1, 2, 4, 8)
 PRIMER_SCAN_DEFAULT_PRIMER: str = "AGATCGGAAGAGC"  # Illumina TruSeq P5, P=13
 PRIMER_SCAN_DEFAULT_N_TILES: int = 4
+CPG_ISLAND_VALID_N_TILES: tuple[int, ...] = (1, 2, 4, 8)
+CPG_ISLAND_DEFAULT_N_TILES: int = 4
 
 
 def _primer_scan_op_name(p: int) -> str:
@@ -305,7 +307,35 @@ def get_primer_scan_op(
     return BionpuPrimerScan(primer=primer, n_tiles=int(n_tiles))
 
 
+def get_cpg_island_op(
+    n_tiles: int | None = None,
+):
+    """Return the CpG-island candidate scanner :class:`NpuOp`."""
+    from bionpu.dispatch.npu import NPU_OPS
+    import bionpu.kernels.genomics.cpg_island as _ci  # noqa: F401
+
+    if n_tiles is None:
+        n_tiles = CPG_ISLAND_DEFAULT_N_TILES
+    if int(n_tiles) not in CPG_ISLAND_VALID_N_TILES:
+        valid = ", ".join(str(x) for x in CPG_ISLAND_VALID_N_TILES)
+        raise ValueError(
+            f"get_cpg_island_op: n_tiles={n_tiles!r} not in {{{valid}}}."
+        )
+
+    op_name = "bionpu_cpg_island"
+    if op_name not in NPU_OPS:
+        raise KeyError(
+            "cpg_island op is not registered in NPU_OPS. "
+            "Import bionpu.kernels.genomics.cpg_island first."
+        )
+
+    BionpuCpgIsland = type(NPU_OPS[op_name])
+    return BionpuCpgIsland(n_tiles=int(n_tiles))
+
+
 __all__ = [
+    "CPG_ISLAND_DEFAULT_N_TILES",
+    "CPG_ISLAND_VALID_N_TILES",
     "KMER_COUNT_DEFAULT_K",
     "KMER_COUNT_DEFAULT_N_TILES",
     "KMER_COUNT_LAUNCH_CHUNKS_ENV",
@@ -323,5 +353,6 @@ __all__ = [
     "PRIMER_SCAN_VALID_P",
     "get_kmer_count_op",
     "get_minimizer_op",
+    "get_cpg_island_op",
     "get_primer_scan_op",
 ]

@@ -40,6 +40,7 @@ from bionpu.data.cpg_oracle import (
     find_cpg_island_streak_positions,
     find_cpg_islands,
     find_cpg_islands_packed,
+    merge_candidate_positions_to_islands,
     merge_streak_positions_to_islands,
 )
 
@@ -143,6 +144,16 @@ def test_streak_merge_round_trip() -> None:
     assert merged == find_cpg_islands(seq)
     # Two distinct rich blocks → two islands.
     assert len(merged) == 2
+
+
+def test_candidate_merge_applies_min_run_length() -> None:
+    candidates = list(range(10, 10 + CPG_DEFAULT_W - 1))
+    assert merge_candidate_positions_to_islands(candidates) == []
+
+    candidates.append(10 + CPG_DEFAULT_W - 1)
+    assert merge_candidate_positions_to_islands(candidates) == [
+        (10, 10 + CPG_DEFAULT_W - 1 + CPG_DEFAULT_W)
+    ]
 
 
 # --------------------------------------------------------------------------- #

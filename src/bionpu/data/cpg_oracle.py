@@ -56,6 +56,7 @@ __all__ = [
     "find_cpg_island_streak_positions",
     "find_cpg_islands",
     "find_cpg_islands_packed",
+    "merge_candidate_positions_to_islands",
     "merge_streak_positions_to_islands",
 ]
 
@@ -227,6 +228,38 @@ def merge_streak_positions_to_islands(
         run_start = p
         prev = p
     out.append((run_start, prev + w))
+    return out
+
+
+def merge_candidate_positions_to_islands(
+    positions: list[int],
+    w: int = CPG_DEFAULT_W,
+) -> list[tuple[int, int]]:
+    """Merge raw candidate window-start positions into CpG islands.
+
+    Unlike :func:`merge_streak_positions_to_islands`, this helper
+    accepts every position whose length-``w`` window passes the
+    thresholds. Only contiguous candidate runs with length ``>= w`` are
+    emitted as islands.
+    """
+    if not positions:
+        return []
+    out: list[tuple[int, int]] = []
+    run_start = positions[0]
+    prev = positions[0]
+    run_len = 1
+    for p in positions[1:]:
+        if p == prev + 1:
+            prev = p
+            run_len += 1
+            continue
+        if run_len >= w:
+            out.append((run_start, prev + w))
+        run_start = p
+        prev = p
+        run_len = 1
+    if run_len >= w:
+        out.append((run_start, prev + w))
     return out
 
 

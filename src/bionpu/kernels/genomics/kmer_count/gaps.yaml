@@ -67,41 +67,83 @@ gaps:
 
   - id: "kmer-chr22-canonical0-cap-fire"
     category: "correctness"
-    op_or_pattern: "n_passes=4 hash-slice partition vs all-A canonical"
+    op_or_pattern: "per-chunk MAX_EMIT_IDX_V05 cap fires on centromere all-A runs"
     attempted: |
-      T13 + T14 silicon-validated v0.5 on chr22 at k=21, n_tiles=4,
-      n_passes=4. Per-pass kernel emits canonicals whose
-      `canonical & ((1 << n_passes_log2) - 1) == pass_idx`. With
-      n_passes=4 (log2=2) and SLICE_HASH_SHIFT=0, the all-A canonical
-      = 0 lands in pass 0 (since 0 & 3 == 0).
+      v1.0 T13/T14: silicon-validated v0.5 on chr22 at k=21,
+      n_tiles=4, n_passes=4. canonical=0 NPU keep = 2 977 273 vs
+      oracle 11 669 944.
+      v1.1 (a) (this report, 2026-04-28): rebuilt at n_passes=16
+      (3 K × 16 passes = 48 xclbins; 14s wall per K) and re-ran
+      chr22 byte-equal. canonical=0 NPU keep = 2 992 193 — barely
+      changed (delta = +14 920). Hypothesis "n_passes=16 redistributes
+      all-A across 16 slices" is DISPROVED.
     failed_with: |
-      Top-1000 byte-equal vs Jellyfish FAILS at chr22 scale. The
-      canonical=0 row diverges most: NPU reports count = 2 977 273,
-      Jellyfish reports 11 669 944 (T13 measurements). Top-1000
-      Jaccard = 0.988 — so the WHICH-canonicals set is right, the
-      counts are wrong on the high-frequency canonicals.
+      v1.0 (np=4): canonical=0 NPU=2 977 273 vs oracle=11 669 944
+        (delta = -8 692 671).
+      v1.1 (np=16): canonical=0 NPU=2 992 193 vs oracle=11 669 944
+        (delta = -8 677 751). chr22 top-100 byte-equal = 16/100;
+        top-1000 byte-equal = 486/1000. The remaining 84 top-100
+        mismatches are EXCESS counts of +7 to +8 (the
+        kmer-chunk-overlap-double-emit gap, scope of v1.1 (c)).
     root_cause: |
-      chr22 has ~12 M all-A k-mers (centromere N→A scrub artefact
-      during 2-bit packing). Pass 0 is responsible for these 12 M
-      canonicals, distributed across ~3 102 4 KiB chunks: ~3 870
-      all-A k-mers per chunk. The kernel's per-chunk emit cap of
-      `MAX_EMIT_IDX_V05 = 4095` is close enough to that figure that
-      after the chunk-overlap double-emit boost (next gap), the cap
-      starts firing per chunk and truncating the canonical=0 emit.
-      Net under-count: ~9 M missing all-A k-mers (~2.98 M kept of
-      ~11.67 M expected).
+      REVISED 2026-04-28 after v1.1 (a) data:
+
+      The kernel filter is
+        emit IFF (canonical & pass_mask) == pass_idx
+             AND ((canonical >> n_passes_log2) & tile_mask) == tile_idx
+      For canonical=0, ALL bits are zero: pass_slot=0 and tile_slot=0
+      regardless of (n_passes, n_tiles). canonical=0 ALWAYS lands in
+      slot (pass=0, tile=0). Increasing n_passes from 4 to 16 only
+      reduces COMPETITORS for that slot; it does not redistribute
+      canonical=0 itself.
+
+      Per-chunk math (k=21, advance=4088 B/chunk, ~16 352 bases):
+        - chr22 has ~12.0 M all-A k-mers from centromere N→A scrub.
+        - Fully-all-A chunks ≈ 12.0 M / 16 352 ≈ 734 chunks.
+        - Each fully-all-A chunk produces ~3 924 all-A k-mers in
+          slot (0, 0), saturating MAX_EMIT_IDX_V05 = 4 095.
+        - Total kept ≈ 734 × ~4 078 = ~2.99 M. Observed: 2.99 M.
+          (Match confirms the cap fires per fully-all-A chunk.)
+
+      Conclusion: the cap is fired by all-A k-mers ALONE in centromere-
+      resident chunks, not by competition with other canonicals.
+      n_passes increase cannot fix this because all-A is invariant
+      under the pass/tile slice mask (zero-bits stay zero-bits).
     workaround: |
-      n_passes=16 redistributes the all-A k-mers across 16 slices
-      (each slice catches ~750 K instead of 12 M; well below the
-      4 095 cap), and the SLICE_HASH_SHIFT can be re-tuned to spread
-      the load. The kernel C source already supports n_passes=16,
-      but only n_passes=4 was built for v1.0; v1.1 is to build
-      `bionpu_kmer_count_k{15,21,31}_n4_np16/` artifact dirs,
-      re-run T13/T14 byte-equal, and re-bench.
+      v1.1 (a) data shows n_passes=16 alone insufficient. Real fixes
+      (none attempted; kernel/IRON/runner locked at v1.1 (a)):
+
+      (A) Larger MAX_EMIT_IDX_V05: the 4 095 cap derives from a
+          32 KiB output BO (32 768 - 4 prefix) / 8 bytes/canonical.
+          Raising BO to 64 KiB gives cap = 8 191 — enough for fully-
+          all-A chunks at k=21 (~3 924 entries). Requires CoreTile
+          DM budget audit (kmer_count_constants.h pinned 32 KiB for
+          a reason — the AIE2P CoreTile DM is 64 KiB total).
+      (B) Smaller chunk size: drop SEQ_IN_CHUNK_BYTES_BASE from 4096
+          to 2048. Halves all-A k-mers per chunk to ~1 962, well
+          below the 4 095 cap. Doubles the chunk count → doubles
+          dispatch overhead. ~2× silicon wall on chr22.
+      (C) Special-case canonical=0 in the kernel: dedicated counter
+          slot for the all-zeros canonical (not in the emit-list),
+          summed by host. Most hardware-correct fix; no chunk-cap
+          impact. Requires kernel C source change + IRON Python
+          tile-DMA layout change. Contract bump.
+      (D) SLICE_HASH_SHIFT > 0 with non-zero base: the current
+          slicing uses `canonical & pass_mask`. A different mix —
+          e.g. `((canonical * GOLDEN_RATIO) & pass_mask)` — would
+          spread canonical=0 across (pass, tile) slots only if the
+          mix moves the all-zeros input off the all-zeros output.
+          Requires investigation; likely Peano-implementable.
+
+      Path (C) is the cleanest. Path (A) is the cheapest if the DM
+      budget allows. Both are v1.1 (c) or v1.2 PRD scope.
     upstream_issue: null
     blocks: []
-    severity: "performance"
-    status: "deferred-to-v1.1"
+    severity: "correctness"
+    status: "open"
+    history:
+      - "v1.0 (T13/T14): observed at np=4."
+      - "v1.1 (a) (2026-04-28): retest at np=16 disproved n_passes hypothesis. Root cause REVISED to per-chunk cap on centromere-resident all-A chunks. Real fixes A-D documented; none implemented."
 
   - id: "kmer-chunk-overlap-double-emit"
     category: "correctness"
@@ -204,37 +246,35 @@ gaps:
 
   - id: "kmer-n_passes-16-not-built"
     category: "expressibility"
-    op_or_pattern: "n_passes ∈ {1, 16} build matrix"
+    op_or_pattern: "n_passes=16 build matrix (k × {15, 21, 31})"
     attempted: |
-      The kernel C source + IRON Python lowering support
-      n_passes ∈ {1, 4, 16} via build-time `n_passes_log2 ∈ {0, 2, 4}`
-      arith.constants. The op class `BionpuKmerCount.__init__`
-      accepts `n_passes` and validates against `SUPPORTED_N_PASSES`.
-    failed_with: |
-      Only `bionpu_kmer_count_k{15,21,31}_n4_np4/` artifact dirs
-      exist in `_npu_artifacts/`. Selecting n_passes=16 (the
-      workaround for `kmer-chr22-canonical0-cap-fire`) would raise
-      `NpuArtifactsMissingError`.
+      v1.1 (a) (2026-04-28): rebuilt all 3 K values at n_passes=16
+      via `make NPU2=1 K=$K experiment=wide4 n_passes=16 seq=10000
+      all-passes`. Each K wall: 13-14 s for 16 xclbins (cached LLVM
+      objects across pass_idx; per-pass aiecc only re-runs IRON-emit
+      + xclbin pack). All 3 artifact dirs installed:
+        bionpu_kmer_count_k15_n4_np16/   (33 leaves)
+        bionpu_kmer_count_k21_n4_np16/   (33 leaves)
+        bionpu_kmer_count_k31_n4_np16/   (33 leaves)
+      Each: 16 final_p{0..15}.xclbin + 16 insts_p{0..15}.bin + 1
+      host_runner. `BionpuKmerCount(k=K, n_tiles=4, n_passes=16)
+      .artifacts_present()` returns True for K ∈ {15, 21, 31}.
+    failed_with: null
     root_cause: |
       v1.0 ship scope was n_passes=4 only — Wave 5 silicon validation
       proved the v0.5 design at one (k, n_tiles, n_passes) tuple.
-      The remaining 6 build cells (k × {n_passes=1, n_passes=16})
-      are queued for v1.1.
+      v1.1 (a) closes the n_passes=16 build cell.
+      n_passes=1 remains unbuilt; not blocking v1.1 since chr22 retest
+      happens at n_passes=16.
     workaround: |
-      Build via:
-        cd src/bionpu/kernels/genomics/kmer_count
-        for K in 15 21 31; do
-          for NP in 1 16; do
-            make NPU2=1 K=$K n_passes=$NP experiment=wide4 all
-          done
-        done
-      Then re-run the T15 bench across the full 9-cell matrix
-      (3 fixtures × 3 k × 1 n_tiles × 3 n_passes = 27 cells).
+      n/a — closed.
     upstream_issue: null
-    blocks:
-      - "kmer-chr22-canonical0-cap-fire"
+    blocks: []
     severity: "deferred"
-    status: "deferred-to-v1.1"
+    status: "closed"
+    history:
+      - "v1.0: only np=4 cells built."
+      - "v1.1 (a) (2026-04-28): np=16 cells built and installed for K ∈ {15, 21, 31}. Closed."
 
   - id: "kmer-multi-tile-aggregator-tile-deadcode"
     category: "expressibility"

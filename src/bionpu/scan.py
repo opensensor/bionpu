@@ -52,6 +52,7 @@ __all__ = [
     "build_chunks",
     "cpu_scan",
     "encode_guide_batch",
+    "encode_guide_batches",
     "hits_to_canonical_rows",
     "npu_scan",
     "parse_guides",
@@ -472,8 +473,18 @@ def encode_guide_batch(
     the last guide; the mapper drops hits whose ``guide_pad_table``
     entry is ``None``.
 
+    For ``len(guides) > N_GUIDES`` callers should chunk via
+    :func:`encode_guide_batches` and dispatch one launch per
+    sub-batch — the host-side multi-launch loop in :func:`npu_scan`
+    handles this transparently.
+
     Returns:
         ``(guides_2bit, guide_pad_table)``.
+
+    Raises:
+        ValueError: when ``len(guides) == 0``.
+        ValueError: when ``len(guides) > N_GUIDES``. Use
+            :func:`encode_guide_batches` for multi-launch dispatch.
     """
     from .kernels.crispr.match_singletile import SPACER_BYTES, encode_2bit
     from .kernels.crispr.pam_filter import N_GUIDES
@@ -481,9 +492,10 @@ def encode_guide_batch(
     if len(guides) == 0:
         raise ValueError("no guides supplied")
     if len(guides) > N_GUIDES:
-        raise NotImplementedError(
-            f"v0.2 supports at most {N_GUIDES} guides per launch; "
-            f"got {len(guides)}. Multi-batch dispatch is future work."
+        raise ValueError(
+            f"encode_guide_batch handles at most {N_GUIDES} guides; "
+            f"got {len(guides)}. Use encode_guide_batches() for "
+            f"multi-launch dispatch."
         )
     out = np.zeros((N_GUIDES, SPACER_BYTES), dtype=np.uint8)
     pad_table: list[GuideSpec | None] = []
@@ -495,6 +507,38 @@ def encode_guide_batch(
             out[i] = encode_2bit(guides[-1].spacer)
             pad_table.append(None)
     return out, pad_table
+
+
+def encode_guide_batches(
+    guides: Sequence[GuideSpec],
+) -> list[tuple[np.ndarray, list[GuideSpec | None]]]:
+    """Split ``guides`` into ``N_GUIDES``-sized batches for multi-launch
+    dispatch.
+
+    The PAM-filter kernel ABI is shape-pinned to ``N_GUIDES = 128``
+    guides per launch. For genome-wide candidate lists in the thousands
+    (BRCA1: 8968 candidates → 71 batches) the host issues one silicon
+    launch per batch and concatenates the per-batch hit lists. The
+    per-launch dispatch overhead is on the order of 16 ms (see
+    `dispatch-overhead-floor` memory) and dominates the per-batch
+    compute, so the round-trip is largely sequential — but still
+    bounded at ~71 × 16 ms ≈ 1.1 s for BRCA1, vs the 7.7 s CPU baseline.
+
+    Returns:
+        A list of ``(guides_2bit, guide_pad_table)`` pairs in the same
+        order as the input. Final batch is padded with copies of the
+        last real guide; padded slots have a ``None`` entry in the
+        pad table so the mapper drops their hits.
+    """
+    from .kernels.crispr.pam_filter import N_GUIDES
+
+    if len(guides) == 0:
+        raise ValueError("no guides supplied")
+    out: list[tuple[np.ndarray, list[GuideSpec | None]]] = []
+    for start in range(0, len(guides), N_GUIDES):
+        chunk = list(guides[start : start + N_GUIDES])
+        out.append(encode_guide_batch(chunk))
+    return out
 
 
 def _format_dna(spacer_genome: str, spacer_guide: str, pam_genome: str) -> str:
@@ -637,24 +681,33 @@ def npu_scan(
     chunks = build_chunks(chrom, seq)
     if not chunks:
         return []
-    guides_2bit, guide_pad_table = encode_guide_batch(guides)
 
-    all_hits: list = []
-    chunk_index_per_hit: list[int] = []
-    for ci, chunk in enumerate(chunks):
-        hits = op(
-            windows_in=chunk.windows_in,
-            guides_2bit=guides_2bit,
-            max_mismatches=max_mismatches,
+    # Host-side multi-launch chunking past the 128-guide kernel ABI cap.
+    # See `encode_guide_batches` for rationale: BRCA1's 8968 candidates
+    # would otherwise be blocked.
+    guide_batches = encode_guide_batches(guides)
+
+    all_rows: list[CasOFFinderRow] = []
+    for guides_2bit, guide_pad_table in guide_batches:
+        all_hits: list = []
+        chunk_index_per_hit: list[int] = []
+        for ci, chunk in enumerate(chunks):
+            hits = op(
+                windows_in=chunk.windows_in,
+                guides_2bit=guides_2bit,
+                max_mismatches=max_mismatches,
+            )
+            all_hits.extend(hits)
+            chunk_index_per_hit.extend([ci] * len(hits))
+        all_rows.extend(
+            hits_to_canonical_rows(
+                hits=all_hits,
+                chunks=chunks,
+                chunk_index_per_hit=chunk_index_per_hit,
+                guide_pad_table=guide_pad_table,
+                chrom_seq=seq,
+                pam_template=pam_template,
+            )
         )
-        all_hits.extend(hits)
-        chunk_index_per_hit.extend([ci] * len(hits))
 
-    return hits_to_canonical_rows(
-        hits=all_hits,
-        chunks=chunks,
-        chunk_index_per_hit=chunk_index_per_hit,
-        guide_pad_table=guide_pad_table,
-        chrom_seq=seq,
-        pam_template=pam_template,
-    )
+    return all_rows

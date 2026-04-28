@@ -191,19 +191,26 @@ def test_numpy_oracle_smoke_top100_locked() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _bionpu_kmer_count_op(k: int, n_tiles: int):
-    """Construct a `BionpuKmerCount` op (kept lazy — import only when needed)."""
+def _bionpu_kmer_count_op(k: int, n_tiles: int, n_passes: int = 4):
+    """Construct a `BionpuKmerCount` op (kept lazy — import only when needed).
+
+    Per ``state/kmer_count_interface_contract.md`` v0.5, the op constructor
+    takes ``n_passes`` (hash-slice partition count) in addition to
+    ``(k, n_tiles)``. The default ``n_passes=4`` matches the v0.5 build
+    artifacts shipping in ``_npu_artifacts/...np4/``.
+    """
     from bionpu.kernels.genomics.kmer_count import BionpuKmerCount
 
-    return BionpuKmerCount(k=k, n_tiles=n_tiles)
+    return BionpuKmerCount(k=k, n_tiles=n_tiles, n_passes=n_passes)
 
 
-def _skip_if_artifacts_missing(k: int, n_tiles: int) -> None:
-    op = _bionpu_kmer_count_op(k, n_tiles)
+def _skip_if_artifacts_missing(k: int, n_tiles: int, n_passes: int = 4) -> None:
+    op = _bionpu_kmer_count_op(k, n_tiles, n_passes)
     if not op.artifacts_present():
         pytest.skip(
-            f"NPU artifacts missing for bionpu_kmer_count_k{k}_n{n_tiles}; "
-            f"build via `make NPU2=1 K={k} "
+            f"NPU artifacts missing for "
+            f"bionpu_kmer_count_k{k}_n{n_tiles}_np{n_passes}; "
+            f"build via `make NPU2=1 K={k} n_passes={n_passes} "
             f"experiment={'production' if n_tiles == 1 else f'wide{n_tiles}'} all` "
             f"in `bionpu-public/src/bionpu/kernels/genomics/kmer_count/` "
             f"and copy outputs to {op.artifact_dir}/."
@@ -224,7 +231,8 @@ def test_npu_smoke_byte_equal_to_numpy(k: int) -> None:
     CLAUDE.md serialisation rule.
     """
     n_tiles = 4
-    _skip_if_artifacts_missing(k, n_tiles)
+    n_passes = 4
+    _skip_if_artifacts_missing(k, n_tiles, n_passes)
 
     from bionpu.dispatch.npu_silicon_lock import npu_silicon_lock
 
@@ -236,7 +244,7 @@ def test_npu_smoke_byte_equal_to_numpy(k: int) -> None:
     # (count desc, canonical asc).
     ref_sorted = _top_n_sorted(ref_counts, 0)  # 0 = no top cap
 
-    op = _bionpu_kmer_count_op(k, n_tiles)
+    op = _bionpu_kmer_count_op(k, n_tiles, n_passes)
     with npu_silicon_lock(label=f"t12_kmer_test_k{k}"):
         npu_pairs = op(
             packed_seq=packed,
@@ -281,7 +289,8 @@ def test_npu_chr22_top1000_byte_equal_at_k21() -> None:
     """
     k = 21
     n_tiles = 4
-    _skip_if_artifacts_missing(k, n_tiles)
+    n_passes = 4
+    _skip_if_artifacts_missing(k, n_tiles, n_passes)
 
     if not _CHR22_BIN.exists():
         pytest.skip(f"chr22 fixture missing: {_CHR22_BIN}")
@@ -294,7 +303,7 @@ def test_npu_chr22_top1000_byte_equal_at_k21() -> None:
     ref_counts = count_kmers_canonical(seq, k=k)
     ref_top1000 = _top_n_sorted(ref_counts, 1000)
 
-    op = _bionpu_kmer_count_op(k, n_tiles)
+    op = _bionpu_kmer_count_op(k, n_tiles, n_passes)
     with npu_silicon_lock(label="t12_kmer_test_chr22_k21"):
         npu_pairs = op(
             packed_seq=packed,

@@ -15,8 +15,8 @@
 
 """bert_int8_matmul — AIE2P INT8 matmul op (DNABERT-Epi scorer port).
 
-Registers two specializations in :data:`bionpu.dispatch.npu.NPU_OPS`
-at import time:
+Registers BERT-base (hidden=768) specializations in
+:data:`bionpu.dispatch.npu.NPU_OPS` at import time:
 
 * ``bert_int8_matmul_head`` (v0.4-alpha; M=47, K=768, N=2) — single
   compute tile, weights resident on tile. Runs on real AIE2P silicon
@@ -32,6 +32,21 @@ at import time:
   BERT feed-forward projections. ffn1 is 47×768 @ 3072×768; ffn2 is
   47×3072 @ 768×3072. The host wire format streams weights from DDR as
   768-output groups so the tile-local accumulator remains qkvo-sized.
+
+Step 0.3b (PRD-dnabert-epi v0.1.4) adds BERT-mini hidden=256 variants
+that share the qkvo group-kernel discipline at smaller K and group-N:
+
+* ``bert_int8_matmul_qkvo_h256``  (M=47, K=256, N=256)
+* ``bert_int8_matmul_ffn1_h256``  (M=47, K=256, N=1024)
+* ``bert_int8_matmul_ffn2_h256``  (M=47, K=1024, N=256)
+
+These reuse the same packing helpers as the BERT-base variants; the
+hidden=256 entry points pin K, group_n, and the artifact-directory
+suffix at call time so a single kernel C++/IRON-Python source pair
+compiles to multiple specialisations driven by Makefile flags. K and
+group_n are no longer hardcoded module-level constants on the helper
+functions — see SCOPE-3 in PRD-dnabert-epi-on-xdna v0.1.4 §1.5
+step 0.3b.
 
 Op contract (both variants)
 ----------------------------
@@ -62,22 +77,37 @@ from bionpu.dispatch.npu import (
 # ─── Common emulation reference ──────────────────────────────────────
 
 # Pinned shapes for the silicon builds (see MANIFEST.md). The emulation
-# reference accepts any M ≤ _MAX_M and any K=_K; the N constraint is
-# variant-specific and enforced per-NpuOp.
+# reference accepts any M ≤ _MAX_M, any K, and any N — the per-variant
+# entry-point functions below pin K + N + group_n at call time so
+# multiple hidden-size specialisations (BERT-base 768, BERT-mini 256)
+# share the same packing/emulation helpers.
 _MAX_M = 47
-_K = 768
+_K_CHUNK = 8
+_QKVO_TILES = 4
+_ARG_X = 3
+_ARG_WS = 4
+_ARG_Y = 5
+
+# BERT-base (hidden=768) shape constants. Kept as named module-level
+# values for the existing entry points; new entry points pass shapes
+# in directly rather than read these.
+_K = 768                  # BERT-base hidden / qkvo K and ffn1 K
 _HEAD_N = 2
 _QKVO_N = 768
 _FFN1_K = 768
 _FFN1_N = 3072
 _FFN2_K = 3072
 _FFN2_N = 768
-_K_CHUNK = 8
-_QKVO_TILES = 4
-_FFN_GROUP_N = 768
-_ARG_X = 3
-_ARG_WS = 4
-_ARG_Y = 5
+_FFN_GROUP_N = 768        # BERT-base group kernel output width
+
+# BERT-mini (hidden=256) shape constants for step 0.3b variants.
+_K_H256 = 256             # BERT-mini hidden / qkvo K and ffn1 K
+_QKVO_N_H256 = 256
+_FFN1_K_H256 = 256
+_FFN1_N_H256 = 1024
+_FFN2_K_H256 = 1024
+_FFN2_N_H256 = 256
+_FFN_GROUP_N_H256 = 256   # BERT-mini group kernel output width (= hidden)
 
 
 def _round4(n: int) -> int:
@@ -177,6 +207,18 @@ def _pack_qkvo_xs(x: np.ndarray, scales_combined: np.ndarray) -> bytes:
 
 def _pack_qkvo_w(w: np.ndarray) -> bytes:
     return _pack_grouped_w(w, group_n=_QKVO_N)
+
+
+def _pack_qkvo_xs_param(
+    x: np.ndarray, scales_combined: np.ndarray, *, k: int, group_n: int
+) -> bytes:
+    """Parameterised qkvo xs packer used by step-0.3b hidden=256 variants."""
+    return _pack_grouped_xs(x, scales_combined, k=k, group_n=group_n)
+
+
+def _pack_qkvo_w_param(w: np.ndarray, *, group_n: int) -> bytes:
+    """Parameterised qkvo weight packer used by step-0.3b hidden=256 variants."""
+    return _pack_grouped_w(w, group_n=group_n)
 
 
 def _read_row_major(raw: bytes, *, n: int) -> np.ndarray:
@@ -347,19 +389,57 @@ def bert_int8_matmul_qkvo(
     and the fused-scale + saturate is per-output-channel and order-
     independent.
     """
-    reference = _emulate(x, w, scales_combined, expected_n=_QKVO_N)
-    artifacts_dir = Path(artifacts_dir) if artifacts_dir is not None else (
-        _default_artifacts_dir("qkvo")
+    return _bert_int8_matmul_qkvo_param(
+        x,
+        w,
+        scales_combined,
+        expected_k=_K,
+        expected_n=_QKVO_N,
+        variant="qkvo",
+        artifacts_dir=artifacts_dir,
     )
-    if not _has_silicon_artifacts(artifacts_dir):
+
+
+def _bert_int8_matmul_qkvo_param(
+    x: np.ndarray,
+    w: np.ndarray,
+    scales_combined: np.ndarray,
+    *,
+    expected_k: int,
+    expected_n: int,
+    variant: str,
+    artifacts_dir: Path | str | None,
+) -> np.ndarray:
+    """Parameterised qkvo dispatch shared by BERT-base and BERT-mini variants.
+
+    SCOPE-3 of step 0.3b: thread (K, group_n=N, variant suffix) through
+    the qkvo dispatch so the same packing + read-row-major logic serves
+    both hidden=768 (`variant="qkvo"`) and hidden=256
+    (`variant="qkvo_h256"`).
+    """
+    reference = _emulate(
+        x,
+        w,
+        scales_combined,
+        expected_n=expected_n,
+        expected_k=expected_k,
+    )
+    artifacts_path = Path(artifacts_dir) if artifacts_dir is not None else (
+        _default_artifacts_dir(variant)
+    )
+    if not _has_silicon_artifacts(artifacts_path):
         return reference
 
-    xs = _pack_qkvo_xs(x, scales_combined)
-    w_chunks = _pack_qkvo_w(np.ascontiguousarray(w))
-    y_size = _round4(_padded_m(_MAX_M) * _QKVO_N)
+    xs = _pack_qkvo_xs_param(
+        x, scales_combined, k=expected_k, group_n=expected_n
+    )
+    w_chunks = _pack_qkvo_w_param(
+        np.ascontiguousarray(w), group_n=expected_n
+    )
+    y_size = _round4(_padded_m(_MAX_M) * expected_n)
     raw, _, _, _ = default_backend().run_xclbin(
-        xclbin=artifacts_dir / "final.xclbin",
-        insts=artifacts_dir / "insts.bin",
+        xclbin=artifacts_path / "final.xclbin",
+        insts=artifacts_path / "insts.bin",
         kernel_name="MLIR_AIE",
         in_buffers=[
             (xs, _ARG_X),
@@ -368,7 +448,7 @@ def bert_int8_matmul_qkvo(
         out_size=y_size,
         out_arg_index=_ARG_Y,
     )
-    return _read_row_major(raw, n=_QKVO_N)[: x.shape[0], :].copy()
+    return _read_row_major(raw, n=expected_n)[: x.shape[0], :].copy()
 
 
 class _BertInt8MatmulFfn1(NpuOp):
@@ -416,8 +496,15 @@ def _bert_int8_matmul_ffn(
     expected_n: int,
     variant: str,
     artifacts_dir: Path | str | None,
+    group_n: int = _FFN_GROUP_N,
 ) -> np.ndarray:
-    """Dispatch a feed-forward matmul using the DDR-streamed grouped ABI."""
+    """Dispatch a feed-forward matmul using the DDR-streamed grouped ABI.
+
+    ``group_n`` defaults to the BERT-base value (768) for backward compat;
+    BERT-mini hidden=256 callers pass ``group_n=256`` so the host-side
+    output-group iteration and the tile-resident accumulator both stay
+    sized to the (smaller) hidden dim.
+    """
     reference = _emulate(
         x,
         w,
@@ -435,16 +522,18 @@ def _bert_int8_matmul_ffn(
         x,
         scales_combined,
         k=expected_k,
-        group_n=_FFN_GROUP_N,
+        group_n=group_n,
     )
-    w_groups = _pack_grouped_w(np.ascontiguousarray(w), group_n=_FFN_GROUP_N)
+    w_groups = _pack_grouped_w(np.ascontiguousarray(w), group_n=group_n)
 
-    # The xclbin's runtime_sequence consumes exactly one _FFN_GROUP_N
+    # The xclbin's runtime_sequence consumes exactly one ``group_n``
     # output group per launch; iterate host dispatch over groups and
-    # assemble the N-axis output. ffn2 is the degenerate single-group case.
-    n_groups = expected_n // _FFN_GROUP_N
+    # assemble the N-axis output. The single-group case (e.g., ffn2 at
+    # BERT-base, both ffn variants at BERT-mini hidden=256) degenerates
+    # to one launch.
+    n_groups = expected_n // group_n
     m_pad = _padded_m(_MAX_M)
-    y_per_group = _round4(m_pad * _FFN_GROUP_N)
+    y_per_group = _round4(m_pad * group_n)
     xs_bytes_per_group = len(xs) // n_groups
     w_bytes_per_group = len(w_groups) // n_groups
 
@@ -464,8 +553,8 @@ def _bert_int8_matmul_ffn(
             out_size=y_per_group,
             out_arg_index=_ARG_Y,
         )
-        y_g = _read_row_major(raw, n=_FFN_GROUP_N)
-        y_full[:, g * _FFN_GROUP_N : (g + 1) * _FFN_GROUP_N] = y_g
+        y_g = _read_row_major(raw, n=group_n)
+        y_full[:, g * group_n : (g + 1) * group_n] = y_g
 
     return y_full[: x.shape[0], :].copy()
 
@@ -513,9 +602,140 @@ def bert_int8_matmul_ffn2(
     )
 
 
+# ─── BERT-mini hidden=256 specialisations (step 0.3b) ───────────────
+
+
+class _BertInt8MatmulQkvoH256(NpuOp):
+    """``bert_int8_matmul_qkvo_h256`` — qkvo at BERT-mini hidden (M=47, K=256, N=256)."""
+
+    name = "bert_int8_matmul_qkvo_h256"
+
+    def __call__(
+        self,
+        *,
+        x: np.ndarray,
+        w: np.ndarray,
+        scales_combined: np.ndarray,
+        artifacts_dir: Path | str | None = None,
+    ) -> np.ndarray:
+        return bert_int8_matmul_qkvo_h256(
+            x, w, scales_combined, artifacts_dir=artifacts_dir
+        )
+
+
+def bert_int8_matmul_qkvo_h256(
+    x: np.ndarray,
+    w: np.ndarray,
+    scales_combined: np.ndarray,
+    *,
+    artifacts_dir: Path | str | None = None,
+) -> np.ndarray:
+    """qkvo INT8 matmul at BERT-mini hidden=256 (M=47, K=256, N=256).
+
+    Uses the same multi-tile + K-chunked discipline as the BERT-base
+    qkvo, just at K=256 / N=256 instead of K=768 / N=768. K=256 is
+    divisible by ``_K_CHUNK=8`` (32 chunks), so the existing IRON
+    lowering applies directly via Makefile shape overrides.
+    """
+    return _bert_int8_matmul_qkvo_param(
+        x,
+        w,
+        scales_combined,
+        expected_k=_K_H256,
+        expected_n=_QKVO_N_H256,
+        variant="qkvo_h256",
+        artifacts_dir=artifacts_dir,
+    )
+
+
+class _BertInt8MatmulFfn1H256(NpuOp):
+    """``bert_int8_matmul_ffn1_h256`` — ffn1 at BERT-mini (M=47, K=256, N=1024)."""
+
+    name = "bert_int8_matmul_ffn1_h256"
+
+    def __call__(
+        self,
+        *,
+        x: np.ndarray,
+        w: np.ndarray,
+        scales_combined: np.ndarray,
+        artifacts_dir: Path | str | None = None,
+    ) -> np.ndarray:
+        return bert_int8_matmul_ffn1_h256(
+            x, w, scales_combined, artifacts_dir=artifacts_dir
+        )
+
+
+def bert_int8_matmul_ffn1_h256(
+    x: np.ndarray,
+    w: np.ndarray,
+    scales_combined: np.ndarray,
+    *,
+    artifacts_dir: Path | str | None = None,
+) -> np.ndarray:
+    """BERT-mini FFN expansion (M<=47, K=256, N=1024).
+
+    Streams four 256-output groups (1024 / 256 = 4) using the qkvo-
+    sized group kernel, mirroring the BERT-base ffn1 host-side ABI.
+    """
+    return _bert_int8_matmul_ffn(
+        x,
+        w,
+        scales_combined,
+        expected_k=_FFN1_K_H256,
+        expected_n=_FFN1_N_H256,
+        variant="ffn1_h256",
+        artifacts_dir=artifacts_dir,
+        group_n=_FFN_GROUP_N_H256,
+    )
+
+
+class _BertInt8MatmulFfn2H256(NpuOp):
+    """``bert_int8_matmul_ffn2_h256`` — ffn2 at BERT-mini (M=47, K=1024, N=256)."""
+
+    name = "bert_int8_matmul_ffn2_h256"
+
+    def __call__(
+        self,
+        *,
+        x: np.ndarray,
+        w: np.ndarray,
+        scales_combined: np.ndarray,
+        artifacts_dir: Path | str | None = None,
+    ) -> np.ndarray:
+        return bert_int8_matmul_ffn2_h256(
+            x, w, scales_combined, artifacts_dir=artifacts_dir
+        )
+
+
+def bert_int8_matmul_ffn2_h256(
+    x: np.ndarray,
+    w: np.ndarray,
+    scales_combined: np.ndarray,
+    *,
+    artifacts_dir: Path | str | None = None,
+) -> np.ndarray:
+    """BERT-mini FFN contraction (M<=47, K=1024, N=256). Single output group."""
+    return _bert_int8_matmul_ffn(
+        x,
+        w,
+        scales_combined,
+        expected_k=_FFN2_K_H256,
+        expected_n=_FFN2_N_H256,
+        variant="ffn2_h256",
+        artifacts_dir=artifacts_dir,
+        group_n=_FFN_GROUP_N_H256,
+    )
+
+
 # ─── Op registration ─────────────────────────────────────────────────
 
 register_npu_op("bert_int8_matmul_head", _BertInt8MatmulHead())
 register_npu_op("bert_int8_matmul_qkvo", _BertInt8MatmulQkvo())
 register_npu_op("bert_int8_matmul_ffn1", _BertInt8MatmulFfn1())
 register_npu_op("bert_int8_matmul_ffn2", _BertInt8MatmulFfn2())
+
+# step 0.3b: BERT-mini hidden=256 variants for single-block composition.
+register_npu_op("bert_int8_matmul_qkvo_h256", _BertInt8MatmulQkvoH256())
+register_npu_op("bert_int8_matmul_ffn1_h256", _BertInt8MatmulFfn1H256())
+register_npu_op("bert_int8_matmul_ffn2_h256", _BertInt8MatmulFfn2H256())

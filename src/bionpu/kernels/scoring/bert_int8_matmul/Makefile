@@ -122,4 +122,13 @@ ffn1:
 ffn2:
 	$(MAKE) NPU2=$(NPU2) M=47 K=3072 N=768 V=ffn2 all
 
-.PHONY: all clean qkvo ffn1 ffn2
+# Regenerate qkvo silicon-byte-equal reference fixtures (xs.bin, w.bin,
+# y_qkvo_ref.bin) from the canonical Python packers + emulator. Use after
+# K_CHUNK or shape changes invalidate the on-disk fixtures (cf. commit
+# 8f74723 which flipped K_CHUNK 64→8 without regenerating refs).
+SEED ?= 42
+
+qkvo-refs:
+	python3 $(srcdir)/regen_qkvo_refs.py --seed $(SEED) --output-dir $(srcdir)
+
+.PHONY: all clean qkvo ffn1 ffn2 qkvo-refs

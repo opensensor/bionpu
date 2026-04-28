@@ -1,0 +1,6 @@
+# primer_scan v0 toolchain-gap report.
+#
+# Empty at v0 ship; populated as gaps are discovered during silicon
+# bring-up and chr22 validation.
+
+gaps: []

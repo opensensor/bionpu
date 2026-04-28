@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0.0",
+  "kernel_name": "bionpu_primer_scan",
+  "target": "aie2p",
+  "compiler": "peano",
+  "build_date": "2026-04-28T21:54:51Z",
+  "host": "matteius-ProArt-P16-H7606WI",
+  "hardware_signature": "x86_64;Ryzen-AI-9-HX-370;npu=AIE2P;6x8",
+  "generated_at_iso8601": "2026-04-28T21:54:51Z",
+  "supported_p": [13, 20, 25],
+  "supported_n_tiles": [1, 2, 4, 8],
+  "path": "B (runtime primer canonical via 24-byte chunk header)"
+}

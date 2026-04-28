@@ -234,6 +234,77 @@ def get_minimizer_op(
     return BionpuMinimizer(k=int(k), w=int(w), n_tiles=int(n_tiles))
 
 
+# --------------------------------------------------------------------------- #
+# Primer / adapter scan helper (v0).
+# Three registry entries (one per pinned primer length P).
+# --------------------------------------------------------------------------- #
+
+PRIMER_SCAN_VALID_P: tuple[int, ...] = (13, 20, 25)
+PRIMER_SCAN_VALID_N_TILES: tuple[int, ...] = (1, 2, 4, 8)
+PRIMER_SCAN_DEFAULT_PRIMER: str = "AGATCGGAAGAGC"  # Illumina TruSeq P5, P=13
+PRIMER_SCAN_DEFAULT_N_TILES: int = 4
+
+
+def _primer_scan_op_name(p: int) -> str:
+    return f"bionpu_primer_scan_p{int(p)}"
+
+
+def get_primer_scan_op(
+    primer: str = PRIMER_SCAN_DEFAULT_PRIMER,
+    n_tiles: int | None = None,
+):
+    """Return the primer/adapter-scan :class:`NpuOp` bound to ``primer``.
+
+    Path B (runtime primer canonical): the primer canonical lives in
+    the chunk header, so a single xclbin per primer length P handles
+    any primer of length P at runtime. Three registry entries (one per
+    pinned P).
+
+    Args:
+        primer: ACGT primer, length must be one of
+            :data:`PRIMER_SCAN_VALID_P` (13, 20, or 25).
+            Defaults to the Illumina TruSeq P5 adapter.
+        n_tiles: tile fan-out. ``None`` (default) selects
+            :data:`PRIMER_SCAN_DEFAULT_N_TILES` (4).
+
+    Returns:
+        A freshly-constructed ``BionpuPrimerScan(primer=primer,
+        n_tiles=n_tiles)`` instance.
+    """
+    from bionpu.dispatch.npu import NPU_OPS
+    import bionpu.kernels.genomics.primer_scan as _ps  # noqa: F401
+
+    if not isinstance(primer, str) or not primer:
+        raise ValueError(
+            f"get_primer_scan_op: primer must be a non-empty ACGT string; "
+            f"got {primer!r}"
+        )
+    p_len = len(primer)
+    if p_len not in PRIMER_SCAN_VALID_P:
+        valid = ", ".join(str(x) for x in PRIMER_SCAN_VALID_P)
+        raise ValueError(
+            f"get_primer_scan_op: primer length P={p_len} not in {{{valid}}}."
+        )
+
+    if n_tiles is None:
+        n_tiles = PRIMER_SCAN_DEFAULT_N_TILES
+    if int(n_tiles) not in PRIMER_SCAN_VALID_N_TILES:
+        valid = ", ".join(str(x) for x in PRIMER_SCAN_VALID_N_TILES)
+        raise ValueError(
+            f"get_primer_scan_op: n_tiles={n_tiles!r} not in {{{valid}}}."
+        )
+
+    op_name = _primer_scan_op_name(p_len)
+    if op_name not in NPU_OPS:
+        raise KeyError(
+            f"primer_scan op {op_name!r} is not registered in NPU_OPS. "
+            f"Import bionpu.kernels.genomics.primer_scan first."
+        )
+
+    BionpuPrimerScan = type(NPU_OPS[op_name])
+    return BionpuPrimerScan(primer=primer, n_tiles=int(n_tiles))
+
+
 __all__ = [
     "KMER_COUNT_DEFAULT_K",
     "KMER_COUNT_DEFAULT_N_TILES",
@@ -246,6 +317,11 @@ __all__ = [
     "MINIMIZER_LAUNCH_CHUNKS_ENV",
     "MINIMIZER_VALID_KW",
     "MINIMIZER_VALID_N_TILES",
+    "PRIMER_SCAN_DEFAULT_N_TILES",
+    "PRIMER_SCAN_DEFAULT_PRIMER",
+    "PRIMER_SCAN_VALID_N_TILES",
+    "PRIMER_SCAN_VALID_P",
     "get_kmer_count_op",
     "get_minimizer_op",
+    "get_primer_scan_op",
 ]

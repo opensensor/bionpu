@@ -404,3 +404,22 @@ def bert_mini_gelu(
 register_npu_op("bert_mini_attention_softmax", _BertMiniAttentionSoftmax())
 register_npu_op("bert_mini_layer_norm", _BertMiniLayerNorm())
 register_npu_op("bert_mini_gelu", _BertMiniGelu())
+
+
+# ─── Step 0.3c re-exports ─────────────────────────────────────────────
+# The BertMiniBlock host-side composition class lives in block.py to
+# keep import-time cheap (no torch / transformers needed for the kernel
+# entry points). Re-expose here for convenient `from bionpu.kernels.
+# scoring.bert_mini_block import BertMiniBlock`.
+from bionpu.kernels.scoring.bert_mini_block.block import (  # noqa: E402
+    BertMiniBlock,
+    BertMiniBlockWeights,
+)
+
+__all__ = [
+    "bert_mini_attention_softmax",
+    "bert_mini_layer_norm",
+    "bert_mini_gelu",
+    "BertMiniBlock",
+    "BertMiniBlockWeights",
+]

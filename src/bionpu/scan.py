@@ -686,19 +686,41 @@ def npu_scan(
     # See `encode_guide_batches` for rationale: BRCA1's 8968 candidates
     # would otherwise be blocked.
     guide_batches = encode_guide_batches(guides)
+    windows_batch = [chunk.windows_in for chunk in chunks]
+
+    # Prefer the batched-dispatch path (run_batch): one host_runner
+    # subprocess per guide batch, dispatching every locus chunk inside
+    # that subprocess. This amortises the ~50 ms-per-launch subprocess
+    # fork cost over `len(chunks)` chunks, which dominates the silicon
+    # time at the BRCA1 scale (8968 candidates × 81 kbp locus → 71
+    # guide batches × ~40 chunks = 2840 launches; subprocess fork
+    # alone would be 142 s without this amortisation).
+    use_run_batch = hasattr(op, "run_batch")
 
     all_rows: list[CasOFFinderRow] = []
     for guides_2bit, guide_pad_table in guide_batches:
-        all_hits: list = []
-        chunk_index_per_hit: list[int] = []
-        for ci, chunk in enumerate(chunks):
-            hits = op(
-                windows_in=chunk.windows_in,
+        if use_run_batch:
+            per_chunk_hits = op.run_batch(
                 guides_2bit=guides_2bit,
+                windows_batch=windows_batch,
                 max_mismatches=max_mismatches,
             )
-            all_hits.extend(hits)
-            chunk_index_per_hit.extend([ci] * len(hits))
+            all_hits: list = []
+            chunk_index_per_hit: list[int] = []
+            for ci, hits in enumerate(per_chunk_hits):
+                all_hits.extend(hits)
+                chunk_index_per_hit.extend([ci] * len(hits))
+        else:
+            all_hits = []
+            chunk_index_per_hit = []
+            for ci, chunk in enumerate(chunks):
+                hits = op(
+                    windows_in=chunk.windows_in,
+                    guides_2bit=guides_2bit,
+                    max_mismatches=max_mismatches,
+                )
+                all_hits.extend(hits)
+                chunk_index_per_hit.extend([ci] * len(hits))
         all_rows.extend(
             hits_to_canonical_rows(
                 hits=all_hits,

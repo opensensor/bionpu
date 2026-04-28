@@ -154,7 +154,7 @@ rank-correlation value separately under
 **Ungate when:** PR-D lands per `restrictive-license-model-policy.md`
 (consume Azimuth as external runtime dep; long-term retrain).
 
-### L-4. NPU device path multi-batch dispatch is future work
+### L-4. NPU device path multi-batch dispatch is future work — RESOLVED 2026-04-28
 
 **Source:** Tier 1 finding 5 (artifact gate) + harness landing
 finding (multi-batch gate).
@@ -173,25 +173,42 @@ The harness landing surfaced a third:
    smallest in the set). **No gene in the 20-gene set fits the v0.2
    single-launch NPU path.**
 
-   Verified locally that `_npu_artifacts/crispr_pam_filter_early/
-   final.xclbin` IS present in the bionpu-public checkout (contradicting
-   the Tier 1 status JSON's "xclbins not vendored" note); the gate is
-   the multi-batch dispatch missing piece, not the artifact.
+**Status (2026-04-28):** RESOLVED via host-side multi-launch chunking
+in commit 0614e6b (submodule). `encode_guide_batches()` splits the
+guide list into `N_GUIDES = 128`-sized batches; `npu_scan` issues one
+silicon launch per batch and concatenates the per-batch hit lists.
+Output stays byte-equal to `cpu_scan` (verified by
+`tests/test_npu_scan_multi_batch.py`, 7 cases including 200 / 256 /
+300 guides, plus boundary cases at exactly 128 and 129).
+
+A second silicon-side gap surfaced during the bisection and was
+closed in the same wave (commit 3d71015): the vendored xclbin's
+per-slot byte size (256 records / 2048 bytes) was mismatched with
+the host decoder's compiled-in `EMIT_SLOT_BYTES` (1024 records /
+8192 bytes after the chr22 records-dropped fix). This caused
+`npu_scan` to silently drop every hit at `window_idx >= 64` (every
+slot past slot 0 was decoded at the wrong stride). The decoder now
+infers `slot_bytes` from `len(blob) // n_slots` so the host stays
+compatible with both vendored generations.
+`tests/test_npu_scan_small_fixture.py` pins this fix (16 cases:
+single-hit-at-1000, hit-at-arbitrary-position parameterised over
+{0, 63, 64, 100, 500, 1000, 4095, 4096, 8000}, threshold sweep
+0..4, and the >4 host-fallback path).
 
 **Harness behaviour:**
-`test_npu_device_path_artifact_gated[<gene>]` is an XFAIL with
-`NotImplementedError` exception captured for every gene (and for
-artifact-missing / xrt-smi-suspended cases too).
+`test_npu_device_path_artifact_gated[<gene>]` should now run on
+silicon for every gene in the 20-gene set (modulo other gates such
+as locus-scoped scan or RS1-vs-RS2 not addressed by this wave).
 
 **Ungate when:** any of:
-- multi-batch dispatch lands (`bionpu.scan.npu_scan` chunks the guide
-  set into N_GUIDES-sized batches and merges results); OR
+- ~~multi-batch dispatch lands (`bionpu.scan.npu_scan` chunks the guide
+  set into N_GUIDES-sized batches and merges results)~~ DONE; OR
 - the per-locus candidate count is brought below N_GUIDES (e.g. by
   pre-filtering by GC%, but that destroys the comparison shape vs
   CRISPOR).
 
-The CPU dispatch path is the canonical hard-gate measurement until
-multi-batch lands.
+The CPU dispatch path remains the byte-equality reference until the
+remaining residual gates close.
 
 ## Per-gene deltas
 

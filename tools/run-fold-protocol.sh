@@ -75,9 +75,12 @@ if [[ -f "$CS_CKPT" ]]; then
     echo "[2b/5] CHANGE-seq scratch fold${FOLD}: present at $CS_CKPT (skipping)"
 else
     echo "[2b/5] CHANGE-seq scratch fold${FOLD}: running (~2 hours)"
+    # CHANGE-seq is the in-vitro half; the upstream validator rejects
+    # `--dataset_in_cellula Lazzarotto_2020_CHANGE_seq`. Pass it via
+    # --dataset_in_vitro instead.
     python3 -u src/run_model.py \
         --model DNABERT \
-        --dataset_in_cellula Lazzarotto_2020_CHANGE_seq \
+        --dataset_in_vitro Lazzarotto_2020_CHANGE_seq \
         --fold "$FOLD" --iter "$ITER" \
         --train --test --exe_type scratch \
         > "$LOG_DIR/run-fold${FOLD}-iter${ITER}-stage2b-train-changeseq.log" 2>&1

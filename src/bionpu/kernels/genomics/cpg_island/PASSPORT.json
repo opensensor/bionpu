@@ -16,6 +16,8 @@
   "validated_cells": ["bionpu_cpg_island_n4"],
   "chr22_byte_equal": true,
   "chr22_n_islands": 1352,
-  "chr22_e2e_wall_s": 3.616,
+  "chr22_n_candidates": 1373708,
+  "chr22_oracle_wall_s": 15.008,
+  "chr22_e2e_wall_s": 3.800,
   "status": "v0 silicon-validated"
 }

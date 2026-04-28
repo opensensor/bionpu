@@ -174,7 +174,7 @@ ${targetname}: ${runner_cc_src}
 	  -I${XILINX_XRT}/include \
 	  ${runner_cc_src} \
 	  -L${XILINX_XRT}/lib -Wl,-rpath,${XILINX_XRT}/lib \
-	  -lxrt_coreutil -luuid \
+	  -lxrt_coreutil -luuid -ltbb \
 	  -o ${targetname}
 
 # all-passes: build N_PASSES xclbin/insts pairs for the active

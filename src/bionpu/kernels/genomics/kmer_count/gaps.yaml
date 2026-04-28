@@ -522,6 +522,62 @@ gaps:
     blocks:
       - "kmer-prd-3-3-e2e-throughput-gate"
     severity: "performance"
-    status: "open"
+    status: "closed"
     history:
       - "v1.2 (b) (2026-04-28): filed after batched-dispatch + sort-merge fixes hit pragmatic 16s gate but not the Jellyfish 9.81s target."
+      - "v1.3 (2026-04-28): shipped (a) depth-4 ring of sparse_out BOs (kernel(...) is non-blocking; xrt::run::wait() drains lazily) + per-batch ping-pong seq_in; (b) skip per-dispatch output-zero+sync_to_device (kernel writes emit_idx and all_a_counter unconditionally; parser reads only emit_idx canonicals; leftover bytes harmless; saves ~50us/dispatch); (c) TBB parallel std::sort via std::execution::par_unseq (4.62s → 0.50s on 39M uint64, single biggest win); (d) std::partial_sort for top-N. chr22 np=4 b=8 e2e: 10.18s; speedup vs v1.2(b) 1.43x; vs Jellyfish 1T 0.96x (5% short of parity). Pipelining alone bought only ~0.6s; the dominant win was the host-side parallel sort. Silicon throughput is the new floor (~7.5s); see kmer-shim-dma-context-overhead-floor for v1.4+. Closed."
+
+  - id: "kmer-shim-dma-context-overhead-floor"
+    category: "performance"
+    op_or_pattern: "AIE2P shim DMA per-dispatch context overhead"
+    attempted: |
+      v1.3 (2026-04-28) closed kmer-pipelined-dispatch-merge with
+      depth-4 ring pipelining + parallel host sort. Resulting chr22
+      e2e at np=4 b=8: 10.18 s = ~7.5s silicon + ~0.5s sort + ~2.2s
+      setup/IO. silicon dispatch wall = 4720us avg under pipelining,
+      so 1556 dispatches × 4.72ms = 7.34s.
+    failed_with: |
+      10.18 s vs Jellyfish 1T 9.81 s = 0.96× speedup. 5% short of
+      parity; ~2× short of PRD §3.3 ≥2× gate. Pipelining alone
+      yields ~0.6s additional savings (silicon dispatches are
+      serialized internally by XRT — single hardware queue per
+      hw_context — so deeper rings don't help further).
+    root_cause: |
+      Each silicon dispatch carries ~1ms of XRT submit + AIE2P shim
+      DMA context overhead on top of ~3.5ms actual compute. The
+      shim DMA per-BD payload is fixed at the runtime_sequence
+      drain size set by IRON Python at xclbin compile time (locked
+      at v1.2(b)). Reducing the dispatch count means either:
+        - increasing n_chunks_per_launch beyond 8 (kernel-side
+          rebuild; n_chunks_per_launch=16 would halve dispatches
+          to ~778, est. e2e ~6-7s — but tile DM cap may not fit
+          16 × 8 KiB seq_in slots within 64 KiB).
+        - persistent-kernel mode where the kernel stays warm and
+          consumes a single large seq_in BO via the IRON ObjectFifo
+          (one run.wait() at the end; would require IRON-side
+          rewrite of the chunk-acquire loop — currently locked at
+          v1.2(b)).
+        - shim-DMA compression (AIE2P AM029 use case 1 / 2): both
+          mechanisms are blocked per `aie2p-compression-mechanisms-status`
+          — use case 1 silicon-wedges for non-compute-tile producers;
+          use case 2 Peano lacks intrinsic implementations.
+    workaround: |
+      v1.4+ candidates:
+        (a) Rebuild xclbin with n_chunks_per_launch=16 (host-side
+            staging fits; tile-side may need DM-buffer reshuffle).
+            Est. e2e: 6-7s.
+        (b) Persistent-kernel mode (locked IRON; large delta).
+            Est. e2e: 5-6s.
+        (c) Larger fixture (chrM, chr1) where setup overhead amortizes
+            better. Strategic: validate the kernel CAN beat Jellyfish
+            on a long sequence (where silicon throughput is the
+            dominant fraction of wall) even if chr22 is parity-bound.
+        (d) Stretch: shim-DMA compression once AIE2P mechanisms unblock
+            (tracked in aie2p-compression-mechanisms-status).
+    upstream_issue: null
+    blocks:
+      - "kmer-prd-3-3-e2e-throughput-gate"
+    severity: "performance"
+    status: "open"
+    history:
+      - "v1.3 (2026-04-28): filed after pipelining + parallel sort lifted chr22 e2e to 10.18s but missed Jellyfish parity by 5%. Silicon dispatch throughput is the new floor; further wins require IRON / shim-DMA changes that are out of scope for host-only optimization."

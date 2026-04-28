@@ -39,6 +39,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <execution>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -503,8 +504,11 @@ std::vector<FinalRecord> sort_and_filter(
         std::vector<uint64_t> &all_emits,
         uint64_t all_a_total,
         int top, int threshold) {
-    // Phase 2.1: sort all_emits.
-    std::sort(all_emits.begin(), all_emits.end());
+    // Phase 2.1: sort all_emits. v1.3: parallel sort via libstdc++
+    // <execution> + TBB (C++17 parallel std::sort). Drops 4.6s sort
+    // wall (chr22 single-thread) to <1s on 16-core HX laptop.
+    std::sort(std::execution::par_unseq,
+              all_emits.begin(), all_emits.end());
 
     // Phase 2.2: RLE sweep. Pre-reserve a generous upper bound (unique
     // count ≤ all_emits.size() + 1; reserving exact size avoids
@@ -536,14 +540,24 @@ std::vector<FinalRecord> sort_and_filter(
         v.push_back({0ULL, all_a_total});
     }
 
-    // Phase 2.3: re-sort by (count desc, canonical asc).
-    std::sort(v.begin(), v.end(),
-              [](const FinalRecord &a, const FinalRecord &b) {
-                  if (a.count != b.count) return a.count > b.count;
-                  return a.canonical < b.canonical;
-              });
+    // Phase 2.3: re-sort by (count desc, canonical asc). v1.3: when
+    // top is small (typical 1000), use partial_sort to avoid sorting
+    // the full unique-canonical list (~30M records on chr22).
     if (top > 0 && static_cast<size_t>(top) < v.size()) {
+        std::partial_sort(
+            v.begin(), v.begin() + static_cast<std::ptrdiff_t>(top), v.end(),
+            [](const FinalRecord &a, const FinalRecord &b) {
+                if (a.count != b.count) return a.count > b.count;
+                return a.canonical < b.canonical;
+            });
         v.resize(static_cast<size_t>(top));
+    } else {
+        std::sort(std::execution::par_unseq,
+                  v.begin(), v.end(),
+                  [](const FinalRecord &a, const FinalRecord &b) {
+                      if (a.count != b.count) return a.count > b.count;
+                      return a.canonical < b.canonical;
+                  });
     }
     return v;
 }
@@ -681,14 +695,44 @@ int main(int argc, char **argv) {
     // (group_ids should match across passes since the IRON Python
     // graph topology is identical across n_passes_log2/pass_idx values).
     // v1.2 (b): BOs sized for one BATCH of n_chunks_per_launch chunks.
+    //
+    // v1.3: depth-2 ring of (seq_in, sparse_out) BOs to enable pipelined
+    // dispatch. While silicon is computing dispatch i, host accumulates
+    // dispatch i-1's output and stages dispatch i+1's seq_in.
+    //
+    //   seq_in_ring[2]: ping-pongs PER BATCH (each batch reuses the
+    //     same seq_in across n_passes dispatches; both passes within
+    //     a batch read the same seq_in BO, so the ping-pong is at the
+    //     batch granularity, not per-dispatch).
+    //   sparse_out_ring[2]: ping-pongs PER DISPATCH (every dispatch
+    //     writes a fresh output blob; we double-buffer so dispatch i+1
+    //     can write to the alternate BO while host parses dispatch i's
+    //     output).
+    //
+    // Ring depth = 2 is sufficient for the access pattern (1 host
+    // consumer + 1 silicon producer with no cross-dependency between
+    // adjacent dispatches' outputs).
     const auto &k0 = per_pass[0].kernel;
-    auto bo_seq_in = xrt::bo(device, per_batch_seq_in_bytes,
-                              XRT_BO_FLAGS_HOST_ONLY, k0.group_id(3));
-    auto bo_sparse_out = xrt::bo(device, per_pass_out_bytes,
-                                  XRT_BO_FLAGS_HOST_ONLY, k0.group_id(4));
-
-    auto *p_seq_in = bo_seq_in.map<uint8_t *>();
-    auto *p_sparse_out = bo_sparse_out.map<uint8_t *>();
+    // v1.3 ring depth. Each slot holds (xrt::run, sparse_out BO, seq_in
+    // tag). RING=4 gives XRT 3-deep submit-ahead while host accumulates,
+    // hiding more cross-dispatch queue latency than depth=2. seq_in is
+    // ping-ponged at batch granularity; with RING=4 and n_passes=4, the
+    // last dispatch of batch bi shares seq_in[bi%2] with all 4 of its
+    // in-flight passes — no aliasing because batch bi+1 always uses
+    // seq_in[(bi+1)%2].
+    constexpr int RING = 4;
+    xrt::bo bo_seq_in_ring[RING];
+    xrt::bo bo_sparse_out_ring[RING];
+    uint8_t *p_seq_in_ring[RING];
+    uint8_t *p_sparse_out_ring[RING];
+    for (int s = 0; s < RING; ++s) {
+        bo_seq_in_ring[s] = xrt::bo(device, per_batch_seq_in_bytes,
+                                    XRT_BO_FLAGS_HOST_ONLY, k0.group_id(3));
+        bo_sparse_out_ring[s] = xrt::bo(device, per_pass_out_bytes,
+                                        XRT_BO_FLAGS_HOST_ONLY, k0.group_id(4));
+        p_seq_in_ring[s] = bo_seq_in_ring[s].map<uint8_t *>();
+        p_sparse_out_ring[s] = bo_sparse_out_ring[s].map<uint8_t *>();
+    }
 
     // v1.2 (b): host-side accumulator is now a flat std::vector<uint64_t>
     // of canonicals (sort-merge replaces unordered_map; closes
@@ -708,6 +752,59 @@ int main(int argc, char **argv) {
     size_t total_emits = 0;
     uint32_t max_emit_observed = 0;
 
+    // v1.3 diagnostic profiling: when BIONPU_KMER_PROFILE=1, record
+    // per-phase µs (stage_seq_in, zero_out, sync_to_device, dispatch+wait,
+    // sync_from_device, accumulate) for the first 10 dispatches of the
+    // first timed iteration. Helps confirm where the budget goes (silicon
+    // compute vs DMA sync vs host accumulate).
+    const bool profile_enabled =
+        (std::getenv("BIONPU_KMER_PROFILE") != nullptr) &&
+        std::string(std::getenv("BIONPU_KMER_PROFILE")) == "1";
+
+    // v1.3 fast path: skip the per-dispatch memset+sync_to_device of
+    // sparse_out. The kernel writes emit_idx (offset 0) and
+    // all_a_counter (offset PADDED-4) unconditionally; the parser
+    // only reads exactly emit_idx canonicals starting at offset 4.
+    // Leftover bytes from a prior dispatch beyond emit_idx are
+    // harmless. This saves ~50 µs per dispatch (memset ~25µs +
+    // sync_to_device ~25µs); at 1556 dispatches that's ~78 ms.
+    // Set BIONPU_KMER_OUTPUT_ZERO=1 to restore the v1.2 (b) safe
+    // behavior if a regression is suspected.
+    const bool output_zero_enabled =
+        (std::getenv("BIONPU_KMER_OUTPUT_ZERO") != nullptr) &&
+        std::string(std::getenv("BIONPU_KMER_OUTPUT_ZERO")) == "1";
+    constexpr int PROFILE_MAX_DISPATCHES = 10;
+    struct ProfileRow {
+        int dispatch_idx;
+        size_t batch_idx;
+        int pass_idx;
+        float stage_seq_in_us;     // memcpy seq_in slots (per-batch only)
+        float sync_seq_in_us;      // sync_to_device seq_in (per-batch only)
+        float zero_out_us;         // memset of sparse_out
+        float sync_out_to_dev_us;  // sync_to_device sparse_out (zero seed)
+        float dispatch_us;         // kernel(...) + run.wait() + sync_from_device
+        float accumulate_us;       // accumulate_pass_blob
+    };
+    std::vector<ProfileRow> profile_rows;
+    if (profile_enabled) {
+        profile_rows.reserve(PROFILE_MAX_DISPATCHES);
+        trace("profile: BIONPU_KMER_PROFILE=1 — capturing first " +
+              std::to_string(PROFILE_MAX_DISPATCHES) +
+              " dispatches");
+    }
+
+    // v1.3 inflight ring slot: (xrt::run, slot index, dispatch index)
+    struct InflightSlot {
+        xrt::run run;
+        int seq_slot;     // 0..RING-1
+        int out_slot;     // 0..RING-1
+        size_t batch_idx;
+        int pass_idx;
+        int dispatch_idx;
+        bool valid;
+        std::chrono::high_resolution_clock::time_point t_dispatch;
+    };
+
     const int total_iters = args.warmup + args.iters;
     for (int it = 0; it < total_iters; ++it) {
         const bool keep = (it >= args.warmup);
@@ -717,91 +814,293 @@ int main(int argc, char **argv) {
             total_emits = 0;
         }
 
-        // v1.2 (b): batch of N_BATCH chunks per silicon dispatch. The
-        // tail batch (when n_chunks_host % N_BATCH != 0) is padded with
-        // zero-actual-bytes chunks so the kernel sees exactly N_BATCH
-        // chunk acquires (otherwise it blocks per the v1 hazard noted
-        // in kmer_count.py). Padding chunks emit no canonicals because
-        // the kernel's actual_bytes header reads as 0.
-        for (size_t bi = 0; bi < n_batches; ++bi) {
-            const size_t batch_first_chunk = bi * static_cast<size_t>(n_batch);
+        InflightSlot inflight[RING];
+        for (int s = 0; s < RING; ++s) inflight[s].valid = false;
 
-            // Stage seq_in for this batch: N_BATCH consecutive chunk
-            // slots, each with the v1.2 (a) 8-byte header + payload.
-            // Zero-fill the whole BO first so unused tail slots have
-            // actual_bytes=0.
-            std::memset(p_seq_in, 0, per_batch_seq_in_bytes);
-            for (int slot = 0; slot < n_batch; ++slot) {
-                const size_t ci = batch_first_chunk + static_cast<size_t>(slot);
-                uint8_t *slot_base = p_seq_in +
-                                     static_cast<size_t>(slot) * seq_in_slot_bytes;
-                if (ci >= n_chunks_host) {
-                    // Tail-pad slot: header already zeroed → actual_bytes=0.
-                    // Kernel will run its loop body but emit nothing.
-                    continue;
+        // Track which seq_in slot the most recent dispatch of each
+        // batch wrote to (for the per-batch staging predicate).
+        // Track whether each seq_in ring slot has been staged for the
+        // currently-pending batch index; we re-stage when we advance
+        // to a new batch using the ping-pong slot.
+        size_t last_seq_batch[RING];
+        bool seq_slot_has_data[RING];
+        for (int s = 0; s < RING; ++s) {
+            last_seq_batch[s] = static_cast<size_t>(-1);
+            seq_slot_has_data[s] = false;
+        }
+
+        // v1.3 pipelined dispatch loop. We linearise (batch, pass) into
+        // a single dispatch index d ∈ [0, n_batches × n_passes). For
+        // each d, we issue an async kernel(...) (which start()s on
+        // construction) into out_slot = d % RING. Before issuing, we
+        // wait for any prior dispatch occupying out_slot, sync_from_
+        // device on that slot, and accumulate its blob. After the loop,
+        // we drain the remaining RING-1 inflight slots.
+        //
+        // seq_in is staged once per BATCH (seq_slot = batch_idx % RING).
+        // The ring depth on sparse_out (= RING) implicitly bounds how
+        // far ahead we can run; since RING=2 < n_passes (typically 4),
+        // we drain pass 0 of batch bi BEFORE issuing pass 0 of batch
+        // bi+1, which guarantees seq_in[bi % RING] is no longer in use
+        // by the time we re-stage it for batch bi+RING.
+        const size_t total_dispatches =
+            n_batches * static_cast<size_t>(args.n_passes);
+
+        for (size_t d = 0; d < total_dispatches; ++d) {
+            const size_t bi = d / static_cast<size_t>(args.n_passes);
+            const int p = static_cast<int>(d % static_cast<size_t>(args.n_passes));
+            const int out_slot = static_cast<int>(d % static_cast<size_t>(RING));
+            const int seq_slot = static_cast<int>(bi % static_cast<size_t>(RING));
+
+            // (1) Drain the ring slot we're about to overwrite.
+            float drain_us = 0.0f;
+            float accumulate_us = 0.0f;
+            if (inflight[out_slot].valid) {
+                auto t_drain0 = std::chrono::high_resolution_clock::now();
+                inflight[out_slot].run.wait();
+                bo_sparse_out_ring[inflight[out_slot].out_slot].sync(
+                    XCL_BO_SYNC_BO_FROM_DEVICE);
+                auto t_drain1 = std::chrono::high_resolution_clock::now();
+                drain_us = std::chrono::duration_cast<
+                    std::chrono::microseconds>(t_drain1 - t_drain0).count();
+
+                auto t_acc0 = std::chrono::high_resolution_clock::now();
+                if (keep) {
+                    accumulate_pass_blob(
+                        p_sparse_out_ring[inflight[out_slot].out_slot],
+                        per_pass_out_bytes,
+                        args.launch_chunks,
+                        n_batch,
+                        all_emits,
+                        all_a_total,
+                        total_emits,
+                        max_emit_observed);
                 }
-                const ChunkPlan &c = chunks[ci];
-                // Length prefix.
-                uint32_t actual_bytes_le = static_cast<uint32_t>(c.bytes);
-                std::memcpy(slot_base, &actual_bytes_le, 4);
-                // v1.2 (a) owned_start_offset_bases:
-                //   chunk 0           : 0
-                //   chunk i  (i>0)    : overlap_bases - (k-1)
-                int32_t owned_start_offset_bases =
-                    (ci == 0)
-                        ? 0
-                        : (overlap_bytes * 4) - (args.k - 1);
-                std::memcpy(slot_base + 4, &owned_start_offset_bases, 4);
-                // Payload.
-                std::memcpy(slot_base + HEADER_BYTES,
-                            input_buf.data() + c.src_offset,
-                            c.bytes);
-            }
-            bo_seq_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-            // Per-pass dispatch loop.
-            for (int p = 0; p < args.n_passes; ++p) {
-                // Zero the output BO so leftover bytes from prior
-                // passes don't contaminate this pass's blob.
-                std::memset(p_sparse_out, 0, per_pass_out_bytes);
-                bo_sparse_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-                auto t0 = std::chrono::high_resolution_clock::now();
-                // 6th arg is the seq_in BATCH CAPACITY (compile-time on
-                // IRON side). Actual payload size per slot is encoded
-                // in each slot's leading 4-byte uint32 LE prefix.
-                auto run = per_pass[p].kernel(
-                    opcode,
-                    per_pass[p].bo_instr,
-                    static_cast<unsigned>(per_pass[p].instr.size()),
-                    bo_seq_in,
-                    bo_sparse_out,
-                    static_cast<int>(per_batch_seq_in_bytes));
-                run.wait();
-                auto t1 = std::chrono::high_resolution_clock::now();
-
-                bo_sparse_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                auto t_acc1 = std::chrono::high_resolution_clock::now();
+                accumulate_us = std::chrono::duration_cast<
+                    std::chrono::microseconds>(t_acc1 - t_acc0).count();
 
                 if (keep) {
-                    accumulate_pass_blob(p_sparse_out, per_pass_out_bytes,
-                                         args.launch_chunks,
-                                         n_batch,
-                                         all_emits,
-                                         all_a_total,
-                                         total_emits,
-                                         max_emit_observed);
-                }
-
-                float us = std::chrono::duration_cast<
-                    std::chrono::microseconds>(t1 - t0).count();
-                if (keep) {
+                    auto td = std::chrono::duration_cast<
+                        std::chrono::microseconds>(
+                            t_drain1 - inflight[out_slot].t_dispatch).count();
+                    float us = static_cast<float>(td);
                     total_us += us;
                     if (us < min_us) min_us = us;
                     if (us > max_us) max_us = us;
                     timed_dispatches++;
                 }
+                inflight[out_slot].valid = false;
+
+                if (profile_enabled && keep &&
+                    inflight[out_slot].dispatch_idx <
+                        PROFILE_MAX_DISPATCHES &&
+                    static_cast<int>(profile_rows.size()) >
+                        inflight[out_slot].dispatch_idx) {
+                    // Back-fill the drain + accumulate µs onto the row
+                    // we created when we issued this dispatch.
+                    profile_rows[inflight[out_slot].dispatch_idx]
+                        .dispatch_us += drain_us;
+                    profile_rows[inflight[out_slot].dispatch_idx]
+                        .accumulate_us = accumulate_us;
+                }
+            }
+
+            // (2) Stage seq_in for batch bi, if not already staged.
+            //     Within a batch, all n_passes dispatches share the
+            //     same seq_in BO; we stage exactly once (on pass 0 of
+            //     the batch).
+            float stage_seq_in_us = 0.0f;
+            float sync_seq_in_us = 0.0f;
+            if (last_seq_batch[seq_slot] != bi) {
+                // Drain any other in-flight dispatch that may still be
+                // reading from this seq_slot before we overwrite it.
+                // (With RING=2 on sparse_out and n_passes>=2, this is
+                // already guaranteed by step (1) above for typical
+                // configurations, but we double-check to be safe for
+                // n_passes=1 + RING=2.)
+                for (int s = 0; s < RING; ++s) {
+                    if (inflight[s].valid && inflight[s].seq_slot == seq_slot) {
+                        inflight[s].run.wait();
+                        bo_sparse_out_ring[inflight[s].out_slot].sync(
+                            XCL_BO_SYNC_BO_FROM_DEVICE);
+                        if (keep) {
+                            accumulate_pass_blob(
+                                p_sparse_out_ring[inflight[s].out_slot],
+                                per_pass_out_bytes,
+                                args.launch_chunks,
+                                n_batch,
+                                all_emits,
+                                all_a_total,
+                                total_emits,
+                                max_emit_observed);
+                            auto td = std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                    std::chrono::high_resolution_clock::now() -
+                                    inflight[s].t_dispatch).count();
+                            float us = static_cast<float>(td);
+                            total_us += us;
+                            if (us < min_us) min_us = us;
+                            if (us > max_us) max_us = us;
+                            timed_dispatches++;
+                        }
+                        inflight[s].valid = false;
+                    }
+                }
+
+                auto t_stage0 = std::chrono::high_resolution_clock::now();
+                const size_t batch_first_chunk =
+                    bi * static_cast<size_t>(n_batch);
+                uint8_t *p_seq_in = p_seq_in_ring[seq_slot];
+                std::memset(p_seq_in, 0, per_batch_seq_in_bytes);
+                for (int slot = 0; slot < n_batch; ++slot) {
+                    const size_t ci = batch_first_chunk +
+                                      static_cast<size_t>(slot);
+                    uint8_t *slot_base = p_seq_in +
+                                         static_cast<size_t>(slot) *
+                                             seq_in_slot_bytes;
+                    if (ci >= n_chunks_host) continue;
+                    const ChunkPlan &c = chunks[ci];
+                    uint32_t actual_bytes_le = static_cast<uint32_t>(c.bytes);
+                    std::memcpy(slot_base, &actual_bytes_le, 4);
+                    int32_t owned_start_offset_bases =
+                        (ci == 0)
+                            ? 0
+                            : (overlap_bytes * 4) - (args.k - 1);
+                    std::memcpy(slot_base + 4, &owned_start_offset_bases, 4);
+                    std::memcpy(slot_base + HEADER_BYTES,
+                                input_buf.data() + c.src_offset,
+                                c.bytes);
+                }
+                auto t_stage1 = std::chrono::high_resolution_clock::now();
+                bo_seq_in_ring[seq_slot].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                auto t_stage2 = std::chrono::high_resolution_clock::now();
+                stage_seq_in_us = std::chrono::duration_cast<
+                    std::chrono::microseconds>(t_stage1 - t_stage0).count();
+                sync_seq_in_us = std::chrono::duration_cast<
+                    std::chrono::microseconds>(t_stage2 - t_stage1).count();
+                last_seq_batch[seq_slot] = bi;
+                seq_slot_has_data[seq_slot] = true;
+            }
+
+            // (3) Zero the output BO + sync_to_device. v1.3 default:
+            //     SKIPPED — the kernel writes emit_idx and all_a_counter
+            //     at fixed offsets unconditionally, and the parser only
+            //     reads exactly emit_idx canonicals; leftover bytes are
+            //     harmless. Restore via BIONPU_KMER_OUTPUT_ZERO=1 if a
+            //     regression is suspected.
+            float zero_out_us = 0.0f;
+            float sync_out_to_dev_us = 0.0f;
+            if (output_zero_enabled) {
+                auto t_zero0 = std::chrono::high_resolution_clock::now();
+                std::memset(p_sparse_out_ring[out_slot], 0,
+                            per_pass_out_bytes);
+                auto t_zero1 = std::chrono::high_resolution_clock::now();
+                bo_sparse_out_ring[out_slot].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                auto t_zero2 = std::chrono::high_resolution_clock::now();
+                zero_out_us = std::chrono::duration_cast<
+                    std::chrono::microseconds>(t_zero1 - t_zero0).count();
+                sync_out_to_dev_us = std::chrono::duration_cast<
+                    std::chrono::microseconds>(t_zero2 - t_zero1).count();
+            }
+
+            // (4) Issue the kernel — non-blocking. kernel(...) returns
+            //     a started xrt::run; we won't wait on it until step
+            //     (1) of a future iteration drains it.
+            auto t_disp = std::chrono::high_resolution_clock::now();
+            xrt::run run = per_pass[p].kernel(
+                opcode,
+                per_pass[p].bo_instr,
+                static_cast<unsigned>(per_pass[p].instr.size()),
+                bo_seq_in_ring[seq_slot],
+                bo_sparse_out_ring[out_slot],
+                static_cast<int>(per_batch_seq_in_bytes));
+
+            inflight[out_slot].run = std::move(run);
+            inflight[out_slot].seq_slot = seq_slot;
+            inflight[out_slot].out_slot = out_slot;
+            inflight[out_slot].batch_idx = bi;
+            inflight[out_slot].pass_idx = p;
+            inflight[out_slot].dispatch_idx = static_cast<int>(d);
+            inflight[out_slot].valid = true;
+            inflight[out_slot].t_dispatch = t_disp;
+
+            if (profile_enabled && keep &&
+                static_cast<int>(d) < PROFILE_MAX_DISPATCHES) {
+                ProfileRow row{};
+                row.dispatch_idx = static_cast<int>(d);
+                row.batch_idx = bi;
+                row.pass_idx = p;
+                row.stage_seq_in_us = stage_seq_in_us;
+                row.sync_out_to_dev_us = sync_out_to_dev_us +
+                                          sync_seq_in_us;
+                row.zero_out_us = zero_out_us;
+                row.dispatch_us = 0.0f;       // back-filled at drain
+                row.accumulate_us = 0.0f;     // back-filled at drain
+                profile_rows.push_back(row);
             }
         }
+
+        // (5) Drain remaining RING-1 inflight slots in dispatch-issue
+        //     order. We sort by dispatch_idx ascending so we accumulate
+        //     in the same order as the v1.2 (b) sequential loop (the
+        //     accumulator is order-independent — it's a flat append +
+        //     sort-merge — so this is purely cosmetic for trace output).
+        {
+            std::vector<int> drain_order;
+            for (int s = 0; s < RING; ++s) {
+                if (inflight[s].valid) drain_order.push_back(s);
+            }
+            std::sort(drain_order.begin(), drain_order.end(),
+                      [&](int a, int b) {
+                          return inflight[a].dispatch_idx <
+                                 inflight[b].dispatch_idx;
+                      });
+            for (int s : drain_order) {
+                inflight[s].run.wait();
+                bo_sparse_out_ring[inflight[s].out_slot].sync(
+                    XCL_BO_SYNC_BO_FROM_DEVICE);
+                auto t_drain1 = std::chrono::high_resolution_clock::now();
+                if (keep) {
+                    accumulate_pass_blob(
+                        p_sparse_out_ring[inflight[s].out_slot],
+                        per_pass_out_bytes,
+                        args.launch_chunks,
+                        n_batch,
+                        all_emits,
+                        all_a_total,
+                        total_emits,
+                        max_emit_observed);
+                    auto td = std::chrono::duration_cast<
+                        std::chrono::microseconds>(
+                            t_drain1 - inflight[s].t_dispatch).count();
+                    float us = static_cast<float>(td);
+                    total_us += us;
+                    if (us < min_us) min_us = us;
+                    if (us > max_us) max_us = us;
+                    timed_dispatches++;
+                }
+                inflight[s].valid = false;
+            }
+        }
+    }
+
+    // Emit profile diagnostic rows (if enabled).
+    if (profile_enabled) {
+        std::cerr << "\n[kmer_count_runner] profile per-dispatch (us):\n";
+        std::cerr <<
+            "  d batch pass | stage_seq_in sync_setup zero_out | "
+            "dispatch+wait+sync_from accumulate\n";
+        for (const auto &r : profile_rows) {
+            std::cerr << "  " << r.dispatch_idx << "  "
+                      << r.batch_idx << "    " << r.pass_idx << "  | "
+                      << r.stage_seq_in_us << "  "
+                      << r.sync_out_to_dev_us << "  "
+                      << r.zero_out_us << "  | "
+                      << r.dispatch_us << "  "
+                      << r.accumulate_us << "\n";
+        }
+        std::cerr << std::flush;
     }
 
     if (max_emit_observed >= static_cast<uint32_t>(MAX_EMIT_IDX_V05)) {
@@ -815,8 +1114,13 @@ int main(int argc, char **argv) {
           " all_a_total=" + std::to_string(all_a_total) +
           " all_emits.size=" + std::to_string(all_emits.size()));
 
+    auto t_sort0 = std::chrono::high_resolution_clock::now();
     auto sorted_records = sort_and_filter(all_emits, all_a_total,
                                           args.top, args.threshold);
+    auto t_sort1 = std::chrono::high_resolution_clock::now();
+    auto sort_us = std::chrono::duration_cast<
+        std::chrono::microseconds>(t_sort1 - t_sort0).count();
+    trace("sort_and_filter wall=" + std::to_string(sort_us) + "us");
     if (args.output_format == "binary") {
         emit_binary_blob(args.output_path, sorted_records);
         trace("wrote binary blob (" + std::to_string(sorted_records.size()) +

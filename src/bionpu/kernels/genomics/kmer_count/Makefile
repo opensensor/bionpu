@@ -1,41 +1,31 @@
 ##===- Makefile -----------------------------------------------------------===##
-# Build the AIE2P xclbin for the bionpu canonical k-mer counter.
+# Build the AIE2P xclbin(s) for the bionpu canonical k-mer counter (v0.5).
 #
-# Per state/kmer_count_interface_contract.md (T1) — symbols, ObjectFifo
+# Per state/kmer_count_interface_contract.md (T1) v0.5 — symbols, ObjectFifo
 # names, constants, and the experiment switch are pinned there.
 #
-# Mirrors `bionpu-public/src/bionpu/kernels/crispr/pam_filter/Makefile`
-# (the 133-line reference). Does NOT use the cascade pattern's
-# `repo_root` / `fork_python` — kmer_count uses standard
-# `aie.iron.ObjectFifo` only and does not need the fork python path.
+# v0.5 BUILD-TIME parameter list:
+#   K         ∈ {15, 21, 31}   — k-mer width
+#   experiment ∈ {production, wide2, wide4, wide8}
+#                              → n_tiles ∈ {1, 2, 4, 8}
+#   n_passes  ∈ {1, 4, 16}     — hash-slice partition count
+#   pass_idx  ∈ {0..n_passes-1} — which slice this xclbin handles
+#   seq                        — host-side fixture length tag (artifact suffix only)
 #
-# Four experiments — each maps to a fixed n_tiles fan-out and the
-# corresponding BIONPU_KMER_COUNT_LAUNCH_CHUNKS env override consumed
-# by kmer_count.py at IRON-emit time:
-#
-#   experiment=production    n_tiles=1   LAUNCH_CHUNKS=1
-#   experiment=wide2         n_tiles=2   LAUNCH_CHUNKS=2
-#   experiment=wide4         n_tiles=4   LAUNCH_CHUNKS=4
-#   experiment=wide8         n_tiles=8   LAUNCH_CHUNKS=8
-#
-# `seq` parameterises the input length in bases (default a smoke
-# 10 Kbp; production runs scale up via the host runner CLI). It does
-# not change the xclbin shape — only the host-side dispatch chunking —
-# but is baked into the artifact_suffix so multi-seq builds coexist.
-#
-# `K` parameterises the k-mer width ∈ {15, 21, 31} for the per-tile
-# kernel symbol (`kmer_count_tile_k{K}`). Default 21.
+# v0.5 produces N_PASSES xclbin/insts pairs per (k, n_tiles, n_passes)
+# install. The single-xclbin target `final_${artifact_suffix}.xclbin`
+# builds ONE specific (pass_idx) xclbin; the `all-passes` target loops
+# pass_idx ∈ [0, n_passes) and builds them all.
 #
 # Build invocations (from this directory):
 #
 #   source /opt/xilinx/xrt/setup.sh
 #   source /home/matteius/xdna-bringup/ironenv/bin/activate
 #   export MLIR_AIE_DIR=/home/matteius/genetics/third_party/mlir-aie
-#   # PEANO_INSTALL_DIR uses the ironenv-bundled peano per the
-#   # `peano-ironenv-canonical` memory:
 #   export PEANO_INSTALL_DIR=/home/matteius/xdna-bringup/ironenv/lib/python3.14/site-packages/llvm-aie
-#   make NPU2=1 experiment=production seq=10000 all
-#   make NPU2=1 experiment=wide4      seq=10000 all
+#
+#   # Single (k=21, n_tiles=4, n_passes=4) build (4 xclbins + 1 host_runner):
+#   make NPU2=1 K=21 experiment=wide4 n_passes=4 seq=10000 all-passes
 #
 # `NPU2=1` is required (AIE2P).
 #
@@ -45,10 +35,6 @@
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 mlir_aie_dir ?= $(MLIR_AIE_DIR)
 
-# Skip the env-required checks when the only goal is `clean` so
-# housekeeping does not require sourcing the bring-up env. All build
-# rules still require MLIR_AIE_DIR + NPU2=1 because make-common +
-# PEANOWRAP2P_FLAGS are referenced unconditionally below.
 ifneq ($(MAKECMDGOALS),clean)
 
 ifeq ($(strip $(mlir_aie_dir)),)
@@ -57,7 +43,6 @@ endif
 
 include ${mlir_aie_dir}/programming_examples/makefile-common
 
-# NPU2=1 enforcement. AIE2P (Strix / XDNA 2) is the only target.
 ifneq ($(NPU2),1)
 $(error NPU2=1 is required (AIE2P); pass NPU2=1 on the make line)
 endif
@@ -68,10 +53,9 @@ devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
 seq ?= 10000
 experiment ?= production
 K ?= 21
+n_passes ?= 4
+pass_idx ?= 0
 
-# Per-experiment switch — n_tiles fan-out + LAUNCH_CHUNKS env override.
-# The artifact_suffix encodes both n_tiles and seq so all four
-# experiments × multiple seq values coexist under build/.
 ifeq ($(experiment),production)
   n_tiles = 1
   launch_chunks = 1
@@ -89,31 +73,33 @@ else
 endif
 
 targetname = bionpu_kmer_count
-# K is part of the artifact suffix so 12 (k, n_tiles) builds coexist
-# under build/ and don't clobber each other's .o files. T11 fix
-# 2026-04-28: per-tile-object instantiates only the active K's
-# template specialisation (gated on -DKMER_K_ACTIVE=$(K) below) to
-# stay within the 64 KiB CoreTile DM cap.
-artifact_suffix = k${K}_n${n_tiles}_L${seq}
+
+# Per-(k, n_tiles, n_passes, pass_idx, seq) artifact suffix so all builds
+# coexist under build/ without clobber.
+artifact_suffix = k${K}_n${n_tiles}_np${n_passes}_p${pass_idx}_L${seq}
+
+# K_only suffix used by the per-K tile object (one .o per K).
+k_obj_suffix = k${K}
 
 aie_py_src        = kmer_count.py
 aie_tile_cc_src   = kmer_count_tile.cc
-aie_agg_cc_src    = kmer_count_aggregator.cc
-aie_tile_obj      = kmer_count_tile.o
-aie_agg_obj       = kmer_count_aggregator.o
+aie_tile_obj      = kmer_count_tile_${k_obj_suffix}.o
 runner_cc_src     = runner.cpp
 
 PYTHON ?= python3
 AIE_API_INCLUDE ?= -I${MLIR_AIE_DIR}/install/include -I${MLIR_AIE_DIR}/third_party/aie_api/include
 AIECC ?= $(shell ${PYTHON} -c "import pathlib, mlir_aie; print(pathlib.Path(mlir_aie.__file__).parent / 'bin' / 'aiecc')" 2>/dev/null || command -v aiecc 2>/dev/null || echo aiecc)
 
+# Single-pass build target: produces ONE xclbin/insts pair for the
+# given (K, n_tiles, n_passes, pass_idx) tuple.
 all: build/final_${artifact_suffix}.xclbin build/insts_${artifact_suffix}.bin ${targetname}
 
 # Per-tile compute kernel object — peano clang++ targeting aie2p.
-# Exposes the three k-specialised symbols (kmer_count_tile_k15,
-# kmer_count_tile_k21, kmer_count_tile_k31); aiecc resolves the one
-# referenced by the IRON Kernel(...) declaration at lower time.
-build/${aie_tile_obj}: ${aie_tile_cc_src}
+# One object per K (the C++ source instantiates ONE template specialisation
+# gated on -DKMER_K_ACTIVE=$(K) to stay within the 64 KiB CoreTile DM cap).
+# Note: this object is independent of n_passes / pass_idx / n_tiles —
+# pass_idx / n_passes_log2 are kernel int32 args.
+build/${aie_tile_obj}: ${aie_tile_cc_src} ${srcdir}/kmer_count_constants.h
 	mkdir -p $(@D)
 ifeq ($(devicename),npu2)
 	cd $(@D) && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} \
@@ -131,43 +117,29 @@ else
 	$(error devicename=$(devicename) not supported; use NPU2=1)
 endif
 
-# Aggregator kernel object — single k-independent symbol
-# `kmer_count_aggregator`. Built separately so aiecc reads both
-# objects from the per-experiment cwd at link time.
-build/${aie_agg_obj}: ${aie_agg_cc_src}
-	mkdir -p $(@D)
-ifeq ($(devicename),npu2)
-	cd $(@D) && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} \
-	  -I${mlir_aie_dir}/aie_kernels \
-	  ${AIE_API_INCLUDE} \
-	  -c ${srcdir}/${aie_agg_cc_src} -o ${aie_agg_obj}
-else ifeq ($(devicename),npu)
-	cd $(@D) && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2_FLAGS} \
-	  -I${mlir_aie_dir}/aie_kernels \
-	  ${AIE_API_INCLUDE} \
-	  -c ${srcdir}/${aie_agg_cc_src} -o ${aie_agg_obj}
-else
-	$(error devicename=$(devicename) not supported; use NPU2=1)
-endif
-
-# IRON Python lowering → MLIR. The BIONPU_KMER_COUNT_LAUNCH_CHUNKS env
-# override is read by kmer_count.py at module-load time per the T1
-# contract; we set it on the python3 invocation so the emitted MLIR
-# carries the correct n_tiles fan-out for this experiment.
+# IRON Python lowering → MLIR. n_passes + pass_idx are baked in at IRON-emit
+# time as compile-time arith.constants (so each pass's xclbin filters on
+# its own slice).
 build/aie_${artifact_suffix}.mlir: ${aie_py_src}
 	mkdir -p $(@D)
 	BIONPU_KMER_COUNT_LAUNCH_CHUNKS=${launch_chunks} \
+	  BIONPU_KMER_COUNT_N_PASSES=${n_passes} \
+	  BIONPU_KMER_COUNT_PASS_IDX=${pass_idx} \
 	  ${PYTHON} ${srcdir}/${aie_py_src} \
 	    -d ${devicename} \
 	    --k ${K} \
 	    --launch-chunks ${launch_chunks} \
+	    --n-passes ${n_passes} \
+	    --pass-idx ${pass_idx} \
 	    > $@.tmp
 	mv $@.tmp $@
 
-# xclbin + instruction stream from aiecc. Both kernel objects are
-# copied into the xclbin build cwd so aiecc's link step finds them.
-build/final_${artifact_suffix}.xclbin: build/aie_${artifact_suffix}.mlir build/${aie_tile_obj} build/${aie_agg_obj}
+# Per-(K, n_tiles, n_passes, pass_idx) xclbin. The per-K tile object is
+# copied / aliased into the build cwd so aiecc finds it under the
+# canonical name `kmer_count_tile.o` regardless of K.
+build/final_${artifact_suffix}.xclbin: build/aie_${artifact_suffix}.mlir build/${aie_tile_obj}
 	mkdir -p $(@D)
+	cp build/${aie_tile_obj} build/kmer_count_tile.o
 	cd $(@D) && PATH=${PEANO_INSTALL_DIR}/bin:$${PATH} ${AIECC} \
 	  --aie-generate-xclbin --no-compile-host \
 	  --xclbin-name=$(@F) \
@@ -180,10 +152,8 @@ build/insts_${artifact_suffix}.bin: build/final_${artifact_suffix}.xclbin
 
 HOST_CXX ?= g++-15
 
-# Host runner — single binary at the kernel root that dispatches
-# whichever xclbin the user passes via --xclbin. Mirrors the CRISPR
-# pam_filter pattern (one host_runner binary per kernel directory).
-${targetname}: ${runner_cc_src} build/final_${artifact_suffix}.xclbin
+# Host runner — single binary at the kernel root.
+${targetname}: ${runner_cc_src}
 	@if [ -z "$$XILINX_XRT" ]; then \
 	  echo "XILINX_XRT not set; source /opt/xilinx/xrt/setup.sh first" >&2; \
 	  exit 1; \
@@ -195,12 +165,23 @@ ${targetname}: ${runner_cc_src} build/final_${artifact_suffix}.xclbin
 	  -lxrt_coreutil -luuid \
 	  -o ${targetname}
 
-# T11 performs the install step — copies the (xclbin, insts.bin,
-# host_runner) triple into
-# `bionpu-public/src/bionpu/dispatch/_npu_artifacts/bionpu_kmer_count_k${K}_n${n_tiles}/`
-# along with a per-artifact MANIFEST.md. T10 only sets up the build.
+# all-passes: build N_PASSES xclbin/insts pairs for the active
+# (K, n_tiles, n_passes, seq) tuple, plus the host_runner.
+#
+# Iterates pass_idx ∈ [0, n_passes) by recursively invoking $(MAKE)
+# with pass_idx overridden. Each recursive build produces one xclbin/
+# insts pair.
+all-passes: ${targetname}
+	@for p in $$(seq 0 $$(( ${n_passes} - 1 ))); do \
+	  echo "==> building pass_idx=$$p"; \
+	  $(MAKE) -f $(firstword $(MAKEFILE_LIST)) \
+	    NPU2=${NPU2} K=${K} experiment=${experiment} \
+	    n_passes=${n_passes} pass_idx=$$p seq=${seq} \
+	    build/final_k${K}_n${n_tiles}_np${n_passes}_p$${p}_L${seq}.xclbin \
+	    || exit 1; \
+	done
 
 clean:
 	rm -rf build ${targetname}
 
-.PHONY: all clean
+.PHONY: all all-passes clean

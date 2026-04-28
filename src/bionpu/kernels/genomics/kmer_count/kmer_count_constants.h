@@ -1,10 +1,14 @@
 // kmer_count_constants.h
-// PINNED by state/kmer_count_interface_contract.md (T1) — DO NOT EDIT
-// without updating the contract doc + every consumer in lockstep.
 //
-// Per state/kmer_count_interface_contract.md (T1) — symbols, ObjectFifo
-// names, and constants pinned there. This header is included verbatim by
-// kmer_count_tile.cc (T5) and kmer_count_aggregator.cc (T6).
+// Per state/kmer_count_interface_contract.md (T1) v0.5 — symbols,
+// ObjectFifo names, and constants pinned by the contract's
+// "v0.5 REDESIGN — Streaming + Multi-Pass" section.
+//
+// v0.5 supersedes the in-tile-counting design. Tile kernels just stream-
+// emit canonical k-mers that fall into the active hash slice; ALL counting
+// happens host-side (std::unordered_map<uint64_t, uint64_t>). N_PASSES
+// partitions the canonical hash space across passes so per-pass output
+// volume stays inside the shim DMA + tile DM budget.
 
 #ifndef BIONPU_KMER_COUNT_CONSTANTS_H
 #define BIONPU_KMER_COUNT_CONSTANTS_H
@@ -26,72 +30,70 @@ static constexpr uint64_t KMER_MASK_K15 = (1ULL << 30) - 1ULL;
 static constexpr uint64_t KMER_MASK_K21 = (1ULL << 42) - 1ULL;
 static constexpr uint64_t KMER_MASK_K31 = (1ULL << 62) - 1ULL;
 
-// Reverse-complement XOR constant. RC of a 2-bit base = base ^ 0x3
-// (A<->T = 0b00 <-> 0b11; C<->G = 0b01 <-> 0b10). For a packed k-mer
-// we XOR with the per-k all-ones mask AND bit-reverse the 2-bit
-// pairs. The packed RC mask (apply XOR before bit-reverse) for k bases
-// is exactly the per-k mask above (every 2-bit pair flipped).
-
-// Per-tile count-table geometry. 512 buckets * 12 bytes = 6 KiB.
-// Tile DM layout (per IRON-emitted ld.script for n_tiles=4 at k=21):
-//   stack             : 0x70000-0x70400 (1 KiB)
-//   partial_count_0_buff_0: 0x70400-0x73400 (12 KiB)
-//   partial_count_0_buff_1: 0x74000-0x77000 (12 KiB)
-//   seq_in_0_cons_buff_0  : 0x78000-0x79008 (4104 B)
-//   seq_in_0_cons_buff_1  : 0x7C000-0x7D008 (4104 B)
-//   .bss (count_table)    : 0x7D008-0x80000 (12,280 B available)
-// Was 4096 in initial T1 contract (T11 build OOM, ld.lld); revised
-// to 1024 (still 8 B over the 12,280 B BSS hole due to alignment of
-// the IRON-allocated buffers); final v1 sizing 512 fits with 6 KiB
-// margin. Trade-off: smaller table → more emit-on-evict cycling at
-// chr22 scale (~50M unique k-mers); host re-aggregation absorbs the
-// bandwidth correctly but T18 documents the concern; v1.1 follow-on
-// is memtile-resident larger table.
-static constexpr int32_t HASH_BUCKETS_PER_TILE = 512;
-
-// Open-addressed linear probing — emit-on-evict overflow.
-static constexpr int32_t OVERFLOW_THRESHOLD = 8;
-
-// CountRecord layout (per-bucket entry in the on-tile count table).
-// 12 bytes packed; static_assert in tile.cc.
-struct CountRecord {
-    uint64_t canonical;   // 8 bytes — canonical k-mer value
-    uint32_t count;       // 4 bytes — observed count
-};
-
-// Sparse-emit record (length-prefixed payload of partial_count_<i>
-// and sparse_out ObjectFifos). 16 bytes; the extra 4 bytes (vs. the
-// CRISPR 8-byte record) are EVICT_FLAG + reserved padding for the
-// host re-aggregation pass.
-static constexpr int32_t EMIT_RECORD_BYTES = 16;
-
-struct EmitRecord {
-    uint64_t canonical;     // 8 bytes
-    uint32_t count;         // 4 bytes
-    uint32_t flags;         // 4 bytes — bit 0: EVICT_FLAG; bits 31:1 reserved (0)
-};
-
-static constexpr uint32_t EVICT_FLAG = 1u << 0;
-
-// Sparse-emit ring slot — mirrors pam_filter post-fix EMIT_SLOT_RECORDS=1024.
-// 1024 records * 16 bytes = 16 KiB per slot; double-buffered = 32 KiB
-// on Tile Z. Tile Z sits below the 48 KiB count-table cap because it
-// drains aggregator-side, not table-side.
-static constexpr int32_t EMIT_SLOT_RECORDS = 1024;
-static constexpr int32_t EMIT_SLOT_BYTES = EMIT_SLOT_RECORDS * EMIT_RECORD_BYTES; // 16384
-
-// Streaming chunk + overlap protocol. The host (T7 runner) dispatches
-// the input in 4096-byte chunks with (k-1)/4 (rounded up) bytes of
-// overlap between consecutive chunks. Per-k overlap is also enumerated
-// for include-time pin.
+// Streaming chunk + 4-byte alignment. The host (T7 runner) dispatches
+// the input in 4096-byte chunks with overlap (per-k) so k-mers spanning
+// chunk boundaries aren't lost. Total chunk_bytes + overlap_bytes MUST
+// be a multiple of 4 because aiecc rejects non-4-aligned `aie.dma_bd`.
 static constexpr int32_t SEQ_IN_CHUNK_BYTES_BASE = 4096;
-static constexpr int32_t SEQ_IN_OVERLAP_K15 = 4;   // ceil((15-1)/4) = 4
-static constexpr int32_t SEQ_IN_OVERLAP_K21 = 5;   // ceil((21-1)/4) = 5
-static constexpr int32_t SEQ_IN_OVERLAP_K31 = 8;   // ceil((31-1)/4) = 8
+static constexpr int32_t SEQ_IN_OVERLAP_K15 = 4;   // 4096+4 = 4100, aligned
+static constexpr int32_t SEQ_IN_OVERLAP_K21 = 8;   // 4096+8 = 4104, aligned (need >=5, rounded up)
+static constexpr int32_t SEQ_IN_OVERLAP_K31 = 8;   // 4096+8 = 4104, aligned
 
-// Aggregator fan-in cap. n_tiles is one of {1, 2, 4, 8}; aggregator
-// signature widens to 8 partial inputs and zeros unused ones at host
-// dispatch time.
-static constexpr int32_t MAX_TILES = 8;
+// =====================================================================
+// v0.5 streaming-emit constants.
+// =====================================================================
+//
+// Per-pass emit format (written by tile kernel into partial_out):
+//   [uint32 emit_idx LE prefix]
+//   [emit_idx × uint64 canonical]
+//   [zero pad to PARTIAL_OUT_BYTES_V05_PADDED]
+//
+// MAX_EMIT_IDX_V05 caps the per-pass canonical count so the writeback
+// stays within PARTIAL_OUT_BYTES_V05_PADDED (32 KiB). The kernel asserts
+// emit_idx < MAX_EMIT_IDX_V05 and silently drops further emissions; this
+// only fires at N_PASSES=1 (no slice partitioning) with chunks producing
+// > MAX_EMIT_IDX_V05 k-mers. The host runner re-dispatches with smaller
+// chunks or larger N_PASSES if the cap fires (runtime check in T7).
+//
+// 32768 = 32 KiB; (32768 - 4) / 8 = 4095.5 → cap at 4095.
+static constexpr int32_t PARTIAL_OUT_BYTES_V05_PADDED = 32768;  // 32 KiB
+static constexpr int32_t MAX_EMIT_IDX_V05 = 4095;               // (32768 - 4) / 8 floor
 
-#endif // BIONPU_KMER_COUNT_CONSTANTS_H
+// =====================================================================
+// Hash-slice partition: SLICE_HASH_SHIFT = 0 (low bits of canonical).
+// =====================================================================
+//
+// We use the LOW bits of `canonical` for slice membership. This is
+// uniform across k (k=15 has only 30 canonical bits, so a high-bit
+// shift of 32 would produce 0 for ALL canonicals at k=15 and break
+// the partition for the smallest k). Low-bits is a standard hash-table
+// bucket-index trick; the canonical is already a near-uniform hash of
+// the k-mer's identity.
+//
+// Slice membership:
+//   slice = canonical & ((1 << n_passes_log2) - 1)
+//   include this canonical IFF slice == pass_idx
+//
+// Coverage is exact: every canonical maps to exactly one slice in
+// [0, N_PASSES); no double-counting, no dropped k-mers. The host's
+// merged unordered_map after N_PASSES dispatches equals the dense
+// k-mer count exactly.
+static constexpr int32_t SLICE_HASH_SHIFT = 0;
+
+// =====================================================================
+// N_PASSES support set: {1, 4, 16}. log2 ∈ {0, 2, 4}.
+// =====================================================================
+//
+//   N_PASSES = 1   (log2 = 0)  : single pass; only viable for fixtures
+//                                where chunk's k-mers ≤ MAX_EMIT_IDX_V05.
+//   N_PASSES = 4   (log2 = 2)  : default; balanced (per-pass ≈ 1/4
+//                                of chunk's k-mers).
+//   N_PASSES = 16  (log2 = 4)  : tight memory; per-pass ≈ 1/16, finer
+//                                dispatch granularity.
+//
+// At smoke 10 Kbp / k=21, chunk is 2500 bytes producing ~9980 k-mers;
+// N_PASSES=1 emits 9980 (exceeds 4095 cap by ~5885), N_PASSES=4 emits
+// ~2495 per pass (within cap), so N_PASSES≥4 is required for correctness.
+static constexpr int32_t N_PASSES_VALUES_LOG2[3] = {0, 2, 4};
+
+#endif  // BIONPU_KMER_COUNT_CONSTANTS_H

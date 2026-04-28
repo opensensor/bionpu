@@ -10,21 +10,23 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 //
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// Per state/kmer_count_interface_contract.md (T1) v0.5 — symbols, ObjectFifo
+// names, constants, the streaming chunk-with-overlap protocol, and the
+// host-side hash-slice multi-pass loop are pinned by the contract's
+// "v0.5 REDESIGN" section.
 //
-// Per state/kmer_count_interface_contract.md (T1) — symbols, ObjectFifo
-// names, constants, the streaming chunk-with-overlap dispatch protocol,
-// the emit-on-evict overflow record layout, and the host-side dedup-by-
-// canonical re-aggregation pass are pinned there. This runner.cpp is
-// the T7 deliverable: chunked dispatch with per-k overlap, host-side
-// re-aggregation, and Jellyfish-FASTA output.
-//
-// Mirrors:
-//  - bionpu/kernels/crispr/pam_filter/runner.cpp (chunked dispatch,
-//    sparse-emit drain, PASS! marker, Avg/Min/Max NPU time lines)
-//  - bionpu/kernels/basecalling/linear_projection/runner.cpp (simpler
-//    single-launch CLI shape; parser regex format).
+// v0.5 host-side dataflow:
+//   1. Load N_PASSES xclbins (one per pass_idx; xclbin/insts paths are
+//      derived from --xclbin / --instr templates by appending _p{idx}
+//      OR by passing --xclbins-dir <dir> with final_p{i}.xclbin per pass).
+//   2. Plan input chunks (4096 bytes + per-k overlap, chunk-aligned).
+//   3. For each chunk, for each pass_idx: zero the output BO,
+//      kernel.run(opcode, instr, instr_size, bo_seq_in, bo_sparse_out,
+//      n_input_bytes), wait, sync from device, parse the joined output
+//      blob (N_TILES × [uint32 emit_idx][emit_idx × uint64 canonical]),
+//      counts[canonical]++ for each emitted canonical.
+//   4. After all chunks × all passes, sort by (count desc, canonical asc),
+//      apply --top + --threshold, emit Jellyfish-FASTA.
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -37,6 +39,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -47,59 +50,37 @@
 namespace {
 
 // ---------------------------------------------------------------------
-// Pinned constants (mirror kmer_count_constants.h byte-equal). T7's
-// runner cannot include the AIE-side header directly because it pulls
-// AIE-specific sysinclude paths via Peano's libcxx; we duplicate the
-// numerics here and static_assert the math against the contract.
+// Pinned constants (mirror kmer_count_constants.h byte-equal).
 // ---------------------------------------------------------------------
 
 constexpr int32_t SEQ_IN_CHUNK_BYTES_BASE = 4096;
 
 // Per-k overlap = max(ceil((k-1)/4), 4-byte alignment requirement).
-// Total chunk = SEQ_IN_CHUNK_BYTES_BASE + overlap MUST be a multiple
-// of 4 because aiecc rejects `aie.dma_bd` ops with non-4-aligned
-// transfer length. ceil((21-1)/4) = 5 was correct for k-mer overlap
-// but 4096+5=4101 fails the alignment check; round up to 8.
-//   k=15: ceil((15-1)/4) = 4; 4096+4 = 4100, aligned (no change)
-//   k=21: ceil((21-1)/4) = 5; bump to 8 so 4096+8 = 4104, aligned
-//   k=31: ceil((31-1)/4) = 8; 4096+8 = 4104, aligned (no change)
-constexpr int32_t SEQ_IN_OVERLAP_K15 = 4;   // 4-aligned; k-mer overlap need = 4
-constexpr int32_t SEQ_IN_OVERLAP_K21 = 8;   // 4-aligned; k-mer overlap need = 5 (rounded up)
-constexpr int32_t SEQ_IN_OVERLAP_K31 = 8;   // 4-aligned; k-mer overlap need = 8
+constexpr int32_t SEQ_IN_OVERLAP_K15 = 4;
+constexpr int32_t SEQ_IN_OVERLAP_K21 = 8;
+constexpr int32_t SEQ_IN_OVERLAP_K31 = 8;
 
-// Catch silent contract drift at compile time:
-//   1. overlap covers the (k-1)-base k-mer span: overlap_bytes >= ceil((k-1)/4)
-//   2. total chunk + overlap is 4-byte aligned (aiecc requirement)
-static_assert(SEQ_IN_OVERLAP_K15 >= ((15 - 1) + 3) / 4 && (SEQ_IN_CHUNK_BYTES_BASE + SEQ_IN_OVERLAP_K15) % 4 == 0,
+static_assert(SEQ_IN_OVERLAP_K15 >= ((15 - 1) + 3) / 4 &&
+              (SEQ_IN_CHUNK_BYTES_BASE + SEQ_IN_OVERLAP_K15) % 4 == 0,
               "k=15 overlap must cover (k-1) bases AND keep total 4-byte aligned");
-static_assert(SEQ_IN_OVERLAP_K21 >= ((21 - 1) + 3) / 4 && (SEQ_IN_CHUNK_BYTES_BASE + SEQ_IN_OVERLAP_K21) % 4 == 0,
+static_assert(SEQ_IN_OVERLAP_K21 >= ((21 - 1) + 3) / 4 &&
+              (SEQ_IN_CHUNK_BYTES_BASE + SEQ_IN_OVERLAP_K21) % 4 == 0,
               "k=21 overlap must cover (k-1) bases AND keep total 4-byte aligned");
-static_assert(SEQ_IN_OVERLAP_K31 >= ((31 - 1) + 3) / 4 && (SEQ_IN_CHUNK_BYTES_BASE + SEQ_IN_OVERLAP_K31) % 4 == 0,
+static_assert(SEQ_IN_OVERLAP_K31 >= ((31 - 1) + 3) / 4 &&
+              (SEQ_IN_CHUNK_BYTES_BASE + SEQ_IN_OVERLAP_K31) % 4 == 0,
               "k=31 overlap must cover (k-1) bases AND keep total 4-byte aligned");
 
-// EmitRecord layout (16 B). Mirrors kmer_count_constants.h.
-struct EmitRecord {
-    uint64_t canonical;
-    uint32_t count;
-    uint32_t flags;
-};
+// v0.5 partial-out element size: 32 KiB per pass-slot. Layout per slot:
+//   [uint32 emit_idx LE prefix][emit_idx × uint64 canonical][zero pad]
+constexpr int32_t PARTIAL_OUT_BYTES_V05_PADDED = 32768;
+constexpr int32_t MAX_EMIT_IDX_V05 = 4095;
 
-static_assert(sizeof(EmitRecord) == 16, "EmitRecord must be 16 bytes packed");
-
-constexpr uint32_t EVICT_FLAG = 1u << 0;
-constexpr int32_t EMIT_RECORD_BYTES = 16;
-constexpr int32_t EMIT_SLOT_RECORDS = 1024;
-constexpr int32_t EMIT_SLOT_BYTES = EMIT_SLOT_RECORDS * EMIT_RECORD_BYTES;
-
-static_assert(EMIT_SLOT_BYTES == 16384,
-              "EMIT_SLOT_BYTES must be 16 KiB per T1 contract");
-
-// Per-k canonical-bit-width mask (apply when decoding back to ACGT).
 constexpr uint64_t KMER_MASK_K15 = (1ULL << 30) - 1ULL;
 constexpr uint64_t KMER_MASK_K21 = (1ULL << 42) - 1ULL;
 constexpr uint64_t KMER_MASK_K31 = (1ULL << 62) - 1ULL;
 
-constexpr int32_t MAX_TILES = 8;
+// SLICE_HASH_SHIFT is 0 (low bits of canonical = slice index).
+// (No need to use it host-side; the kernel applies it during emit.)
 
 // ---------------------------------------------------------------------
 // Per-k overlap selector.
@@ -161,14 +142,10 @@ std::vector<uint8_t> read_packed_input(const std::string &path) {
 }
 
 // ---------------------------------------------------------------------
-// 2-bit canonical -> ACGT decoder. Inverse of T2's pack_dna_2bit /
-// matches T1's MSB-first wire format. Decodes the lowest 2*k bits of
-// `canonical` to a length-k ASCII string. Bit pair (k-1) is the MSB
-// (most significant 2 bits within the masked region) which corresponds
-// to the FIRST base of the k-mer (consistent with the rolling kernel
-// shift order: forward = (forward << 2) | new_base, so the most
-// recently shifted-in base is the LSB and the oldest base is at the
-// top).
+// 2-bit canonical -> ACGT decoder. Inverse of T2's pack_dna_2bit; matches
+// T1's MSB-first wire format. Decodes the lowest 2*k bits of `canonical`
+// to a length-k ASCII string. Bit pair (k-1) is the MSB (most significant
+// 2 bits within the masked region) → first base of the k-mer.
 // ---------------------------------------------------------------------
 char base_of_2bit(uint64_t code) {
     switch (static_cast<unsigned>(code & 0x3ULL)) {
@@ -177,17 +154,13 @@ char base_of_2bit(uint64_t code) {
         case 2: return 'G';
         case 3: return 'T';
     }
-    return 'N';  // unreachable
+    return 'N';
 }
 
 std::string decode_canonical_to_acgt(uint64_t canonical, int k) {
-    // Mask off any high garbage above the canonical bit-width before
-    // decoding, defensive against corrupt records.
     uint64_t masked = canonical & kmer_mask_for_k(k);
     std::string out;
     out.resize(static_cast<size_t>(k));
-    // Position 0 = oldest (top 2 bits of the masked value);
-    // Position k-1 = newest (lowest 2 bits).
     for (int pos = 0; pos < k; ++pos) {
         int shift = 2 * (k - 1 - pos);
         uint64_t code = (masked >> shift) & 0x3ULL;
@@ -200,8 +173,13 @@ std::string decode_canonical_to_acgt(uint64_t canonical, int k) {
 // CLI.
 // ---------------------------------------------------------------------
 struct Args {
-    std::string xclbin;
-    std::string instr;
+    // Comma-separated list of xclbin paths, one per pass. Length must equal n_passes.
+    // Alternatively, `--xclbin <single>` sets pass 0 (n_passes=1) or
+    // `--xclbins-dir <dir>` finds final_p{i}.xclbin / insts_p{i}.bin in <dir>.
+    std::string xclbins_dir;
+    std::string xclbin_template;        // single xclbin path; for n_passes=1 OR template-mode
+    std::string instr_template;         // matching insts.bin path
+    std::string artifact_suffix;        // optional, used when constructing per-pass paths from a base dir
     std::string kernel = "MLIR_AIE";
     std::string input_path;
     std::string output_path;
@@ -209,6 +187,7 @@ struct Args {
     int top = 1000;
     int threshold = 1;
     int launch_chunks = 4;
+    int n_passes = 4;
     int iters = 1;
     int warmup = 0;
 };
@@ -218,8 +197,12 @@ void print_usage(std::ostream &os) {
 "Usage: kmer_count_runner [options]\n"
 "\n"
 "Required:\n"
-"  -x, --xclbin <path>         xclbin file (final.xclbin)\n"
-"  -i, --instr <path>          NPU instructions binary (insts.bin)\n"
+"  -x, --xclbin <path>         xclbin file (final_p0.xclbin) — pass-0 xclbin\n"
+"                              when --n-passes>1, the runner derives pass-i\n"
+"                              xclbin by replacing the final '_p0' (or 'p0')\n"
+"                              token in the filename with '_p<i>' (or 'p<i>').\n"
+"  -i, --instr <path>          NPU instructions binary (insts_p0.bin) — pass-0\n"
+"                              instr; same _p<i>-substitution as --xclbin.\n"
 "  --input <packed_2bit>       packed-2-bit input (.2bit.bin)\n"
 "  --output <jf_fasta>         Jellyfish-FASTA output ('>count\\nkmer\\n')\n"
 "  --k {15,21,31}              k-mer length\n"
@@ -228,12 +211,15 @@ void print_usage(std::ostream &os) {
 "  -k, --kernel <name>         kernel name (default MLIR_AIE)\n"
 "  --top <N>                   top-N records (default 1000; 0 = all)\n"
 "  --launch-chunks {1,2,4,8}   tile fan-out (default 4)\n"
+"  --n-passes {1,4,16}         hash-slice partition count (default 4)\n"
 "  --iters <N>                 timed iterations (default 1)\n"
 "  --warmup <N>                untimed warmup iters (default 0)\n"
 "  --threshold <int>           min count to emit (default 1)\n"
 "\n"
-"All 9 args (--xclbin/--instr/--kernel/--input/--output/--k/--top/\n"
-"--launch-chunks/--iters/--warmup) parsed per T1 contract.\n";
+"Per state/kmer_count_interface_contract.md v0.5: the runner dispatches\n"
+"N_PASSES xclbins per chunk (one per hash-slice partition), accumulates\n"
+"canonical k-mers into a host-side unordered_map, then sorts + topN +\n"
+"emits Jellyfish-FASTA.\n";
 }
 
 Args parse(int argc, char **argv) {
@@ -249,8 +235,8 @@ Args parse(int argc, char **argv) {
                 throw std::runtime_error("missing value for " + key);
             return argv[++i];
         };
-        if (key == "-x" || key == "--xclbin") a.xclbin = next();
-        else if (key == "-i" || key == "--instr") a.instr = next();
+        if (key == "-x" || key == "--xclbin") a.xclbin_template = next();
+        else if (key == "-i" || key == "--instr") a.instr_template = next();
         else if (key == "-k" || key == "--kernel") a.kernel = next();
         else if (key == "--input") a.input_path = next();
         else if (key == "--output") a.output_path = next();
@@ -258,115 +244,155 @@ Args parse(int argc, char **argv) {
         else if (key == "--top") a.top = std::stoi(next());
         else if (key == "--threshold") a.threshold = std::stoi(next());
         else if (key == "--launch-chunks") a.launch_chunks = std::stoi(next());
+        else if (key == "--n-passes") a.n_passes = std::stoi(next());
         else if (key == "--iters") a.iters = std::stoi(next());
         else if (key == "--warmup") a.warmup = std::stoi(next());
         else throw std::runtime_error("unknown arg: " + key);
     }
-    if (a.xclbin.empty() || a.instr.empty() || a.input_path.empty() ||
-        a.output_path.empty())
+    if (a.xclbin_template.empty() || a.instr_template.empty() ||
+        a.input_path.empty() || a.output_path.empty())
         throw std::runtime_error(
             "required: -x <xclbin> -i <instr> --input <path> "
             "--output <path> --k {15,21,31}");
     if (a.k != 15 && a.k != 21 && a.k != 31)
-        throw std::runtime_error(
-            "--k must be one of {15, 21, 31} per T1 contract");
+        throw std::runtime_error("--k must be one of {15, 21, 31}");
     if (a.launch_chunks != 1 && a.launch_chunks != 2 &&
         a.launch_chunks != 4 && a.launch_chunks != 8)
-        throw std::runtime_error(
-            "--launch-chunks must be one of {1, 2, 4, 8} per T1 contract");
+        throw std::runtime_error("--launch-chunks must be one of {1, 2, 4, 8}");
+    if (a.n_passes != 1 && a.n_passes != 4 && a.n_passes != 16)
+        throw std::runtime_error("--n-passes must be one of {1, 4, 16}");
     if (a.iters <= 0)
         throw std::runtime_error("--iters must be > 0");
     if (a.warmup < 0)
         throw std::runtime_error("--warmup must be >= 0");
     if (a.top < 0)
-        throw std::runtime_error("--top must be >= 0 (0 = all-above-threshold)");
+        throw std::runtime_error("--top must be >= 0");
     if (a.threshold < 0)
         throw std::runtime_error("--threshold must be >= 0");
     return a;
 }
 
 // ---------------------------------------------------------------------
-// Streaming chunk-with-overlap dispatch.
+// Per-pass artifact path resolver.
 //
-// Per T1 contract: input is dispatched in SEQ_IN_CHUNK_BYTES_BASE
-// (=4096) byte chunks with overlap_bytes (per-k) of overlap between
-// consecutive chunks. The seq_in ObjectFifo carries
-// (chunk_bytes + overlap_bytes) per element. Without the overlap,
-// k-mers spanning chunk boundaries are lost (correctness fail vs
-// Jellyfish at T14).
+// Convention: --xclbin and --instr point to the pass-0 artifacts
+// (containing '_p0' or 'p0' in filename). Per-pass paths derived by
+// replacing the substring with '_p<i>' / 'p<i>'.
 //
-// chunk i covers source bytes [i*4096, i*4096 + 4096 + overlap),
-// clamped to the input length on the last chunk. The kernel uses
-// n_input_bytes to bound its rolling loop so the last (possibly
-// short) chunk is correct.
+// For n_passes=1, pass_idx=0 — path used as-is. The caller may pass a
+// path without '_p0' substring; that's fine for n_passes=1 (we pass it
+// through unchanged).
 // ---------------------------------------------------------------------
+std::string resolve_pass_path(const std::string &template_path,
+                              int pass_idx, int n_passes) {
+    if (n_passes == 1) {
+        return template_path;  // single pass; use template path as-is
+    }
+    // Try '_p<n>' substring substitution (standard Makefile naming).
+    std::string out = template_path;
+    std::string from = "_p0";
+    std::string to = "_p" + std::to_string(pass_idx);
+    auto pos = out.rfind(from);
+    if (pos != std::string::npos) {
+        out.replace(pos, from.size(), to);
+        return out;
+    }
+    // Fallback: append _p<i> before the final extension.
+    auto dot = template_path.rfind('.');
+    if (dot != std::string::npos) {
+        out = template_path.substr(0, dot) + "_p" + std::to_string(pass_idx) +
+              template_path.substr(dot);
+        return out;
+    }
+    return template_path + "_p" + std::to_string(pass_idx);
+}
+
+// ---------------------------------------------------------------------
+// Streaming chunk-with-overlap dispatch planner.
+//
+// Each chunk carries up to (SEQ_IN_CHUNK_BYTES_BASE + overlap_bytes - 4)
+// bytes of payload (the leading 4 bytes are the in-band uint32 LE
+// length prefix consumed by the kernel). Without the -4 the kernel's
+// length prefix would clobber the first 4 payload bytes.
+// ---------------------------------------------------------------------
+constexpr size_t LENGTH_PREFIX_BYTES = 4;
+
 struct ChunkPlan {
     size_t src_offset;     // first byte of this chunk in the source buffer
     size_t bytes;          // bytes copied into the BO for this chunk
-                            // (<= 4096 + overlap; smaller on the final chunk)
+                           // (<= chunk_payload_capacity)
 };
 
 std::vector<ChunkPlan> plan_chunks(size_t input_bytes, int overlap_bytes) {
     std::vector<ChunkPlan> plan;
     if (input_bytes == 0) return plan;
-    const size_t base = static_cast<size_t>(SEQ_IN_CHUNK_BYTES_BASE);
-    const size_t ov = static_cast<size_t>(overlap_bytes);
+    const size_t total_chunk = static_cast<size_t>(SEQ_IN_CHUNK_BYTES_BASE)
+                             + static_cast<size_t>(overlap_bytes);
+    const size_t payload_cap = total_chunk - LENGTH_PREFIX_BYTES;
+    // Advance per chunk by base = payload_cap - overlap_bytes (so the
+    // overlap region is re-read by the next chunk to preserve k-mers
+    // straddling boundaries).
+    const size_t advance = payload_cap - static_cast<size_t>(overlap_bytes);
     size_t off = 0;
     while (off < input_bytes) {
-        size_t end = std::min(off + base + ov, input_bytes);
+        size_t end = std::min(off + payload_cap, input_bytes);
         ChunkPlan p;
         p.src_offset = off;
         p.bytes = end - off;
         plan.push_back(p);
         if (end >= input_bytes) break;
-        off += base;  // advance by chunk_base; the overlap region is
-                       // re-read by the next chunk to preserve k-mers
-                       // straddling the boundary.
+        off += advance;
     }
     return plan;
 }
 
 // ---------------------------------------------------------------------
-// Host-side overflow re-aggregation.
+// Per-pass output blob parser.
 //
-// Per T1 contract, the output BO carries:
-//   (a) regular sparse-emit records (flags == 0, length-prefixed
-//       within each EMIT_SLOT)
-//   (b) evicted-overflow records (flags & EVICT_FLAG)
-// Both are 16 bytes (canonical_u64, count_u32, flags_u32). The host
-// deduplicates by canonical_u64 across the entire output BO,
-// summing count_u32 regardless of EVICT_FLAG. This is REQUIRED for
-// T14 byte-equal-vs-Jellyfish on chr22.
+// Output layout per pass: N_TILES × PARTIAL_OUT_BYTES_V05_PADDED bytes.
+// Per-tile slot: [uint32 emit_idx LE prefix][emit_idx × uint64 canonical].
 //
-// `out_blob` is the entire flattened post-sync output BO (size =
-// n_chunks * launch_chunks * EMIT_SLOT_BYTES, or whatever the
-// runner allocated). We scan EMIT_RECORD_BYTES at a stride and
-// accept records whose `count > 0` (this matches the kernel's
-// convention: zero-count slots are skipped on emit). Records that
-// happen to land in the all-zero post-end-of-stream tail are
-// filtered out by `count == 0`.
+// For each canonical, counts[canonical]++. Each emit IS one observation
+// (NOT a count summary) — the kernel emits one canonical per k-mer
+// occurrence whose canonical falls into the active hash slice.
 // ---------------------------------------------------------------------
-std::unordered_map<uint64_t, uint64_t>
-reaggregate_records(const std::vector<uint8_t> &out_blob) {
-    std::unordered_map<uint64_t, uint64_t> merged;
-    if (out_blob.size() < sizeof(EmitRecord)) return merged;
-    const size_t n_records = out_blob.size() / sizeof(EmitRecord);
-    const EmitRecord *recs =
-        reinterpret_cast<const EmitRecord *>(out_blob.data());
-    for (size_t i = 0; i < n_records; ++i) {
-        const EmitRecord &r = recs[i];
-        if (r.count == 0) continue;  // empty/uninitialized slot
-        // Sum counts across duplicates regardless of EVICT_FLAG.
-        merged[r.canonical] += static_cast<uint64_t>(r.count);
+size_t accumulate_pass_blob(const uint8_t *blob, size_t blob_size,
+                            int n_tiles,
+                            std::unordered_map<uint64_t, uint64_t> &counts,
+                            size_t &out_emit_total) {
+    size_t emits = 0;
+    for (int t = 0; t < n_tiles; ++t) {
+        size_t off = static_cast<size_t>(t) *
+                     static_cast<size_t>(PARTIAL_OUT_BYTES_V05_PADDED);
+        if (off + 4 > blob_size) break;
+        uint32_t emit_idx = 0;
+        std::memcpy(&emit_idx, blob + off, 4);
+        if (emit_idx > static_cast<uint32_t>(MAX_EMIT_IDX_V05)) {
+            // Defensive: kernel must cap at MAX_EMIT_IDX_V05; if blob
+            // returned a higher value, treat it as corruption and clamp.
+            emit_idx = static_cast<uint32_t>(MAX_EMIT_IDX_V05);
+        }
+        size_t payload_off = off + 4;
+        size_t payload_max = static_cast<size_t>(emit_idx) * 8u;
+        if (payload_off + payload_max > blob_size) {
+            payload_max = (blob_size > payload_off) ? (blob_size - payload_off) : 0;
+            payload_max = (payload_max / 8u) * 8u;
+        }
+        const uint8_t *p = blob + payload_off;
+        for (size_t i = 0; i < (size_t)emit_idx; ++i) {
+            uint64_t canonical = 0;
+            std::memcpy(&canonical, p + i * 8u, 8);
+            counts[canonical] += 1ULL;
+        }
+        emits += static_cast<size_t>(emit_idx);
     }
-    return merged;
+    out_emit_total += emits;
+    return emits;
 }
 
 // ---------------------------------------------------------------------
 // Sort + filter + emit Jellyfish-FASTA.
-//
-// Output format per T1 / PRD §3.2 / Q5: '>count\nkmer\n' per record,
-// with kmer in ACGT decoded MSB-first from the 2-bit canonical uint64.
+// Output format per T1 / PRD §3.2 / Q5: '>count\nkmer\n' per record.
 // Sort key: (count desc, canonical asc).
 // ---------------------------------------------------------------------
 struct FinalRecord {
@@ -383,10 +409,11 @@ void emit_jellyfish_fasta(const std::string &path,
         if (kv.second < static_cast<uint64_t>(threshold)) continue;
         v.push_back({kv.first, kv.second});
     }
-    std::sort(v.begin(), v.end(), [](const FinalRecord &a, const FinalRecord &b) {
-        if (a.count != b.count) return a.count > b.count;
-        return a.canonical < b.canonical;
-    });
+    std::sort(v.begin(), v.end(),
+              [](const FinalRecord &a, const FinalRecord &b) {
+                  if (a.count != b.count) return a.count > b.count;
+                  return a.canonical < b.canonical;
+              });
     if (top > 0 && static_cast<size_t>(top) < v.size()) {
         v.resize(static_cast<size_t>(top));
     }
@@ -398,6 +425,18 @@ void emit_jellyfish_fasta(const std::string &path,
           << decode_canonical_to_acgt(r.canonical, k) << '\n';
     }
 }
+
+// ---------------------------------------------------------------------
+// Per-pass loaded artifacts. We load all N_PASSES xclbins up-front so
+// dispatching per-pass is O(1) per kernel call.
+// ---------------------------------------------------------------------
+struct PassArtifacts {
+    xrt::xclbin xclbin;
+    xrt::hw_context context;
+    xrt::kernel kernel;
+    xrt::bo bo_instr;
+    std::vector<uint32_t> instr;
+};
 
 }  // namespace
 
@@ -417,7 +456,8 @@ int main(int argc, char **argv) {
     const int overlap_bytes = overlap_bytes_for_k(args.k);
     trace("k=" + std::to_string(args.k) +
           " overlap_bytes=" + std::to_string(overlap_bytes) +
-          " launch_chunks=" + std::to_string(args.launch_chunks));
+          " launch_chunks=" + std::to_string(args.launch_chunks) +
+          " n_passes=" + std::to_string(args.n_passes));
 
     // Load packed-2-bit input from disk.
     auto input_buf = read_packed_input(args.input_path);
@@ -428,137 +468,163 @@ int main(int argc, char **argv) {
     const size_t n_chunks_host = chunks.size();
     trace("planned chunks=" + std::to_string(n_chunks_host));
 
-    // Load instr binary.
-    auto instr_v = read_instr_binary(args.instr);
-    trace("instr_words=" + std::to_string(instr_v.size()));
+    // Per-pass output blob size = N_TILES × 32 KiB.
+    const size_t per_pass_out_bytes =
+        static_cast<size_t>(args.launch_chunks) *
+        static_cast<size_t>(PARTIAL_OUT_BYTES_V05_PADDED);
 
-    // Per-chunk seq_in BO size = chunk_bytes_base + overlap_bytes
-    // (last chunk may carry fewer bytes; we still allocate full slot
-    // and zero-pad).
+    // Per-chunk seq_in BO size = chunk_bytes_base + overlap_bytes.
     const size_t seq_in_slot_bytes =
         static_cast<size_t>(SEQ_IN_CHUNK_BYTES_BASE + overlap_bytes);
 
-    // Per-chunk sparse_out BO size = launch_chunks * EMIT_SLOT_BYTES.
-    // (One EMIT_SLOT per active match-tile; T1 contract pins.)
-    const size_t sparse_out_slot_bytes =
-        static_cast<size_t>(args.launch_chunks) *
-        static_cast<size_t>(EMIT_SLOT_BYTES);
-
     // ------------------------------------------------------------
-    // XRT setup.
+    // XRT setup — load N_PASSES xclbins.
     // ------------------------------------------------------------
     trace("xrt device open");
     unsigned int device_index = 0;
     auto device = xrt::device(device_index);
 
-    trace("xclbin load path=" + args.xclbin);
-    auto xclbin = xrt::xclbin(args.xclbin);
-    device.register_xclbin(xclbin);
+    std::vector<PassArtifacts> per_pass(static_cast<size_t>(args.n_passes));
+    for (int p = 0; p < args.n_passes; ++p) {
+        std::string xclbin_path =
+            resolve_pass_path(args.xclbin_template, p, args.n_passes);
+        std::string instr_path =
+            resolve_pass_path(args.instr_template, p, args.n_passes);
+        trace("pass=" + std::to_string(p) +
+              " xclbin=" + xclbin_path +
+              " instr=" + instr_path);
 
-    xrt::hw_context context(device, xclbin.get_uuid());
-    trace("kernel open name=" + args.kernel);
-    auto kernel = xrt::kernel(context, args.kernel);
+        per_pass[p].xclbin = xrt::xclbin(xclbin_path);
+        device.register_xclbin(per_pass[p].xclbin);
+        per_pass[p].context = xrt::hw_context(
+            device, per_pass[p].xclbin.get_uuid());
+        per_pass[p].kernel = xrt::kernel(per_pass[p].context, args.kernel);
+        per_pass[p].instr = read_instr_binary(instr_path);
 
-    // Allocate 3 BOs: instr, seq_in (one slot, reused per chunk),
-    // sparse_out (one slot per launch, accumulated host-side).
-    auto bo_instr = xrt::bo(device, instr_v.size() * sizeof(uint32_t),
-                            XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
+        per_pass[p].bo_instr = xrt::bo(
+            device, per_pass[p].instr.size() * sizeof(uint32_t),
+            XCL_BO_FLAGS_CACHEABLE, per_pass[p].kernel.group_id(1));
+        auto *p_instr = per_pass[p].bo_instr.map<uint32_t *>();
+        std::memcpy(p_instr, per_pass[p].instr.data(),
+                    per_pass[p].instr.size() * sizeof(uint32_t));
+        per_pass[p].bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
+
+    // Allocate seq_in / sparse_out BOs against pass-0's kernel
+    // (group_ids should match across passes since the IRON Python
+    // graph topology is identical across n_passes_log2/pass_idx values).
+    const auto &k0 = per_pass[0].kernel;
     auto bo_seq_in = xrt::bo(device, seq_in_slot_bytes,
-                             XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
-    auto bo_sparse_out = xrt::bo(device, sparse_out_slot_bytes,
-                                  XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
+                              XRT_BO_FLAGS_HOST_ONLY, k0.group_id(3));
+    auto bo_sparse_out = xrt::bo(device, per_pass_out_bytes,
+                                  XRT_BO_FLAGS_HOST_ONLY, k0.group_id(4));
 
-    auto *p_instr = bo_instr.map<uint32_t *>();
-    std::memcpy(p_instr, instr_v.data(), instr_v.size() * sizeof(uint32_t));
     auto *p_seq_in = bo_seq_in.map<uint8_t *>();
     auto *p_sparse_out = bo_sparse_out.map<uint8_t *>();
 
-    bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-    // Host-side accumulator for ALL emitted records across ALL chunks
-    // and ALL timed iters of the LAST iteration only (warmup discards
-    // host data; iter k>warmup keeps host data).
-    std::vector<uint8_t> all_out_concat;
-    all_out_concat.reserve(n_chunks_host * sparse_out_slot_bytes);
+    // Host-side accumulator. Counts live across all chunks AND all passes.
+    // Each pass increments counts for its slice's canonicals.
+    std::unordered_map<uint64_t, uint64_t> counts;
 
     const unsigned int opcode = 3;
     float total_us = 0.0f;
     float min_us = 1e30f;
     float max_us = 0.0f;
-    int timed_chunks = 0;
+    int timed_dispatches = 0;
+    size_t total_emits = 0;
+    uint32_t max_emit_observed = 0;
 
     const int total_iters = args.warmup + args.iters;
     for (int it = 0; it < total_iters; ++it) {
         const bool keep = (it >= args.warmup);
-        if (keep) all_out_concat.clear();
+        if (keep) counts.clear();
 
         for (size_t ci = 0; ci < n_chunks_host; ++ci) {
             const ChunkPlan &c = chunks[ci];
 
-            // Zero-pad the seq_in slot so the tail of the LAST
-            // (possibly short) chunk doesn't alias stale data from
-            // a previous chunk.
+            // Stage seq_in for this chunk: 4-byte uint32 LE length
+            // prefix at offset 0 (= c.bytes), then payload at offset 4
+            // for c.bytes bytes; zero-pad remainder.
             std::memset(p_seq_in, 0, seq_in_slot_bytes);
-            std::memcpy(p_seq_in,
+            // Length prefix.
+            uint32_t actual_bytes_le = static_cast<uint32_t>(c.bytes);
+            std::memcpy(p_seq_in, &actual_bytes_le, 4);
+            // Payload.
+            std::memcpy(p_seq_in + LENGTH_PREFIX_BYTES,
                         input_buf.data() + c.src_offset,
                         c.bytes);
             bo_seq_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-            // Zero the output slot so leftover records from the
-            // previous chunk don't double-count after re-aggregation.
-            std::memset(p_sparse_out, 0, sparse_out_slot_bytes);
-            bo_sparse_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            // Per-pass dispatch loop.
+            for (int p = 0; p < args.n_passes; ++p) {
+                // Zero the output BO so leftover bytes from prior
+                // passes don't contaminate this pass's blob.
+                std::memset(p_sparse_out, 0, per_pass_out_bytes);
+                bo_sparse_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-            auto t0 = std::chrono::high_resolution_clock::now();
-            // Kernel signature: (opcode, instr, instr_size, seq_in,
-            // sparse_out, n_input_bytes_for_this_chunk).
-            // The last arg lets the kernel bound its rolling loop on
-            // the final (short) chunk.
-            auto run = kernel(opcode, bo_instr,
-                              static_cast<unsigned>(instr_v.size()),
-                              bo_seq_in, bo_sparse_out,
-                              static_cast<int>(c.bytes));
-            run.wait();
-            auto t1 = std::chrono::high_resolution_clock::now();
+                auto t0 = std::chrono::high_resolution_clock::now();
+                // 6th arg is the seq_in_slot CAPACITY (compile-time on
+                // IRON side). Actual payload size is encoded in the
+                // chunk's leading 4-byte uint32 LE prefix; the kernel
+                // unpacks it.
+                auto run = per_pass[p].kernel(
+                    opcode,
+                    per_pass[p].bo_instr,
+                    static_cast<unsigned>(per_pass[p].instr.size()),
+                    bo_seq_in,
+                    bo_sparse_out,
+                    static_cast<int>(seq_in_slot_bytes));
+                run.wait();
+                auto t1 = std::chrono::high_resolution_clock::now();
 
-            bo_sparse_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                bo_sparse_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
-            if (keep) {
-                size_t pos = all_out_concat.size();
-                all_out_concat.resize(pos + sparse_out_slot_bytes);
-                std::memcpy(all_out_concat.data() + pos,
-                            p_sparse_out, sparse_out_slot_bytes);
-            }
+                if (keep) {
+                    // Track max emit_idx across all per-tile slots.
+                    for (int t = 0; t < args.launch_chunks; ++t) {
+                        size_t off = static_cast<size_t>(t) *
+                                     static_cast<size_t>(PARTIAL_OUT_BYTES_V05_PADDED);
+                        if (off + 4 > per_pass_out_bytes) break;
+                        uint32_t emit_idx = 0;
+                        std::memcpy(&emit_idx, p_sparse_out + off, 4);
+                        if (emit_idx > max_emit_observed) {
+                            max_emit_observed = emit_idx;
+                        }
+                    }
+                    accumulate_pass_blob(p_sparse_out, per_pass_out_bytes,
+                                         args.launch_chunks,
+                                         counts, total_emits);
+                }
 
-            float us = std::chrono::duration_cast<std::chrono::microseconds>(
-                           t1 - t0).count();
-            if (keep) {
-                total_us += us;
-                if (us < min_us) min_us = us;
-                if (us > max_us) max_us = us;
-                timed_chunks++;
+                float us = std::chrono::duration_cast<
+                    std::chrono::microseconds>(t1 - t0).count();
+                if (keep) {
+                    total_us += us;
+                    if (us < min_us) min_us = us;
+                    if (us > max_us) max_us = us;
+                    timed_dispatches++;
+                }
             }
         }
     }
 
-    // ------------------------------------------------------------
-    // Host-side re-aggregation + Jellyfish-FASTA emit.
-    // ------------------------------------------------------------
-    trace("re-aggregating " +
-          std::to_string(all_out_concat.size() / sizeof(EmitRecord)) +
-          " emit slots");
-    auto merged = reaggregate_records(all_out_concat);
-    trace("unique canonicals after merge=" + std::to_string(merged.size()));
+    if (max_emit_observed >= static_cast<uint32_t>(MAX_EMIT_IDX_V05)) {
+        trace("WARN: max_emit_idx_observed=" +
+              std::to_string(max_emit_observed) +
+              " hit cap MAX_EMIT_IDX_V05=" +
+              std::to_string(MAX_EMIT_IDX_V05) +
+              " — kernel dropped k-mers; increase --n-passes");
+    }
+    trace("total emits across all passes=" + std::to_string(total_emits) +
+          " unique canonicals=" + std::to_string(counts.size()));
 
-    emit_jellyfish_fasta(args.output_path, merged, args.k,
+    emit_jellyfish_fasta(args.output_path, counts, args.k,
                          args.top, args.threshold);
     trace("wrote Jellyfish-FASTA to " + args.output_path);
 
-    float avg_us = (timed_chunks > 0) ? (total_us / timed_chunks) : 0.0f;
-    if (timed_chunks == 0) {
-        // Defensive: keep the regex-parseable lines well-formed even
-        // if no chunks were timed (e.g. zero-length input). A zero
-        // value is intentional and parseable by `_RE_AVG/MIN/MAX`.
+    float avg_us = (timed_dispatches > 0) ?
+                   (total_us / timed_dispatches) : 0.0f;
+    if (timed_dispatches == 0) {
         min_us = 0.0f;
         max_us = 0.0f;
     }

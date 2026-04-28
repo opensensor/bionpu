@@ -64,3 +64,184 @@ gaps:
     blocks: []
     severity: "deferred"
     status: "deferred-to-v1.1"
+
+  - id: "kmer-chr22-canonical0-cap-fire"
+    category: "correctness"
+    op_or_pattern: "n_passes=4 hash-slice partition vs all-A canonical"
+    attempted: |
+      T13 + T14 silicon-validated v0.5 on chr22 at k=21, n_tiles=4,
+      n_passes=4. Per-pass kernel emits canonicals whose
+      `canonical & ((1 << n_passes_log2) - 1) == pass_idx`. With
+      n_passes=4 (log2=2) and SLICE_HASH_SHIFT=0, the all-A canonical
+      = 0 lands in pass 0 (since 0 & 3 == 0).
+    failed_with: |
+      Top-1000 byte-equal vs Jellyfish FAILS at chr22 scale. The
+      canonical=0 row diverges most: NPU reports count = 2 977 273,
+      Jellyfish reports 11 669 944 (T13 measurements). Top-1000
+      Jaccard = 0.988 — so the WHICH-canonicals set is right, the
+      counts are wrong on the high-frequency canonicals.
+    root_cause: |
+      chr22 has ~12 M all-A k-mers (centromere N→A scrub artefact
+      during 2-bit packing). Pass 0 is responsible for these 12 M
+      canonicals, distributed across ~3 102 4 KiB chunks: ~3 870
+      all-A k-mers per chunk. The kernel's per-chunk emit cap of
+      `MAX_EMIT_IDX_V05 = 4095` is close enough to that figure that
+      after the chunk-overlap double-emit boost (next gap), the cap
+      starts firing per chunk and truncating the canonical=0 emit.
+      Net under-count: ~9 M missing all-A k-mers (~2.98 M kept of
+      ~11.67 M expected).
+    workaround: |
+      n_passes=16 redistributes the all-A k-mers across 16 slices
+      (each slice catches ~750 K instead of 12 M; well below the
+      4 095 cap), and the SLICE_HASH_SHIFT can be re-tuned to spread
+      the load. The kernel C source already supports n_passes=16,
+      but only n_passes=4 was built for v1.0; v1.1 is to build
+      `bionpu_kmer_count_k{15,21,31}_n4_np16/` artifact dirs,
+      re-run T13/T14 byte-equal, and re-bench.
+    upstream_issue: null
+    blocks: []
+    severity: "performance"
+    status: "deferred-to-v1.1"
+
+  - id: "kmer-chunk-overlap-double-emit"
+    category: "correctness"
+    op_or_pattern: "runner.cpp chunked dispatch overlap region"
+    attempted: |
+      T13 + T14 silicon validation at chr22 scale. The host runner
+      dispatches the input in 4 KiB chunks with per-k overlap
+      (k=15: 4 B; k=21/31: 8 B per T1 contract).
+    failed_with: |
+      NPU output diverges from Jellyfish by 3-8 excess on each
+      canonical at the top of the count distribution (T14 top-1000
+      diffs first 50). Top-1000 Jaccard = 0.988, but counts are
+      systematically 3-8 above Jellyfish for high-frequency
+      canonicals.
+    root_cause: |
+      The runner's chunked dispatch counts boundary k-mers in two
+      adjacent chunks because the overlap region is processed by
+      both. For each chunk-pair boundary, ~k-1 extra k-mers are
+      emitted. With ~3 102 chunks across chr22 and a power-law
+      count distribution, the high-frequency canonicals receive a
+      systematic 3-8 excess.
+    workaround: |
+      v1.1 fix: emit only when k-mer start-index is in the chunk's
+      "owned" range, not the overlap region. Specifically, for
+      chunk `i` with overlap `O`:
+        owned_start = (i == 0) ? 0 : O
+        owned_end   = chunk_payload_capacity - O  (except last chunk)
+      The kernel signature needs a 6th int32_t `owned_start_offset`
+      (or the runner pre-shifts `n_input_bytes` to the owned
+      region). Either path is straightforward but contract-bumping;
+      v1.1 PRD will pin which.
+    upstream_issue: null
+    blocks: []
+    severity: "performance"
+    status: "deferred-to-v1.1"
+
+  - id: "kmer-host-postpass-python-bottleneck"
+    category: "performance"
+    op_or_pattern: "BionpuKmerCount.__call__ Jellyfish-FASTA parse"
+    attempted: |
+      T14 chr22 measurement: NPU silicon-only avg = 951.7 µs/iter;
+      end-to-end wall (incl. Python host) = 32.7 s/iter. The C++
+      runner already uses std::unordered_map for the per-pass
+      canonical accumulation, so the bottleneck is NOT the on-host
+      counting itself.
+    failed_with: |
+      End-to-end speedup vs Jellyfish 1T = 0.31× at chr22 scale —
+      i.e. end-to-end is 3× SLOWER than CPU Jellyfish despite the
+      silicon being 10 533× faster. PRD §3.3 silicon-only gate met;
+      end-to-end gate not met.
+    root_cause: |
+      `BionpuKmerCount.__call__` (subprocess path) reads the runner's
+      Jellyfish-FASTA stdout and re-parses it via Python:
+      `_parse_jellyfish_fasta` walks ~30 M lines and calls
+      `_ascii_kmer_to_canonical_u64` per record. The pure-Python
+      ~30 M-iteration loop is ~30 s on chr22.
+    workaround: |
+      Two v1.1 paths:
+        (a) Native ndarray return: have the runner write a binary
+            blob `[uint64 canonical][uint64 count]` packed, and have
+            the Python op-class `np.fromfile` it. Saves the parse +
+            ASCII-decode + canonical-recompute round-trip.
+        (b) In-process pyxrt path: skip subprocess entirely, read
+            raw NPU output blobs in-process, accumulate via
+            `numpy.bincount` or a Cython-backed dict. v0.5
+            BionpuKmerCount.__call__ already raises
+            NotImplementedError for the pyxrt path; v1.1 implements
+            it.
+      Either path should bring end-to-end within 2-5× of silicon-
+      only and clear the PRD §3.3 end-to-end gate.
+    upstream_issue: null
+    blocks: []
+    severity: "performance"
+    status: "deferred-to-v1.1"
+
+  - id: "kmer-n_passes-16-not-built"
+    category: "expressibility"
+    op_or_pattern: "n_passes ∈ {1, 16} build matrix"
+    attempted: |
+      The kernel C source + IRON Python lowering support
+      n_passes ∈ {1, 4, 16} via build-time `n_passes_log2 ∈ {0, 2, 4}`
+      arith.constants. The op class `BionpuKmerCount.__init__`
+      accepts `n_passes` and validates against `SUPPORTED_N_PASSES`.
+    failed_with: |
+      Only `bionpu_kmer_count_k{15,21,31}_n4_np4/` artifact dirs
+      exist in `_npu_artifacts/`. Selecting n_passes=16 (the
+      workaround for `kmer-chr22-canonical0-cap-fire`) would raise
+      `NpuArtifactsMissingError`.
+    root_cause: |
+      v1.0 ship scope was n_passes=4 only — Wave 5 silicon validation
+      proved the v0.5 design at one (k, n_tiles, n_passes) tuple.
+      The remaining 6 build cells (k × {n_passes=1, n_passes=16})
+      are queued for v1.1.
+    workaround: |
+      Build via:
+        cd src/bionpu/kernels/genomics/kmer_count
+        for K in 15 21 31; do
+          for NP in 1 16; do
+            make NPU2=1 K=$K n_passes=$NP experiment=wide4 all
+          done
+        done
+      Then re-run the T15 bench across the full 9-cell matrix
+      (3 fixtures × 3 k × 1 n_tiles × 3 n_passes = 27 cells).
+    upstream_issue: null
+    blocks:
+      - "kmer-chr22-canonical0-cap-fire"
+    severity: "deferred"
+    status: "deferred-to-v1.1"
+
+  - id: "kmer-multi-tile-aggregator-tile-deadcode"
+    category: "expressibility"
+    op_or_pattern: "kmer_count_aggregator CoreTile fan-in (unused in v0.5)"
+    attempted: |
+      T6 originally implemented a CoreTile aggregator that received
+      partials from N tiles and forwarded a sparse stream to shim
+      DMA. T8 IRON Python emit replaced this with the memtile-join
+      pattern from `crispr/match_multitile_memtile/multitile_memtile.py`
+      because CoreTile has only 2 input DMA channels (AM020 Ch. 2
+      p. 27).
+    failed_with: |
+      The `kmer_count_aggregator.cc` source compiles cleanly but is
+      unreferenced by the v0.5 build (kmer_count.py does NOT declare
+      a `Kernel("kmer_count_aggregator", ...)` external symbol).
+      Dead code, retained for documentation + v1.1 research.
+    root_cause: |
+      Two-stage CoreTile-then-memtile fan-in would let v1.1 grow
+      n_tiles past 4 without exhausting the memtile S2MM budget
+      (each CoreTile aggregator absorbs 2 producers; 4 CoreTile
+      aggregators feed a memtile of 4 producers = effective n=8
+      with budget). The aggregator source is the seed for that work.
+    workaround: |
+      v1.0 ships with the aggregator source unlinked. v1.1 PRD will
+      either:
+        (a) Wire the aggregator into a hierarchical fan-in
+            topology (each CoreTile aggregator handles 2 producers,
+            then memtile.join the aggregators).
+        (b) Retire the file once v1.1 silicon-validates the memtile-
+            only fan-in for n_tiles=8 via the two-stage path
+            described in `kmer-n8-memtile-dma-cap`.
+    upstream_issue: null
+    blocks: []
+    severity: "deferred"
+    status: "deferred-to-v1.1"

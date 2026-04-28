@@ -11,4 +11,56 @@ compiler: "peano"
 build_date: "2026-04-28T00:00:00+00:00"
 host: "matteius-ProArt-P16-H7606WI"
 
-gaps: []
+gaps:
+  - id: "kmer-n8-memtile-dma-cap"
+    category: "expressibility"
+    op_or_pattern: "n_tiles=8 memtile-aggregated combine"
+    attempted: |
+      T11 sweep at n_tiles=8 across all 3 k values. The memtile-
+      aggregated combine topology (T11 Fix C; mirrors
+      crispr/match_multitile_memtile/multitile_memtile.py) routes
+      one partial ObjectFifo per match tile through the memtile via
+      `outC.prod().join(N partials, ...)`. At N=8 this exceeds the
+      AIE2P MemTile DMA channel budget.
+    failed_with: |
+      aiecc placement pipeline:
+        'aie.tile' op no MemTile with sufficient DMA capacity
+        Error: Tile placement pipeline failed
+      Reproduces deterministically across all 3 k values; MLIR-emit
+      step succeeds and kernel .o compiles, but tile-placement pass
+      rejects the topology.
+    root_cause: |
+      AM020 Ch. 5 p. 74 documents AIE2P MemTile as 6 S2MM + 6 MM2S
+      DMA channels. The memtile-join `prod().join(N=8, ...)` topology
+      consumes 1 S2MM channel per producer tile (8 needed) plus 1
+      MM2S channel for the shim drain — exceeding the 6 S2MM budget.
+      Same hardware spec limit hit by `crispr/match_multitile/`
+      ATTEMPT-2 (4-into-1 on a CoreTile, 2-channel cap), which is
+      why `crispr/match_multitile_memtile/` was created — but that
+      fix only stretches to N≤6 effective producers per memtile.
+      N=8 needs a different topology.
+    workaround: |
+      Three known paths, all deferred to a v1.1 follow-on PRD
+      after Wave-5 silicon validation of the n ∈ {1, 2, 4} matrix:
+
+      (1) Two-stage memtile fan-in: 8 producers → 2 intermediate
+          memtile slots of 4 each → 1 final memtile. Stays within
+          6 S2MM/memtile (4 S2MM + 1 MM2S = 5/6 used per stage).
+          Adds 1 hop of latency. ~4-8 hrs incl. silicon round-trip.
+      (2) Multi-memtile-column placement: 8 producers → 2 memtiles
+          in different columns. Less proven; cross-column routing
+          constraints unknown.
+      (3) Cap n_tiles at 4 in the schema: drop n_tiles=8 from
+          BIONPU_KMER_COUNT_LAUNCH_CHUNKS allowed values. The
+          speedup curve from n=1→4 captures most parallelism on
+          AIE2P silicon (CRISPR pam_filter saw diminishing returns
+          past 4 tiles).
+
+      v1 ships path (3) by acceptance: Wave 5 silicon-validates and
+      benchmarks the 9-cell matrix (3 k × 3 n_tiles); a v1.1 PRD
+      will revisit (1) or (2) once the n=1/2/4 throughput curve is
+      empirically known.
+    upstream_issue: null
+    blocks: []
+    severity: "deferred"
+    status: "deferred-to-v1.1"

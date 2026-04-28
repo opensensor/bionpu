@@ -256,6 +256,46 @@ def _parse_jellyfish_fasta(text: str, k: int) -> list[tuple[int, int]]:
     return out
 
 
+def _parse_binary_blob(path: Path) -> list[tuple[int, int]]:
+    """Parse the runner's ``--output-format binary`` blob.
+
+    Layout (little-endian):
+      ``[uint64 n_records][n_records × {uint64 canonical, uint64 count}]``
+
+    Returns ``[(canonical_u64, count), ...]`` preserving the runner's
+    sort order (count desc, canonical asc — already applied host-side
+    in the C++ ``sort_and_filter`` step).
+
+    Closes the ``kmer-host-postpass-python-bottleneck`` gap (v1.1 (b)).
+    Replaces the previous Jellyfish-FASTA Python parse which walked
+    ~30M lines + called :func:`_ascii_kmer_to_canonical_u64` per record
+    on chr22 (~30s of pure-Python loop).
+    """
+    raw = np.fromfile(path, dtype=np.uint8)
+    if raw.size < 8:
+        raise NpuRunFailed(
+            0, "",
+            f"[bionpu] binary output blob {path} too small "
+            f"({raw.size} bytes; expected >=8 for n_records header)",
+        )
+    n_records = int(np.frombuffer(raw[:8], dtype=np.uint64)[0])
+    expected_bytes = 8 + n_records * 16
+    if raw.size < expected_bytes:
+        raise NpuRunFailed(
+            0, "",
+            f"[bionpu] binary output blob {path} truncated: "
+            f"n_records={n_records} but file has only "
+            f"{raw.size} bytes (need {expected_bytes})",
+        )
+    if n_records == 0:
+        return []
+    records_buf = raw[8 : 8 + n_records * 16]
+    flat = np.frombuffer(records_buf, dtype=np.uint64)
+    canonicals = flat[0::2]
+    counts = flat[1::2]
+    return list(zip(canonicals.tolist(), counts.tolist()))
+
+
 # --------------------------------------------------------------------------- #
 # Op class.
 # --------------------------------------------------------------------------- #
@@ -395,11 +435,20 @@ class BionpuKmerCount(NpuOp):
         warmup: int,
         timeout_s: float,
     ) -> tuple[list[tuple[int, int]], _RunInfo]:
-        """Spawn the host_runner; parse Jellyfish-FASTA --output."""
+        """Spawn the host_runner and parse the binary --output blob.
+
+        v1.1 (b) — closes the ``kmer-host-postpass-python-bottleneck`` gap.
+        Previously the runner emitted Jellyfish-FASTA text and the op-class
+        re-parsed it via a pure-Python loop calling
+        :func:`_ascii_kmer_to_canonical_u64` per record (~30s on chr22).
+        Now the runner can emit a flat little-endian binary blob via
+        ``--output-format binary`` and the op-class uses ``np.fromfile`` +
+        a vectorised view to skip the ASCII round-trip entirely.
+        """
         with tempfile.TemporaryDirectory(prefix=f"{self.name}_") as tdir:
             t = Path(tdir)
             input_path = t / "packed_seq.2bit.bin"
-            output_path = t / "kmers.jf.fa"
+            output_path = t / "kmers.bin"
             np.ascontiguousarray(packed_seq).tofile(input_path)
 
             cmd = [
@@ -409,6 +458,7 @@ class BionpuKmerCount(NpuOp):
                 "-k", _KERNEL_NAME,
                 "--input", str(input_path),
                 "--output", str(output_path),
+                "--output-format", "binary",
                 "--k", str(self.k),
                 "--top", str(int(top_n)),
                 "--threshold", str(int(threshold)),
@@ -450,9 +500,8 @@ class BionpuKmerCount(NpuOp):
                     proc.stderr
                     + f"\n[bionpu] runner did not produce --output {output_path}",
                 )
-            fasta = output_path.read_text()
+            kmers = _parse_binary_blob(output_path)
 
-        kmers = _parse_jellyfish_fasta(fasta, self.k)
         info = _RunInfo(
             avg_us=float(avg),
             min_us=float(mn),

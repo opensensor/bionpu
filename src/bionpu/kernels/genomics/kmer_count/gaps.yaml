@@ -142,40 +142,65 @@ gaps:
     category: "performance"
     op_or_pattern: "BionpuKmerCount.__call__ Jellyfish-FASTA parse"
     attempted: |
-      T14 chr22 measurement: NPU silicon-only avg = 951.7 µs/iter;
-      end-to-end wall (incl. Python host) = 32.7 s/iter. The C++
-      runner already uses std::unordered_map for the per-pass
-      canonical accumulation, so the bottleneck is NOT the on-host
-      counting itself.
+      v1.1 (b) shipped: runner --output-format {fasta, binary} CLI arg
+      added to runner.cpp; emit_binary_blob writes
+        [uint64 n_records LE][n_records × {uint64 canonical, uint64 count}]
+      Op-class `BionpuKmerCount.__call__` subprocess path now passes
+      `--output-format binary` and parses via `np.frombuffer` view of
+      `np.fromfile`. Skips the Python ASCII Jellyfish-FASTA parse +
+      _ascii_kmer_to_canonical_u64 round-trip entirely.
     failed_with: |
-      End-to-end speedup vs Jellyfish 1T = 0.31× at chr22 scale —
-      i.e. end-to-end is 3× SLOWER than CPU Jellyfish despite the
-      silicon being 10 533× faster. PRD §3.3 silicon-only gate met;
-      end-to-end gate not met.
+      v1.1 (b) measurement (chr22 k=21 n_tiles=4 n_passes=4, 2026-04-28):
+        runner subprocess wall (binary mode):  33.84 s
+        runner subprocess wall (FASTA  mode):  33.03 s
+        op-class end-to-end wall:              33.97 s
+        silicon-only avg per dispatch:        ~934  µs
+        n_dispatches = 3105 chunks × 4 passes = 12,420
+        silicon-only summed (12420 × 934µs):   11.6 s
+        Python FASTA parse wall (1000 records): 1.7 ms
+      Conclusion: the v1.0 root-cause in this entry was MISDIAGNOSED.
+      The Python parse is NEGLIGIBLE — 1.7 ms on the top_n=1000 records
+      the runner already filters host-side. The remaining ~22 s of e2e
+      wall lives INSIDE the C++ runner: the host-side
+      std::unordered_map<uint64_t,uint64_t> accumulate of 42 M emit
+      records into 30.7 M unique canonicals, plus the per-dispatch
+      XRT/IRON setup overhead × 12,420.
     root_cause: |
-      `BionpuKmerCount.__call__` (subprocess path) reads the runner's
-      Jellyfish-FASTA stdout and re-parses it via Python:
-      `_parse_jellyfish_fasta` walks ~30 M lines and calls
-      `_ascii_kmer_to_canonical_u64` per record. The pure-Python
-      ~30 M-iteration loop is ~30 s on chr22.
+      Two distinct bottlenecks, both inside the C++ runner (NOT in the
+      Python subprocess wrapper):
+        1. Per-dispatch overhead × 12,420 dispatches. At ~1.8 ms wall
+           per dispatch (including IRON setup + sync_to/from_device +
+           kernel launch + wait), 12,420 dispatches ≈ 22 s. Silicon
+           compute itself is only 11.6 s of that.
+        2. unordered_map<uint64,uint64> of 42 M inserts into 30.7 M
+           unique buckets — likely 5-10 s of host CPU.
+      The original gap-entry hypothesis (Python ASCII parse of 30 M
+      records) was wrong because the runner already applies the
+      `--top` filter BEFORE the FASTA emit; the Python side only ever
+      saw 1000 records.
     workaround: |
-      Two v1.1 paths:
-        (a) Native ndarray return: have the runner write a binary
-            blob `[uint64 canonical][uint64 count]` packed, and have
-            the Python op-class `np.fromfile` it. Saves the parse +
-            ASCII-decode + canonical-recompute round-trip.
-        (b) In-process pyxrt path: skip subprocess entirely, read
-            raw NPU output blobs in-process, accumulate via
-            `numpy.bincount` or a Cython-backed dict. v0.5
-            BionpuKmerCount.__call__ already raises
-            NotImplementedError for the pyxrt path; v1.1 implements
-            it.
-      Either path should bring end-to-end within 2-5× of silicon-
-      only and clear the PRD §3.3 end-to-end gate.
+      v1.1 (b) lands the binary-blob wire format anyway — it removes
+      the (small) ASCII-emit + Python-parse path on the critical
+      output, and is the right wire format for any future v1.1+
+      pipeline integration that wants to chain kmer_count's output
+      into a downstream NPU op without round-tripping through ASCII.
+
+      The ACTUAL chr22 e2e bottleneck splits cleanly into:
+        v1.2 (a) Reduce per-dispatch overhead — pyxrt in-process
+                 path + multi-launch / pipelined kernel submit, OR
+                 batch multiple chunks per dispatch via larger seq_in
+                 BO + per-chunk slot offsets.
+        v1.2 (b) Replace runner's std::unordered_map with a faster
+                 hash structure (e.g., tsl::robin_map, ankerl::dense
+                 hash, or a sorted-merge of per-pass arrays via radix
+                 sort). 30.7 M unique × hash insert is the dominant
+                 host CPU cost after silicon.
+      File these as new gaps; this entry closes after the wire-format
+      change since the original misdiagnosed root-cause is gone.
     upstream_issue: null
     blocks: []
     severity: "performance"
-    status: "deferred-to-v1.1"
+    status: "closed"
 
   - id: "kmer-n_passes-16-not-built"
     category: "expressibility"
@@ -245,3 +270,75 @@ gaps:
     blocks: []
     severity: "deferred"
     status: "deferred-to-v1.1"
+
+  - id: "kmer-runner-per-dispatch-overhead"
+    category: "performance"
+    op_or_pattern: "host_runner per-chunk + per-pass dispatch loop"
+    attempted: |
+      v1.1 (b) profiling on chr22 (k=21, n_tiles=4, n_passes=4):
+      runner subprocess wall = 33.84 s for 12,420 silicon dispatches
+      (3105 chunks × 4 passes). Silicon compute ≈ 934 µs/dispatch ×
+      12,420 = 11.6 s. Remainder ≈ 22 s is per-dispatch host overhead
+      (memset of out BO + sync_to_device + kernel.run + wait +
+      sync_from_device + accumulate).
+    failed_with: |
+      Surfaces as the residual chr22 end-to-end bottleneck after the
+      v1.1 (b) Python-parse fix (which itself was a misdiagnosed
+      red herring). End-to-end speedup vs Jellyfish 1T = 0.30× —
+      unchanged from v1.0; PRD §3.3 e2e gate still not met.
+    root_cause: |
+      The runner's main loop does ONE silicon kernel.run() per
+      (chunk, pass) tuple. At ~1.8 ms wall per dispatch including
+      ~934 µs silicon compute + ~870 µs host-side IRON/XRT overhead,
+      the host overhead is comparable to the compute itself. With
+      12,420 dispatches the overhead dominates.
+    workaround: |
+      v1.2 candidates:
+        (a) Pyxrt in-process path — drops subprocess fork cost (one-
+            time ~30 ms; not the dominant share but easy to remove)
+            AND lets us pipeline xrt::run::start() + .wait() across
+            multiple dispatches.
+        (b) Multi-launch batch per dispatch: stage M chunks into one
+            larger seq_in BO and have IRON Python iterate over per-
+            chunk slot offsets within a single kernel.run(). Reduces
+            host-side overhead by factor M.
+        (c) Persistent-kernel mode — runner submits N chunks worth
+            of seq_in in one streamed BO and the kernel pulls chunks
+            from a single ObjectFifo without per-chunk re-launch.
+    upstream_issue: null
+    blocks:
+      - "kmer-prd-3-3-e2e-throughput-gate"
+    severity: "performance"
+    status: "open"
+
+  - id: "kmer-runner-host-merge-unordered_map"
+    category: "performance"
+    op_or_pattern: "runner host-side std::unordered_map<uint64,uint64> accumulate"
+    attempted: |
+      v1.1 (b) profiling: runner accumulate of 42 M emit records into
+      30.7 M unique canonical buckets via std::unordered_map. Wall
+      attributable to the merge step is ~5-10 s of the 22 s host
+      overhead (the rest is per-dispatch XRT submit overhead).
+    failed_with: |
+      Independent of the per-dispatch fix — even with zero dispatch
+      overhead, the post-silicon merge of 42 M canonicals through a
+      libstdc++ unordered_map is a 5-10 s host CPU bottleneck.
+    root_cause: |
+      libstdc++'s unordered_map has a node-per-bucket allocator
+      pattern that's cache-hostile at 30 M entries. Each insert is
+      ~150-300 ns due to malloc + chain traversal.
+    workaround: |
+      v1.2 candidates:
+        (a) Replace with tsl::robin_map or ankerl::unordered_dense
+            (header-only, drop-in API, 3-5× faster on this workload).
+        (b) Skip the per-emit hash entirely: collect all 42 M
+            canonicals into a flat std::vector, radix-sort by
+            canonical, then run-length encode to (canonical, count)
+            pairs. O(n) sort time; cache-friendly.
+        (c) Per-pass accumulate-then-sort, merging only the
+            top-N per pass before global merge.
+    upstream_issue: null
+    blocks:
+      - "kmer-prd-3-3-e2e-throughput-gate"
+    severity: "performance"
+    status: "open"

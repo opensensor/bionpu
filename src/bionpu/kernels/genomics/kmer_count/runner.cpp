@@ -183,6 +183,7 @@ struct Args {
     std::string kernel = "MLIR_AIE";
     std::string input_path;
     std::string output_path;
+    std::string output_format = "fasta";  // {fasta, binary} — v1.1 (b) gap close
     int k = 21;
     int top = 1000;
     int threshold = 1;
@@ -215,6 +216,11 @@ void print_usage(std::ostream &os) {
 "  --iters <N>                 timed iterations (default 1)\n"
 "  --warmup <N>                untimed warmup iters (default 0)\n"
 "  --threshold <int>           min count to emit (default 1)\n"
+"  --output-format {fasta,binary} output wire format (default fasta).\n"
+"                              binary: little-endian uint64 n_records,\n"
+"                              followed by n_records × {uint64 canonical,\n"
+"                              uint64 count}. Used by the v1.1 (b) op-class\n"
+"                              path to skip the Python Jellyfish-FASTA parse.\n"
 "\n"
 "Per state/kmer_count_interface_contract.md v0.5: the runner dispatches\n"
 "N_PASSES xclbins per chunk (one per hash-slice partition), accumulates\n"
@@ -247,6 +253,7 @@ Args parse(int argc, char **argv) {
         else if (key == "--n-passes") a.n_passes = std::stoi(next());
         else if (key == "--iters") a.iters = std::stoi(next());
         else if (key == "--warmup") a.warmup = std::stoi(next());
+        else if (key == "--output-format") a.output_format = next();
         else throw std::runtime_error("unknown arg: " + key);
     }
     if (a.xclbin_template.empty() || a.instr_template.empty() ||
@@ -269,6 +276,10 @@ Args parse(int argc, char **argv) {
         throw std::runtime_error("--top must be >= 0");
     if (a.threshold < 0)
         throw std::runtime_error("--threshold must be >= 0");
+    if (a.output_format != "fasta" && a.output_format != "binary")
+        throw std::runtime_error(
+            "--output-format must be one of {fasta, binary}; got '" +
+            a.output_format + "'");
     return a;
 }
 
@@ -400,9 +411,11 @@ struct FinalRecord {
     uint64_t count;
 };
 
-void emit_jellyfish_fasta(const std::string &path,
-                          const std::unordered_map<uint64_t, uint64_t> &merged,
-                          int k, int top, int threshold) {
+// Sort + filter records into a final vector ready for output emit.
+// (Common to both --output-format=fasta and =binary paths.)
+std::vector<FinalRecord> sort_and_filter(
+        const std::unordered_map<uint64_t, uint64_t> &merged,
+        int top, int threshold) {
     std::vector<FinalRecord> v;
     v.reserve(merged.size());
     for (const auto &kv : merged) {
@@ -417,12 +430,35 @@ void emit_jellyfish_fasta(const std::string &path,
     if (top > 0 && static_cast<size_t>(top) < v.size()) {
         v.resize(static_cast<size_t>(top));
     }
+    return v;
+}
+
+void emit_jellyfish_fasta(const std::string &path,
+                          const std::vector<FinalRecord> &v, int k) {
     std::ofstream f(path);
     if (!f)
         throw std::runtime_error("cannot open output for write: " + path);
     for (const auto &r : v) {
         f << '>' << r.count << '\n'
           << decode_canonical_to_acgt(r.canonical, k) << '\n';
+    }
+}
+
+// Binary blob output (v1.1 (b) — closes kmer-host-postpass-python-bottleneck).
+// Layout (all little-endian):
+//   [uint64 n_records][n_records × {uint64 canonical, uint64 count}]
+// Total size = 8 + n_records*16 bytes. Op-class on the Python side
+// `np.fromfile`s this into an ndarray and does NO ASCII parse.
+void emit_binary_blob(const std::string &path,
+                      const std::vector<FinalRecord> &v) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f)
+        throw std::runtime_error("cannot open output for write: " + path);
+    uint64_t n = static_cast<uint64_t>(v.size());
+    f.write(reinterpret_cast<const char *>(&n), sizeof(n));
+    for (const auto &r : v) {
+        f.write(reinterpret_cast<const char *>(&r.canonical), sizeof(r.canonical));
+        f.write(reinterpret_cast<const char *>(&r.count),     sizeof(r.count));
     }
 }
 
@@ -618,9 +654,16 @@ int main(int argc, char **argv) {
     trace("total emits across all passes=" + std::to_string(total_emits) +
           " unique canonicals=" + std::to_string(counts.size()));
 
-    emit_jellyfish_fasta(args.output_path, counts, args.k,
-                         args.top, args.threshold);
-    trace("wrote Jellyfish-FASTA to " + args.output_path);
+    auto sorted_records = sort_and_filter(counts, args.top, args.threshold);
+    if (args.output_format == "binary") {
+        emit_binary_blob(args.output_path, sorted_records);
+        trace("wrote binary blob (" + std::to_string(sorted_records.size()) +
+              " records) to " + args.output_path);
+    } else {
+        emit_jellyfish_fasta(args.output_path, sorted_records, args.k);
+        trace("wrote Jellyfish-FASTA (" + std::to_string(sorted_records.size()) +
+              " records) to " + args.output_path);
+    }
 
     float avg_us = (timed_dispatches > 0) ?
                    (total_us / timed_dispatches) : 0.0f;

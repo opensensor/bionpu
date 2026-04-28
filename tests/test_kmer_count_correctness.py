@@ -218,6 +218,93 @@ def _skip_if_artifacts_missing(k: int, n_tiles: int, n_passes: int = 4) -> None:
 
 
 @pytest.mark.npu
+def test_npu_smoke_binary_blob_roundtrip_at_k21() -> None:
+    """v1.1 (b) regression: binary --output-format round-trip on smoke.
+
+    Closes ``kmer-host-postpass-python-bottleneck`` (gaps.yaml). The op
+    class's subprocess path now passes ``--output-format binary`` to the
+    runner and ``np.fromfile``s the result, skipping the per-record
+    ASCII Jellyfish-FASTA decode round-trip. This test asserts the
+    op-class returns the same ``[(canonical, count), ...]`` listing it
+    would return under the v1.0 FASTA-mode parse.
+
+    We construct the FASTA-mode reference by invoking the runner
+    directly with ``--output-format fasta`` and feeding the resulting
+    text to :func:`_parse_jellyfish_fasta`. The op-class invocation
+    drives the binary mode internally. The two listings must be
+    byte-equal — same sort order, same canonical-u64 + count tuples.
+    """
+    k = 21
+    n_tiles = 4
+    n_passes = 4
+    _skip_if_artifacts_missing(k, n_tiles, n_passes)
+
+    import subprocess
+    import tempfile
+
+    from bionpu.dispatch.npu import _xrt_env  # noqa: PLC2701
+    from bionpu.dispatch.npu_silicon_lock import npu_silicon_lock
+    from bionpu.kernels.genomics.kmer_count import _parse_jellyfish_fasta  # noqa: PLC2701
+
+    op = _bionpu_kmer_count_op(k, n_tiles, n_passes)
+    packed, _ = _load_packed_seq(_SMOKE_BIN, _SMOKE_N_BASES)
+
+    # Reference path: invoke the runner subprocess in FASTA mode and
+    # parse via the legacy text path.
+    with tempfile.TemporaryDirectory(prefix="kmer_v11b_test_") as tdir:
+        tdir_path = Path(tdir)
+        in_path = tdir_path / "smoke.2bit.bin"
+        out_path_fasta = tdir_path / "ref.fa"
+        np.ascontiguousarray(packed).tofile(in_path)
+        cmd = [
+            str(op.host_runner),
+            "-x", str(op.xclbin),
+            "-i", str(op.insts),
+            "-k", "MLIR_AIE",
+            "--input", str(in_path),
+            "--output", str(out_path_fasta),
+            "--output-format", "fasta",
+            "--k", str(k),
+            "--top", "0",         # full listing
+            "--threshold", "1",
+            "--launch-chunks", str(n_tiles),
+            "--n-passes", str(n_passes),
+            "--iters", "1",
+            "--warmup", "0",
+        ]
+        with npu_silicon_lock(label="t12_kmer_v11b_fasta_ref"):
+            proc = subprocess.run(  # noqa: S603 — argv strictly controlled
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120.0,
+                env=_xrt_env(),
+            )
+        assert proc.returncode == 0, (
+            f"FASTA-mode runner failed: rc={proc.returncode}\n"
+            f"stdout={proc.stdout}\nstderr={proc.stderr}"
+        )
+        fasta_records = _parse_jellyfish_fasta(out_path_fasta.read_text(), k)
+
+    # Binary-mode path through the op class (the actual v1.1 (b) wire).
+    with npu_silicon_lock(label="t12_kmer_v11b_binary"):
+        binary_records = op(
+            packed_seq=packed,
+            top_n=0,
+            threshold=1,
+            n_iters=1,
+            warmup=0,
+        )
+
+    assert binary_records == fasta_records, (
+        f"v1.1 (b) binary round-trip diverges from FASTA reference. "
+        f"len(binary)={len(binary_records)}, len(fasta)={len(fasta_records)}. "
+        f"binary[:3]={binary_records[:3]}; fasta[:3]={fasta_records[:3]}."
+    )
+
+
+@pytest.mark.npu
 @pytest.mark.parametrize("k", [15, 21, 31])
 def test_npu_smoke_byte_equal_to_numpy(k: int) -> None:
     """NPU full output on smoke fixture byte-equal to numpy oracle.

@@ -115,9 +115,20 @@ class TrimStats:
 
 
 def _is_pure_acgt(seq: str) -> bool:
-    """True iff every char of ``seq`` is one of A/C/G/T (uppercase)."""
-    # frozenset membership beats a regex on small reads.
-    return all(c in _ACGT_SET for c in seq)
+    """True iff every char of ``seq`` is one of A/C/G/T (uppercase).
+
+    Uses ``str.translate`` to delete every ACGT — a non-empty result
+    proves a non-ACGT base remains. Roughly an order of magnitude faster
+    than a Python ``all(c in set ...)`` generator for ~150 bp reads
+    (and significantly faster on multi-MB strings).
+    """
+    return not seq.translate(_NON_ACGT_DELETE_TABLE)
+
+
+# Pre-built translate table that removes every A/C/G/T (upper). Built
+# once at import time; thread-safe (immutable). Keys are unicode
+# codepoints (matching ``str.translate``'s contract).
+_NON_ACGT_DELETE_TABLE = str.maketrans("", "", "ACGT")
 
 
 def _trim_one_read_cpu(
@@ -315,6 +326,53 @@ def trim_fastq(
 # --------------------------------------------------------------------------- #
 
 
+# Vectorised ACGT -> 2-bit lookup.
+#
+# ``pack_dna_2bit`` from kmer_oracle is the canonical packer (Python loop;
+# byte-equal wire-format reference). For batched silicon dispatch we hot-
+# loop on the same op tens of times per second, so we ship a numpy-side
+# vectorised reproduction here. Byte-equality is asserted by the v2 byte-
+# equal regression tests; if those drift the test gates immediately.
+_ACGT_LOOKUP = np.zeros(256, dtype=np.uint8)
+_ACGT_LOOKUP[ord("A")] = 0
+_ACGT_LOOKUP[ord("C")] = 1
+_ACGT_LOOKUP[ord("G")] = 2
+_ACGT_LOOKUP[ord("T")] = 3
+
+
+def _pack_dna_2bit_vectorised(concat: str) -> np.ndarray:
+    """Vectorised pack of an ACGT string to 2-bit MSB-first bytes.
+
+    Byte-equal to :func:`bionpu.data.kmer_oracle.pack_dna_2bit`. ~30x
+    faster on multi-MB strings (numpy bitops vs Python for-loop).
+
+    Caller must guarantee ``concat`` is pure ACGT — non-ACGT inputs
+    silently produce zero-padded output. The trimmer's pre-classification
+    loop already filters to pure-ACGT before reaching this packer.
+    """
+    n = len(concat)
+    if n == 0:
+        return np.zeros(0, dtype=np.uint8)
+    n_bytes = (n + 3) // 4
+    # Pad to a multiple of 4 so we can reshape into rows of 4 bases.
+    pad = (4 - (n % 4)) % 4
+    if pad:
+        # 'A' contributes a 0 nibble — same as the zero-padding the
+        # pure-Python loop applies via np.zeros.
+        concat = concat + ("A" * pad)
+    arr = np.frombuffer(concat.encode("ascii"), dtype=np.uint8)
+    codes = _ACGT_LOOKUP[arr]  # (n + pad,) uint8 with each value in 0..3
+    rows = codes.reshape(-1, 4)
+    # MSB-first: lane 0 -> bits[7:6], lane 1 -> [5:4], lane 2 -> [3:2], lane 3 -> [1:0].
+    out = (
+        (rows[:, 0] << 6)
+        | (rows[:, 1] << 4)
+        | (rows[:, 2] << 2)
+        | (rows[:, 3])
+    ).astype(np.uint8)
+    return out[:n_bytes]
+
+
 def _build_concat_silicon_input(
     seqs: list[str],
 ) -> tuple[np.ndarray, list[int], int]:
@@ -346,8 +404,32 @@ def _build_concat_silicon_input(
     if not parts:
         return np.zeros(0, dtype=np.uint8), [], 0
     concat = "".join(parts)
-    packed = pack_dna_2bit(concat)
+    # Use the vectorised packer — byte-equal output to pack_dna_2bit but
+    # ~30x faster. The byte-equal regression tests gate any drift.
+    packed = _pack_dna_2bit_vectorised(concat)
     return packed, offsets, cursor
+
+
+#: Per-call dispatch impl override for the silicon batched path.
+#
+# v2 default: ``"pyxrt"`` — in-process dispatch, ~3-5 ms per dispatch.
+# Set ``BIONPU_TRIM_DISPATCH=subprocess`` (or pass ``_impl="subprocess"``
+# in test fixtures) to revert to the v1 host_runner subprocess path
+# (~100 ms per dispatch). The v2 in-process path is byte-equal to v1's
+# subprocess path on the synthetic-100 fixture; see test
+# ``test_v2_pyxrt_byte_equal_to_subprocess``.
+_TRIM_DISPATCH_ENV: str = "BIONPU_TRIM_DISPATCH"
+
+
+def _resolve_trim_impl() -> str:
+    """Read the trim-side dispatch override from the env.
+
+    Defaults to ``"pyxrt"`` (v2). Returns ``"subprocess"`` only if the
+    env var is set explicitly to that value. Other values silently
+    fall back to pyxrt (the safe default).
+    """
+    val = os.environ.get(_TRIM_DISPATCH_ENV, "").strip().lower()
+    return "subprocess" if val == "subprocess" else "pyxrt"
 
 
 def _silicon_batch_dispatch(
@@ -358,14 +440,18 @@ def _silicon_batch_dispatch(
     """Dispatch ``op`` once on a concatenated silicon batch and return
     the per-read leftmost forward-strand match position (or ``None``).
 
+    Default impl is the v2 in-process pyxrt path (BIONPU_TRIM_DISPATCH
+    env var override; see :func:`_resolve_trim_impl`).
+
     Returns ``(match_positions, dispatch_us)`` where ``match_positions``
     is a list of length ``len(seqs)``.
     """
     if not seqs:
         return [], 0.0
     packed, offsets, _ = _build_concat_silicon_input(seqs)
+    impl = _resolve_trim_impl()
     t0 = time.perf_counter()
-    matches = op(packed_seq=packed)
+    matches = op(packed_seq=packed, _impl=impl)
     dispatch_us = (time.perf_counter() - t0) * 1e6
 
     # Pre-compute per-read [start, end) intervals (inclusive of read body

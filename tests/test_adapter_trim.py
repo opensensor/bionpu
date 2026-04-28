@@ -539,6 +539,155 @@ def test_trim_fastq_batched_silicon_byte_equal_cutadapt(tmp_path: Path):
     )
 
 
+# --------------------------------------------------------------------------- #
+# v2 — in-process pyxrt dispatch byte-equal regressions (skipped if no NPU).
+# --------------------------------------------------------------------------- #
+
+
+def test_v2_pyxrt_byte_equal_to_subprocess(tmp_path: Path):
+    """v2 in-process pyxrt dispatch produces a FASTQ byte-equal to the
+    v1 subprocess dispatch on the synthetic-100 fixture (HARD GATE).
+
+    This is the v2 acceptance gate: if pyxrt diverges from subprocess by
+    even a single byte, the new in-process BO staging or the parse logic
+    is incorrect.
+
+    Skipped when:
+      * NPU artifacts are missing
+      * the cross-process silicon lock is held by another process (so we
+        can't run the subprocess path concurrently with pyxrt)
+    """
+    in_path = _FIXTURE_ROOT / "synthetic_reads_with_adapters.fastq"
+    if not in_path.exists():
+        pytest.skip(f"fixture missing: {in_path}")
+    op = _maybe_skip_if_no_npu()
+
+    pyxrt_out = tmp_path / "pyxrt.fastq"
+    sub_out = tmp_path / "subprocess.fastq"
+
+    # Force pyxrt path.
+    monkey_env = os.environ.get("BIONPU_TRIM_DISPATCH")
+    os.environ["BIONPU_TRIM_DISPATCH"] = "pyxrt"
+    try:
+        trim_fastq_batched(
+            in_path, pyxrt_out, adapter=ADAPTER, op=op, batch_size=64,
+        )
+    finally:
+        if monkey_env is None:
+            os.environ.pop("BIONPU_TRIM_DISPATCH", None)
+        else:
+            os.environ["BIONPU_TRIM_DISPATCH"] = monkey_env
+
+    # Subprocess path (a fresh op instance avoids reusing the cached
+    # pyxrt BO state).
+    from bionpu.kernels.genomics.primer_scan import BionpuPrimerScan
+    sub_op = BionpuPrimerScan(primer=ADAPTER, n_tiles=4)
+    monkey_env = os.environ.get("BIONPU_TRIM_DISPATCH")
+    os.environ["BIONPU_TRIM_DISPATCH"] = "subprocess"
+    try:
+        try:
+            trim_fastq_batched(
+                in_path, sub_out, adapter=ADAPTER, op=sub_op,
+                batch_size=64,
+            )
+        except Exception as exc:  # pragma: no cover — environment-dependent
+            # The cross-process silicon lock can be held by an unrelated
+            # job. Skip rather than fail in that case (same policy as
+            # the v1 silicon test gates).
+            msg = str(exc)
+            if "lock" in msg.lower() or "LockTimeout" in msg:
+                pytest.skip(
+                    f"cross-process silicon lock unavailable: {exc}"
+                )
+            raise
+    finally:
+        if monkey_env is None:
+            os.environ.pop("BIONPU_TRIM_DISPATCH", None)
+        else:
+            os.environ["BIONPU_TRIM_DISPATCH"] = monkey_env
+
+    assert pyxrt_out.read_bytes() == sub_out.read_bytes(), (
+        "v2 pyxrt output differs from v1 subprocess output on "
+        "synthetic_reads_with_adapters.fastq"
+    )
+
+
+def test_v2_pyxrt_byte_equal_to_cutadapt(tmp_path: Path):
+    """v2 pyxrt dispatch byte-equal to cutadapt -a -O 13 on the
+    100-read synthetic fixture.
+
+    Cross-check vs the production-engineering reference; closes the
+    full silicon-vs-reference loop on the in-process path. Skipped when
+    cutadapt is unavailable.
+    """
+    in_path = _FIXTURE_ROOT / "synthetic_reads_with_adapters.fastq"
+    if not in_path.exists():
+        pytest.skip(f"fixture missing: {in_path}")
+    cutadapt = _find_cutadapt()
+    if cutadapt is None:
+        pytest.skip("cutadapt not on PATH; skipping cross-check")
+    op = _maybe_skip_if_no_npu()
+
+    pyxrt_out = tmp_path / "pyxrt.fastq"
+    cutadapt_out = tmp_path / "cutadapt.fastq"
+
+    monkey_env = os.environ.get("BIONPU_TRIM_DISPATCH")
+    os.environ["BIONPU_TRIM_DISPATCH"] = "pyxrt"
+    try:
+        trim_fastq_batched(
+            in_path, pyxrt_out, adapter=ADAPTER, op=op, batch_size=64,
+        )
+    finally:
+        if monkey_env is None:
+            os.environ.pop("BIONPU_TRIM_DISPATCH", None)
+        else:
+            os.environ["BIONPU_TRIM_DISPATCH"] = monkey_env
+
+    subprocess.run(
+        [
+            cutadapt,
+            "-a", ADAPTER,
+            "--no-indels", "-e", "0", "-O", str(len(ADAPTER)),
+            "-j", "1",
+            "-o", str(cutadapt_out),
+            str(in_path),
+        ],
+        capture_output=True, check=True,
+    )
+
+    assert pyxrt_out.read_bytes() == cutadapt_out.read_bytes(), (
+        "v2 pyxrt output differs from cutadapt -a -O 13 on "
+        "synthetic_reads_with_adapters.fastq"
+    )
+
+
+def test_v2_pyxrt_packer_byte_equal_to_pack_dna_2bit():
+    """The v2 trimmer's vectorised packer must produce identical bytes
+    to ``bionpu.data.kmer_oracle.pack_dna_2bit`` for every input.
+    """
+    from bionpu.data.kmer_oracle import pack_dna_2bit
+    from bionpu.genomics.adapter_trim.trimmer import _pack_dna_2bit_vectorised
+
+    cases = [
+        "",
+        "A", "C", "G", "T",
+        "ACGT",
+        "ACGTACGT",
+        "ACGTAC",                # not aligned (6 chars -> 2 bytes)
+        "AGATCGGAAGAGC",         # TruSeq P5
+        "T" * 16,                # sentinel
+        ("ACGT" * 100) + "A",    # 401 chars -> 101 bytes
+        "AAAAA" + ("CGTA" * 50) + "GG",
+    ]
+    for case in cases:
+        a = pack_dna_2bit(case)
+        b = _pack_dna_2bit_vectorised(case)
+        assert a.tobytes() == b.tobytes(), (
+            f"vectorised packer drifted from pack_dna_2bit on input "
+            f"len={len(case)}: {case[:20]!r}..."
+        )
+
+
 def test_trim_fastq_silicon_byte_equal_cutadapt(tmp_path: Path):
     """Silicon path matches cutadapt -a -O 13 byte-equally on the
     100-read synthetic fixture (full e2e validation)."""

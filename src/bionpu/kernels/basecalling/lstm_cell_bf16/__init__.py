@@ -50,7 +50,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-
 from bionpu.dispatch.npu import (
     NpuArtifactsMissingError,
     NpuOp,
@@ -159,11 +158,11 @@ def bf16_bytes_to_fp32(buf_u16: np.ndarray, shape: tuple[int, ...]) -> np.ndarra
     expanded = (buf_u16.astype(np.uint32) << 16).view(np.float32)
     return expanded.reshape(shape)
 
-def _pack_input_bf16(x: np.ndarray) -> np.ndarray:
+def _pack_input_bf16(x: np.ndarray, seq_len: int = T_LSTM) -> np.ndarray:
     """``(L, N=1, 96)`` fp32 -> ``(L * 96,)`` bf16-as-uint16 contiguous."""
-    if x.shape != (T_LSTM, 1, INPUT_DIM):
+    if x.shape != (seq_len, 1, INPUT_DIM):
         raise ValueError(
-            f"lstm_cell_bf16 input must have shape ({T_LSTM}, 1, {INPUT_DIM}); "
+            f"lstm_cell_bf16 input must have shape ({seq_len}, 1, {INPUT_DIM}); "
             f"got {x.shape}"
         )
     if x.dtype != np.float32:
@@ -219,14 +218,17 @@ def _pack_wb_bf16(
     flat_fp32 = np.concatenate(parts).astype(np.float32)
     return fp32_to_bf16_bytes(flat_fp32)
 
-def _unpack_output_bf16(buf_u16: np.ndarray) -> np.ndarray:
+def _unpack_output_bf16(
+    buf_u16: np.ndarray,
+    seq_len: int = T_LSTM,
+) -> np.ndarray:
     """``(L * 96,)`` bf16-as-uint16 -> ``(L, 1, 96)`` fp32."""
-    expected = T_LSTM * HIDDEN
+    expected = seq_len * HIDDEN
     if buf_u16.size != expected:
         raise ValueError(
             f"lstm output length mismatch: got {buf_u16.size}, expected {expected}"
         )
-    return bf16_bytes_to_fp32(buf_u16, (T_LSTM, 1, HIDDEN))
+    return bf16_bytes_to_fp32(buf_u16, (seq_len, 1, HIDDEN))
 
 class DoradoFastLstmCellBf16(NpuOp):
     """Single bf16 LSTM cell forward over a fixed time sequence."""

@@ -53,10 +53,26 @@ available as a baseline comparator. See
 
 from __future__ import annotations
 
+from .cfd import CFDScorer, aggregate_cfd, cfd_score_pair
+from .doench_rs2 import (
+    AzimuthNotInstalledError,
+    DoenchAzimuthScorer,
+    DoenchRS1Scorer,
+    doench_rs1_score,
+    extract_30mer_context,
+)
 from .types import ScoreRow, parse_score_tsv, serialize_canonical_score, write_score_tsv
 
 __all__ = [
+    "AzimuthNotInstalledError",
+    "CFDScorer",
+    "DoenchAzimuthScorer",
+    "DoenchRS1Scorer",
     "ScoreRow",
+    "aggregate_cfd",
+    "cfd_score_pair",
+    "doench_rs1_score",
+    "extract_30mer_context",
     "parse_score_tsv",
     "serialize_canonical_score",
     "write_score_tsv",

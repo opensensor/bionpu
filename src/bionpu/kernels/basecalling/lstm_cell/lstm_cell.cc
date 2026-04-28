@@ -40,40 +40,21 @@ static float bias_cache[BIAS_LEN_K];
 // in non-cache calls.
 constexpr int BIAS_PREFIX = BIAS_LEN_K;
 
-// Branch-light scalar sigmoid: 1 / (1 + exp(-x)). Implemented as
-// 0.5 * (1 + tanh(0.5 * x)) because we have an integrated tanh
-// approximation via the math library; for FP32 v1 we use the standard
-// runtime functions Peano provides (`std::tanh`, `std::exp`).
-//
-// To keep the v1 kernel free of <cmath>/<math.h> stdlib dependencies
-// (which often pull in unsupported newlib bits on AIE2P), we use the
-// AIE-API tanh/exp scalar approximations. AIE2P has scalar tanh + exp
-// in <aie_api/aie.hpp>'s scalar overloads; for FP32 we fall back to a
-// rational approximation when those aren't available.
-
-// Scalar sigmoid via the identity sigmoid(x) = 0.5 * (tanh(0.5*x) + 1).
-// We use a Padé-style rational approximation for tanh that is correct
-// to ~1e-3 over [-6, 6]; for LSTM gates (gate values fed through
-// sigmoid/tanh) the inputs are bounded by the small magnitudes typical
-// of LSTM activations on Dorado fast weights, so the absolute error on
-// h, c is bounded.
-//
-// For FP32 v1 correctness, we use the simplest accurate approximations:
-//   tanh(x) = x * (27 + x*x) / (27 + 9*x*x)  for |x| < 4
-//           = sign(x)                          otherwise
-// (3rd-order Padé). Max error ~3e-3 over [-3, 3]; will replace
-// with `aie::tanh<float>` (vector intrinsic) once that path lands.
-static inline float scalar_tanh_padé(float x) {
-  // Clip extreme inputs to avoid sign(x)-style accuracy collapse near
-  // the rational approximation's limits.
-  if (x > 4.0f) return 1.0f;
-  if (x < -4.0f) return -1.0f;
-  float xx = x * x;
-  return x * (27.0f + xx) / (27.0f + 9.0f * xx);
+// Compact high-order rational tanh approximation. The coefficients are
+// a [7/6] odd Padé-style form that is substantially tighter than the
+// previous x*(27+x^2)/(27+9*x^2) approximation while staying small
+// enough for AIE program memory. Clamp outside the useful gate range.
+static inline float scalar_tanh_fp32(float x) {
+  if (x > 5.0f) return 1.0f;
+  if (x < -5.0f) return -1.0f;
+  float x2 = x * x;
+  float num = ((x2 + 378.0f) * x2 + 17325.0f) * x2 + 135135.0f;
+  float den = ((28.0f * x2 + 3150.0f) * x2 + 62370.0f) * x2 + 135135.0f;
+  return x * num / den;
 }
 
 static inline float scalar_sigmoid(float x) {
-  return 0.5f * (scalar_tanh_padé(0.5f * x) + 1.0f);
+  return 0.5f * (scalar_tanh_fp32(0.5f * x) + 1.0f);
 }
 
 extern "C" {
@@ -169,10 +150,10 @@ void dorado_fast_lstm_cell_fp32(float *restrict x_t,
     for (int oc = 0; oc < HIDDEN; ++oc) {
       float i_g = scalar_sigmoid(gate_acc[0][oc]); // gate 0: input gate
       float f_g = scalar_sigmoid(gate_acc[1][oc]); // gate 1: forget gate
-      float g_g = scalar_tanh_padé(gate_acc[2][oc]); // gate 2: cell input
+      float g_g = scalar_tanh_fp32(gate_acc[2][oc]); // gate 2: cell input
       float o_g = scalar_sigmoid(gate_acc[3][oc]); // gate 3: output gate
       float c_new = f_g * c_state[oc] + i_g * g_g;
-      float h_new = o_g * scalar_tanh_padé(c_new);
+      float h_new = o_g * scalar_tanh_fp32(c_new);
       c_state[oc] = c_new;
       h_state[oc] = h_new;
       y_t[oc] = h_new;

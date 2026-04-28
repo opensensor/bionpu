@@ -11,4 +11,48 @@ target: "aie2p"
 compiler: "peano"
 build_date: "2026-04-25T04:35:00+00:00"
 host: "matteius-ProArt-P16-H7606WI"
-gaps: []
+gaps:
+  - id: "C-pyxrt-in-process-dispatch"
+    category: "host_dispatch"
+    op_or_pattern: "Replace subprocess host_runner with in-process pyxrt for DoradoFastLstmCell"
+    attempted: |
+      Added BIONPU_LSTM_CELL_DISPATCH={subprocess,pyxrt} env var (also
+      accepted as DoradoFastLstmCell.__call__(_impl=...)) routing
+      through bionpu.dispatch.npu.NpuBackend.run_xclbin (in-process
+      pyxrt). Subprocess path stays the default fallback.
+
+      Kernel arg layout reused from runner.cpp:
+        arg3=input, arg4=weight (per-timestep expanded), arg5=output,
+        arg6=trace(1).
+
+      The runner expands the compact (HIDDEN, INPUT_DIM) WB to a
+      ``(seq_len, N_GATES, 4, _CHUNK_LEN)`` per-timestep stream
+      before it pushes the BO; the pyxrt path replicates that
+      expansion in Python (see ``_expand_wb``) so the bo_weight
+      payload byte-matches the runner's output.
+    failed_with: null
+    root_cause: |
+      Same as the linear_projection (a) story: each subprocess
+      invocation pays ~70-80 ms of fork + xrt::device::register_xclbin
+      + hw_context construction, plus the lstm runner does ~110 MB
+      of weight expansion per call. pyxrt path caches the
+      device + xclbin + kernel handles process-wide.
+    workaround: |
+      Silicon-validated C_PYXRT_PASS at
+      results/basecalling/b-m10-pyxrt-rollout/measurements.json
+      (state/c-pyxrt-rollout-dorado_fast_lstm_cell-*.json):
+        subprocess wall/iter  ~2741.7 ms (kernel ~1767.2 ms)
+        pyxrt wall/iter        ~2712.4 ms (kernel ~1767.3 ms)
+        pyxrt 16-iter steady  ~1994.2 ms wall/iter (~226.5 ms host overhead)
+        pyxrt vs subprocess output: byte-equal (max-abs-diff 0.0).
+      Steady-state savings: ~747.6 ms / chunk — by far the largest
+      win in this batch, because the FP32 lstm_cell binary's host
+      overhead (compact->expanded WB build = 110 MB, BO sync, fork)
+      is paid once on subprocess and amortised over all 16 iters in
+      pyxrt steady-state. The cascade kernel (separate task) is the
+      load-bearing speedup for actual silicon time on the LSTMs;
+      this gap closes the remaining host-side ceremony.
+    upstream_issue: null
+    blocks: []
+    severity: "performance"
+    status: "validated"

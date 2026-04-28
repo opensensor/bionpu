@@ -51,6 +51,10 @@ from pathlib import Path
 
 import numpy as np
 
+from bionpu.dispatch._pyxrt_helpers import (
+    resolve_dispatch_impl,
+    run_pyxrt_with_buffers,
+)
 from bionpu.dispatch.npu import (
     NpuArtifactsMissingError,
     NpuOp,
@@ -61,6 +65,14 @@ from bionpu.dispatch.npu import (
 # Pinned op geometry. T_IN is the public input time dimension across the
 # encoder body; T_OUT_L3 is the conv-stem output length after stride 6.
 T_IN = 2000
+
+# Production-shape (long) input length, paired with the L=1667 LSTM
+# artifact. The encoder's production_long path runs a 10000-sample
+# raw chunk through stem L1 -> L2 -> L3 (stride=6). Stem L3 reduces
+# 10000 input samples to 1667 output timesteps:
+#   ((10000 + 2*9 - 19) / 6) + 1 = 1666 + 1 = 1667.
+L1667_T_IN = 10000
+L1667_L3_T_OUT = 1667
 
 # --- Layer 2: Conv1d(16, 16, k=5, s=1, p=2) -------------------------------- #
 L2_T_CHUNK = 200
@@ -101,17 +113,40 @@ L3_INPUT_PADDED_LEN = T_IN + 2 * L3_PAD  # 2018 samples per channel
 # in one kernel invocation. may revisit chunking; for v1 the
 # memory budget is fine.
 
+# Long-shape padded input length: 10000 + 2*9 = 10018 samples per channel.
+L1667_L3_INPUT_PADDED_LEN = L1667_T_IN + 2 * L3_PAD
+
+# Map LSTM seq_len -> conv-stem T_in (raw signal time-axis length). Stem
+# L1 / L2 keep the time axis; stem L3 reduces by stride=6 to the LSTM
+# timestep count. Same mapping as conv_stem/__init__._SEQ_LEN_TO_T_IN.
+_SEQ_LEN_TO_T_IN: dict[int, int] = {
+    334: T_IN,           # short-shape: T_in=2000
+    1667: L1667_T_IN,    # long-shape:  T_in=10000
+}
+# Map LSTM seq_len -> stem L3 t_out (== seq_len). The stem L3 helper
+# uses these to size the output buffer. Kept explicit for symmetry.
+_SEQ_LEN_TO_L3_T_OUT: dict[int, int] = {
+    334: L3_T_OUT,            # 334
+    1667: L1667_L3_T_OUT,     # 1667
+}
+_SEQ_LEN_TO_L3_PADDED_LEN: dict[int, int] = {
+    334: L3_INPUT_PADDED_LEN,            # 2018
+    1667: L1667_L3_INPUT_PADDED_LEN,     # 10018
+}
+
 _PACKAGE_ROOT = (
     Path(__file__).resolve().parent.parent.parent.parent
     / "dispatch"
     / "_npu_artifacts"
 )
-_L2_DIR = _PACKAGE_ROOT / "dorado_fast_conv_stem_layer2"
+_L2_NAME = "dorado_fast_conv_stem_layer2"
+_L2_DIR = _PACKAGE_ROOT / _L2_NAME
 _L2_XCLBIN = _L2_DIR / "final.xclbin"
 _L2_INSTS = _L2_DIR / "insts.bin"
 _L2_RUNNER = _L2_DIR / "host_runner"
 
-_L3_DIR = _PACKAGE_ROOT / "dorado_fast_conv_stem_layer3"
+_L3_NAME = "dorado_fast_conv_stem_layer3"
+_L3_DIR = _PACKAGE_ROOT / _L3_NAME
 _L3_XCLBIN = _L3_DIR / "final.xclbin"
 _L3_INSTS = _L3_DIR / "insts.bin"
 _L3_RUNNER = _L3_DIR / "host_runner"
@@ -127,6 +162,21 @@ _RE_MIN = re.compile(
 _RE_MAX = re.compile(
     r"^Max NPU time:\s*([0-9.eE+\-]+)us\.?\s*$", re.MULTILINE
 )
+
+# Kernel-arg slot layout for the conv_stem layers 2/3 runner (see
+# runner.cpp: kernel(opcode, bo_instr, instr_size, bo_signal, bo_wb,
+# bo_output, bo_ctrlpkts, bo_trace)). Slots 6/7 are 8-byte/1-byte
+# placeholders the pyxrt path fills with zero-payload BOs to keep
+# group_id valid on those args.
+_ARG_SIGNAL = 3
+_ARG_WB = 4
+_ARG_OUTPUT = 5
+_ARG_CTRLPKTS = 6
+_ARG_TRACE = 7
+
+# Byte sizing constants for the pyxrt output BOs. Mirrors layer2_sizes /
+# layer3_sizes in runner.cpp.
+L3_N_OC_GROUPS = L3_OUT_CH // L3_OC_GROUP_SIZE  # 6
 
 @dataclass(frozen=True)
 class ConvLayerRunResult:
@@ -152,30 +202,39 @@ def _xrt_env() -> dict[str, str]:
 # Layer 2 helpers
 # --------------------------------------------------------------------------- #
 
-def _l2_pack_signal(signal: np.ndarray) -> np.ndarray:
-    """(1, 16, T=2000) -> (N_CHUNKS, 16, T_CHUNK + 4) FP32 contiguous.
+def _l2_pack_signal(
+    signal: np.ndarray, total_t: int = T_IN, chunk_t: int = L2_T_CHUNK,
+) -> np.ndarray:
+    """(1, 16, total_t) -> (n_chunks, 16, chunk_t + 4) FP32 contiguous.
 
     Mirrors 's chunking but with 16 input channels: we zero-pad each
-    channel along time, then slice into N overlapping chunks of length
-    T_CHUNK + 4 samples. Per-channel layout within a chunk is row-major
-    (chunk, channel, time).
+    channel along time, then slice into n overlapping chunks of length
+    chunk_t + 4 samples. Per-channel layout within a chunk is row-major
+    (chunk, channel, time). The ``total_t`` / ``chunk_t`` knobs let the
+    L1667 op (``total_t=10000``, ``chunk_t=200``, 50 chunks) reuse the
+    same packing primitive as the legacy short-shape op.
     """
-    if signal.shape != (1, L2_IN_CH, T_IN):
+    if total_t % chunk_t != 0:
         raise ValueError(
-            f"layer2 signal must have shape (1, {L2_IN_CH}, {T_IN}); "
+            f"total_t ({total_t}) must be a multiple of chunk_t ({chunk_t})"
+        )
+    if signal.shape != (1, L2_IN_CH, total_t):
+        raise ValueError(
+            f"layer2 signal must have shape (1, {L2_IN_CH}, {total_t}); "
             f"got {signal.shape}"
         )
     if signal.dtype != np.float32:
         raise ValueError(f"layer2 signal must be FP32; got dtype={signal.dtype}")
-    s = signal.reshape(L2_IN_CH, T_IN)
-    padded = np.zeros((L2_IN_CH, T_IN + 2 * L2_PAD), dtype=np.float32)
-    padded[:, L2_PAD : L2_PAD + T_IN] = s
+    n_chunks = total_t // chunk_t
+    s = signal.reshape(L2_IN_CH, total_t)
+    padded = np.zeros((L2_IN_CH, total_t + 2 * L2_PAD), dtype=np.float32)
+    padded[:, L2_PAD : L2_PAD + total_t] = s
     chunks = np.empty(
-        (L2_N_CHUNKS, L2_IN_CH, L2_T_CHUNK + 2 * L2_PAD), dtype=np.float32
+        (n_chunks, L2_IN_CH, chunk_t + 2 * L2_PAD), dtype=np.float32
     )
-    for i in range(L2_N_CHUNKS):
-        start = i * L2_T_CHUNK
-        chunks[i] = padded[:, start : start + L2_T_CHUNK + 2 * L2_PAD]
+    for i in range(n_chunks):
+        start = i * chunk_t
+        chunks[i] = padded[:, start : start + chunk_t + 2 * L2_PAD]
     return chunks
 
 def _l2_pack_wb(weight: np.ndarray, bias: np.ndarray) -> np.ndarray:
@@ -193,63 +252,74 @@ def _l2_pack_wb(weight: np.ndarray, bias: np.ndarray) -> np.ndarray:
     B = bias.astype(np.float32, copy=False)
     return np.concatenate([W, B]).astype(np.float32)
 
-def _l2_unpack_output(flat: np.ndarray) -> np.ndarray:
-    """(N_CHUNKS * 16 * T_CHUNK,) -> (1, 16, T) FP32."""
-    expected = L2_N_CHUNKS * L2_OUT_CH * L2_T_CHUNK
+def _l2_unpack_output(
+    flat: np.ndarray, total_t: int = T_IN, chunk_t: int = L2_T_CHUNK,
+) -> np.ndarray:
+    """(n_chunks * 16 * chunk_t,) -> (1, 16, total_t) FP32."""
+    n_chunks = total_t // chunk_t
+    expected = n_chunks * L2_OUT_CH * chunk_t
     if flat.size != expected:
         raise ValueError(
             f"layer2 output length mismatch: got {flat.size}, expected {expected}"
         )
-    chunked = flat.reshape(L2_N_CHUNKS, L2_OUT_CH, L2_T_CHUNK)
-    return chunked.transpose(1, 0, 2).reshape(1, L2_OUT_CH, T_IN)
+    chunked = flat.reshape(n_chunks, L2_OUT_CH, chunk_t)
+    return chunked.transpose(1, 0, 2).reshape(1, L2_OUT_CH, total_t)
 
 # --------------------------------------------------------------------------- #
 # Layer 3 helpers
 # --------------------------------------------------------------------------- #
 
-def _l3_pack_signal(signal: np.ndarray) -> np.ndarray:
-    """Pack ``(1, 16, T=2000)`` into the layer-3 per-step input stream.
+def _l3_pack_signal(
+    signal: np.ndarray, total_t_in: int = T_IN, t_out: int = L3_T_OUT,
+) -> np.ndarray:
+    """Pack ``(1, 16, total_t_in)`` into the layer-3 per-step input stream.
 
     The IRON kernel acquires `signal_in` once per output time step
-    (``T_OUT = 334`` total). Each acquire consumes one slice of
+    (``t_out`` total). Each acquire consumes one slice of
     ``(in_ch=16, kernel=19)`` floats covering the input window for
     that output: ``window[t] = padded_input[:, t*STRIDE : t*STRIDE + K]``
     where ``padded_input`` is the host's zero-padded raw signal of
-    shape ``(16, T_IN + 2*PAD = 2018)``.
+    shape ``(16, total_t_in + 2*PAD)``. The default
+    (``total_t_in=2000``, ``t_out=334``) is the legacy short-shape
+    artifact; long-shape uses (``total_t_in=10000``, ``t_out=1667``).
 
     Returns:
-        ndarray shape ``(T_OUT * 16 * 19,)`` = ``(101_536,)`` floats,
-        slice-major (slice, channel, kernel) row-major.
+        ndarray shape ``(t_out * 16 * 19,)`` floats, slice-major
+        (slice, channel, kernel) row-major.
     """
-    if signal.shape != (1, L3_IN_CH, T_IN):
+    if signal.shape != (1, L3_IN_CH, total_t_in):
         raise ValueError(
-            f"layer3 signal must have shape (1, {L3_IN_CH}, {T_IN}); "
+            f"layer3 signal must have shape (1, {L3_IN_CH}, {total_t_in}); "
             f"got {signal.shape}"
         )
     if signal.dtype != np.float32:
         raise ValueError(f"layer3 signal must be FP32; got dtype={signal.dtype}")
-    s = signal.reshape(L3_IN_CH, T_IN)
-    padded = np.zeros((L3_IN_CH, L3_INPUT_PADDED_LEN), dtype=np.float32)
-    padded[:, L3_PAD : L3_PAD + T_IN] = s
-    # Build per-step windows: out shape (T_OUT, 16, 19).
-    out = np.empty((L3_T_OUT, L3_IN_CH, L3_K), dtype=np.float32)
-    for t in range(L3_T_OUT):
+    padded_len = total_t_in + 2 * L3_PAD
+    s = signal.reshape(L3_IN_CH, total_t_in)
+    padded = np.zeros((L3_IN_CH, padded_len), dtype=np.float32)
+    padded[:, L3_PAD : L3_PAD + total_t_in] = s
+    # Build per-step windows: out shape (t_out, 16, 19).
+    out = np.empty((t_out, L3_IN_CH, L3_K), dtype=np.float32)
+    for t in range(t_out):
         start = t * L3_STRIDE
         out[t] = padded[:, start : start + L3_K]
     return out.reshape(-1)
 
-def _l3_pack_wb(weight: np.ndarray, bias: np.ndarray) -> np.ndarray:
+def _l3_pack_wb(
+    weight: np.ndarray, bias: np.ndarray, t_out: int = L3_T_OUT,
+) -> np.ndarray:
     """Pack (96, 16, 19) + (96,) into the layer-3 wb stream.
 
-    The IRON kernel acquires `wb_in` ``N_OC_GROUPS * T_OUT = 6 * 334 =
-    2004`` times across one run; each acquire consumes one OC-group
-    slice (4880 floats: 16*16*19 weights + 16 biases). The host
-    therefore materialises ``T_OUT`` repetitions of the 6-group cycle
-    into a single ``T_OUT * 6 * 4880 = 9_778_560`` float buffer (~37 MB
-    FP32). Each cycle within a repetition lays the OC groups in order
-    (OC group g covers output channels [g*16:(g+1)*16]). The slice for
-    group g is the contiguous ``(weight[g*16:(g+1)*16], bias[g*16:(g+1)*16])``
-    pair, in (oc_in_group, ic, k) row-major + bias-tail layout.
+    The IRON kernel acquires `wb_in` ``N_OC_GROUPS * t_out`` times
+    across one run; each acquire consumes one OC-group slice (4880
+    floats: 16*16*19 weights + 16 biases). The host therefore
+    materialises ``t_out`` repetitions of the 6-group cycle into a
+    single ``t_out * 6 * 4880`` float buffer
+    (~37 MB at t_out=334; ~187 MB at t_out=1667). Each cycle within a
+    repetition lays the OC groups in order (OC group g covers output
+    channels [g*16:(g+1)*16]). The slice for group g is the contiguous
+    ``(weight[g*16:(g+1)*16], bias[g*16:(g+1)*16])`` pair, in
+    (oc_in_group, ic, k) row-major + bias-tail layout.
 
     A future revision can use BD-level repeat patterns to drop the
     repetition bloat; the v1 path prioritises correctness and stays
@@ -279,37 +349,37 @@ def _l3_pack_wb(weight: np.ndarray, bias: np.ndarray) -> np.ndarray:
         gb = B[oc_lo:oc_hi]  # (16,)
         cycle[g, : gw.size] = gw
         cycle[g, gw.size :] = gb
-    # Repeat the cycle T_OUT times: total buffer = T_OUT * n_groups *
+    # Repeat the cycle t_out times: total buffer = t_out * n_groups *
     # slice. Use np.broadcast_to + np.ascontiguousarray to avoid
     # materialising the full buffer twice.
     repeated = np.broadcast_to(
-        cycle, (L3_T_OUT, n_groups, cycle.shape[1])
+        cycle, (t_out, n_groups, cycle.shape[1])
     ).reshape(-1)
     return np.ascontiguousarray(repeated, dtype=np.float32)
 
-def _l3_unpack_output(flat: np.ndarray) -> np.ndarray:
-    """``(T_OUT * 6 * 16,)`` -> ``(1, 96, T_OUT)`` FP32 (NCL contiguous).
+def _l3_unpack_output(flat: np.ndarray, t_out: int = L3_T_OUT) -> np.ndarray:
+    """``(t_out * 6 * 16,)`` -> ``(1, 96, t_out)`` FP32 (NCL contiguous).
 
     The kernel produces output in (time, oc_group, oc_in_group)
     row-major order (one OC-group slice of 16 floats per kernel call,
     cycling through 6 groups per time step). We reshape to
-    ``(T_OUT, 6, 16)``, flatten the last two dims to ``(T_OUT, 96)``
+    ``(t_out, 6, 16)``, flatten the last two dims to ``(t_out, 96)``
     (out_channel-major within each time step in (oc_group, oc_in_group)
     interleaving), then transpose+reshape to NCL.
     """
     n_groups = L3_OUT_CH // L3_OC_GROUP_SIZE
-    expected = L3_T_OUT * n_groups * L3_OC_GROUP_SIZE  # = T_OUT * 96
+    expected = t_out * n_groups * L3_OC_GROUP_SIZE  # = t_out * 96
     if flat.size != expected:
         raise ValueError(
             f"layer3 output length mismatch: got {flat.size}, expected {expected}"
         )
-    # (T_OUT, 6, 16) -> (T_OUT, 96): groups stored back-to-back gives
+    # (t_out, 6, 16) -> (t_out, 96): groups stored back-to-back gives
     # the natural (g*16 + i_in_group)-th oc index = g*16 + i_in_group
     # (i.e. group 0 is oc 0..15, group 1 is oc 16..31, etc.). The
     # flat output is exactly that order.
-    nlc = flat.reshape(L3_T_OUT, L3_OUT_CH)
+    nlc = flat.reshape(t_out, L3_OUT_CH)
     # NLC -> NCL with N=1.
-    return nlc.transpose(1, 0).reshape(1, L3_OUT_CH, L3_T_OUT)
+    return nlc.transpose(1, 0).reshape(1, L3_OUT_CH, t_out)
 
 # --------------------------------------------------------------------------- #
 # NpuOp wrappers
@@ -368,7 +438,16 @@ def _run_host_runner(
     return float(m_avg.group(1)), float(m_min.group(1)), float(m_max.group(1))
 
 class DoradoFastConvStemLayer2(NpuOp):
-    """Second Dorado fast stem Conv1d layer."""
+    """Second Dorado fast stem Conv1d layer.
+
+    Two on-disk artifacts:
+
+    - ``seq_len=T_IN`` (=2000, default): legacy short-shape artifact.
+      Loaded from ``_npu_artifacts/dorado_fast_conv_stem_layer2/``.
+    - ``seq_len=L1667_T_IN`` (=10000): production-shape (long) artifact
+      paired with stem L3 long-shape and the LSTM L=1667 path. Loaded
+      from ``_npu_artifacts/dorado_fast_conv_stem_layer2_L1667/``.
+    """
 
     name = "dorado_fast_conv_stem_layer2"
 
@@ -380,12 +459,49 @@ class DoradoFastConvStemLayer2(NpuOp):
     IN_CHANNELS = L2_IN_CH
     OUT_CHANNELS = L2_OUT_CH
 
-    def __init__(self) -> None:
+    def __init__(self, seq_len: int = 334) -> None:
+        # ``seq_len`` names the LSTM timestep count (334 short / 1667
+        # long). Stem L2 keeps the time axis (stride=1, padding=2) so
+        # T_in == L1's T_in, derived via _SEQ_LEN_TO_T_IN.
+        if seq_len not in _SEQ_LEN_TO_T_IN:
+            raise ValueError(
+                f"seq_len={seq_len} not supported; expected one of "
+                f"{tuple(_SEQ_LEN_TO_T_IN.keys())}. Add a Makefile "
+                f"invocation + an "
+                f"_npu_artifacts/dorado_fast_conv_stem_layer2_L<seq_len>/ "
+                f"directory to extend."
+            )
+        self.seq_len = int(seq_len)
+        self._t_in = _SEQ_LEN_TO_T_IN[self.seq_len]
+        self._chunk = L2_T_CHUNK  # 200 divides both 2000 and 10000
         self.last_run: ConvLayerRunResult | None = None
 
     @classmethod
     def artifacts_present(cls) -> bool:
         return all(p.exists() for p in (_L2_XCLBIN, _L2_INSTS, _L2_RUNNER))
+
+    @property
+    def artifact_dir(self) -> Path:
+        if self.seq_len == 334:
+            return _L2_DIR
+        return _PACKAGE_ROOT / f"{_L2_NAME}_L{self.seq_len}"
+
+    @property
+    def xclbin(self) -> Path:
+        return self.artifact_dir / "final.xclbin"
+
+    @property
+    def insts(self) -> Path:
+        return self.artifact_dir / "insts.bin"
+
+    @property
+    def host_runner(self) -> Path:
+        return self.artifact_dir / "host_runner"
+
+    def artifacts_available(self) -> bool:
+        return all(
+            p.exists() for p in (self.xclbin, self.insts, self.host_runner)
+        )
 
     def __call__(
         self,
@@ -396,16 +512,59 @@ class DoradoFastConvStemLayer2(NpuOp):
         n_iters: int = 1,
         warmup: int = 0,
         timeout_s: float = 60.0,
+        _impl: str | None = None,
     ) -> np.ndarray:
-        for p in (_L2_XCLBIN, _L2_INSTS, _L2_RUNNER):
+        impl = resolve_dispatch_impl(
+            _impl, env_var="BIONPU_CONV_STEM_LAYER2_DISPATCH"
+        )
+        xclbin = self.xclbin
+        insts = self.insts
+        host_runner = self.host_runner
+        artifact_dir = self.artifact_dir
+        total_t = self._t_in
+        chunk_t = self._chunk
+        n_chunks = total_t // chunk_t
+        required = (
+            (xclbin, insts) if impl == "pyxrt"
+            else (xclbin, insts, host_runner)
+        )
+        for p in required:
             if not p.exists():
                 raise NpuArtifactsMissingError(
-                    f"NPU artifact missing for {self.name}: {p}. See "
-                    f"{_L2_DIR}/MANIFEST.md to rebuild."
+                    f"NPU artifact missing for {self.name} "
+                    f"(seq_len={self.seq_len}, T_in={total_t}): {p}. "
+                    f"See {artifact_dir}/MANIFEST.md to rebuild."
                 )
 
-        sig_packed = _l2_pack_signal(signal)
+        sig_packed = _l2_pack_signal(signal, total_t=total_t, chunk_t=chunk_t)
         wb_packed = _l2_pack_wb(weight, bias)
+
+        if impl == "pyxrt":
+            out_size = n_chunks * L2_OUT_CH * chunk_t * 4  # FP32
+            raw_out, avg_us, min_us, max_us = run_pyxrt_with_buffers(
+                xclbin_path=xclbin,
+                insts_path=insts,
+                in_buffers=[
+                    (sig_packed.tobytes(), _ARG_SIGNAL),
+                    (wb_packed.tobytes(), _ARG_WB),
+                    (bytes(8), _ARG_CTRLPKTS),
+                    (bytes(1), _ARG_TRACE),
+                ],
+                out_size=out_size,
+                out_arg_index=_ARG_OUTPUT,
+                n_iters=n_iters,
+                warmup=warmup,
+            )
+            flat = np.frombuffer(raw_out, dtype=np.float32).copy()
+            out = _l2_unpack_output(flat, total_t=total_t, chunk_t=chunk_t)
+            self.last_run = ConvLayerRunResult(
+                output=out,
+                avg_us=avg_us,
+                min_us=min_us,
+                max_us=max_us,
+                n_iters=int(n_iters),
+            )
+            return out
 
         with tempfile.TemporaryDirectory(prefix="t51_l2_") as td:
             tdp = Path(td)
@@ -417,19 +576,19 @@ class DoradoFastConvStemLayer2(NpuOp):
             wb_packed.tofile(wb_path)
 
             avg_us, min_us, max_us = _run_host_runner(
-                runner=_L2_RUNNER,
-                xclbin=_L2_XCLBIN,
-                insts=_L2_INSTS,
+                runner=host_runner,
+                xclbin=xclbin,
+                insts=insts,
                 sig_path=sig_path,
                 wb_path=wb_path,
                 out_path=out_path,
-                extra_args=["--time", str(T_IN), "--chunk", str(L2_T_CHUNK)],
+                extra_args=["--time", str(total_t), "--chunk", str(chunk_t)],
                 n_iters=n_iters,
                 warmup=warmup,
                 timeout_s=timeout_s,
             )
             flat = np.fromfile(out_path, dtype=np.float32)
-        out = _l2_unpack_output(flat)
+        out = _l2_unpack_output(flat, total_t=total_t, chunk_t=chunk_t)
         self.last_run = ConvLayerRunResult(
             output=out,
             avg_us=avg_us,
@@ -440,7 +599,20 @@ class DoradoFastConvStemLayer2(NpuOp):
         return out
 
 class DoradoFastConvStemLayer3(NpuOp):
-    """Third Dorado fast stem Conv1d layer."""
+    """Third Dorado fast stem Conv1d layer.
+
+    Two on-disk artifacts:
+
+    - ``seq_len=T_IN`` (=2000, default; t_out=334): legacy short-shape
+      artifact. Loaded from
+      ``_npu_artifacts/dorado_fast_conv_stem_layer3/``.
+    - ``seq_len=L1667_T_IN`` (=10000; t_out=1667): production-shape
+      (long) artifact paired with the LSTM L=1667 path. Loaded from
+      ``_npu_artifacts/dorado_fast_conv_stem_layer3_L1667/``. The
+      ``seq_len`` parameter names the *raw input length* (matching
+      conv_stem layers 1 and 2); ``t_out`` follows from
+      ``((seq_len + 2*PAD - K) // STRIDE) + 1``.
+    """
 
     name = "dorado_fast_conv_stem_layer3"
 
@@ -452,12 +624,53 @@ class DoradoFastConvStemLayer3(NpuOp):
     IN_CHANNELS = L3_IN_CH
     OUT_CHANNELS = L3_OUT_CH
 
-    def __init__(self) -> None:
+    def __init__(self, seq_len: int = 334) -> None:
+        # ``seq_len`` names the LSTM timestep count (334 short / 1667
+        # long); since stem L3 reduces by stride=6, t_out == seq_len.
+        if seq_len not in _SEQ_LEN_TO_T_IN:
+            raise ValueError(
+                f"seq_len={seq_len} not supported; expected one of "
+                f"{tuple(_SEQ_LEN_TO_T_IN.keys())}. Add a Makefile "
+                f"invocation + an "
+                f"_npu_artifacts/dorado_fast_conv_stem_layer3_L<seq_len>/ "
+                f"directory to extend."
+            )
+        self.seq_len = int(seq_len)
+        self._t_in = _SEQ_LEN_TO_T_IN[self.seq_len]
+        self._t_out = _SEQ_LEN_TO_L3_T_OUT[self.seq_len]
+        self._padded_len = _SEQ_LEN_TO_L3_PADDED_LEN[self.seq_len]
         self.last_run: ConvLayerRunResult | None = None
 
     @classmethod
     def artifacts_present(cls) -> bool:
         return all(p.exists() for p in (_L3_XCLBIN, _L3_INSTS, _L3_RUNNER))
+
+    @property
+    def t_out(self) -> int:
+        return self._t_out
+
+    @property
+    def artifact_dir(self) -> Path:
+        if self.seq_len == 334:
+            return _L3_DIR
+        return _PACKAGE_ROOT / f"{_L3_NAME}_L{self.seq_len}"
+
+    @property
+    def xclbin(self) -> Path:
+        return self.artifact_dir / "final.xclbin"
+
+    @property
+    def insts(self) -> Path:
+        return self.artifact_dir / "insts.bin"
+
+    @property
+    def host_runner(self) -> Path:
+        return self.artifact_dir / "host_runner"
+
+    def artifacts_available(self) -> bool:
+        return all(
+            p.exists() for p in (self.xclbin, self.insts, self.host_runner)
+        )
 
     def __call__(
         self,
@@ -468,16 +681,63 @@ class DoradoFastConvStemLayer3(NpuOp):
         n_iters: int = 1,
         warmup: int = 0,
         timeout_s: float = 60.0,
+        _impl: str | None = None,
     ) -> np.ndarray:
-        for p in (_L3_XCLBIN, _L3_INSTS, _L3_RUNNER):
+        impl = resolve_dispatch_impl(
+            _impl, env_var="BIONPU_CONV_STEM_LAYER3_DISPATCH"
+        )
+        xclbin = self.xclbin
+        insts = self.insts
+        host_runner = self.host_runner
+        artifact_dir = self.artifact_dir
+        total_t_in = self._t_in
+        t_out = self._t_out
+        padded_len = self._padded_len
+        required = (
+            (xclbin, insts) if impl == "pyxrt"
+            else (xclbin, insts, host_runner)
+        )
+        for p in required:
             if not p.exists():
                 raise NpuArtifactsMissingError(
-                    f"NPU artifact missing for {self.name}: {p}. See "
-                    f"{_L3_DIR}/MANIFEST.md to rebuild."
+                    f"NPU artifact missing for {self.name} "
+                    f"(seq_len={self.seq_len}, T_in={total_t_in}): "
+                    f"{p}. See {artifact_dir}/MANIFEST.md to rebuild."
                 )
 
-        sig_packed = _l3_pack_signal(signal)
-        wb_packed = _l3_pack_wb(weight, bias)
+        sig_packed = _l3_pack_signal(signal, total_t_in=total_t_in, t_out=t_out)
+        wb_packed = _l3_pack_wb(weight, bias, t_out=t_out)
+
+        if impl == "pyxrt":
+            # Output bytes mirror layer3_sizes(): t_out * N_OC_GROUPS *
+            # OC_GROUP_SIZE FP32 floats.
+            out_size = (
+                t_out * L3_N_OC_GROUPS * L3_OC_GROUP_SIZE * 4
+            )
+            raw_out, avg_us, min_us, max_us = run_pyxrt_with_buffers(
+                xclbin_path=xclbin,
+                insts_path=insts,
+                in_buffers=[
+                    (sig_packed.tobytes(), _ARG_SIGNAL),
+                    (wb_packed.tobytes(), _ARG_WB),
+                    (bytes(8), _ARG_CTRLPKTS),
+                    (bytes(1), _ARG_TRACE),
+                ],
+                out_size=out_size,
+                out_arg_index=_ARG_OUTPUT,
+                n_iters=n_iters,
+                warmup=warmup,
+            )
+            flat = np.frombuffer(raw_out, dtype=np.float32).copy()
+            out = _l3_unpack_output(flat, t_out=t_out)
+            self.last_run = ConvLayerRunResult(
+                output=out,
+                avg_us=avg_us,
+                min_us=min_us,
+                max_us=max_us,
+                n_iters=int(n_iters),
+            )
+            return out
 
         with tempfile.TemporaryDirectory(prefix="t51_l3_") as td:
             tdp = Path(td)
@@ -489,22 +749,22 @@ class DoradoFastConvStemLayer3(NpuOp):
             wb_packed.tofile(wb_path)
 
             avg_us, min_us, max_us = _run_host_runner(
-                runner=_L3_RUNNER,
-                xclbin=_L3_XCLBIN,
-                insts=_L3_INSTS,
+                runner=host_runner,
+                xclbin=xclbin,
+                insts=insts,
                 sig_path=sig_path,
                 wb_path=wb_path,
                 out_path=out_path,
                 extra_args=[
-                    "--in-time", str(L3_INPUT_PADDED_LEN),
-                    "--out-time", str(L3_T_OUT),
+                    "--in-time", str(padded_len),
+                    "--out-time", str(t_out),
                 ],
                 n_iters=n_iters,
                 warmup=warmup,
                 timeout_s=timeout_s,
             )
             flat = np.fromfile(out_path, dtype=np.float32)
-        out = _l3_unpack_output(flat)
+        out = _l3_unpack_output(flat, t_out=t_out)
         self.last_run = ConvLayerRunResult(
             output=out,
             avg_us=avg_us,
@@ -534,6 +794,9 @@ __all__ = [
     "ConvLayerRunResult",
     "DoradoFastConvStemLayer2",
     "DoradoFastConvStemLayer3",
+    "L1667_L3_INPUT_PADDED_LEN",
+    "L1667_L3_T_OUT",
+    "L1667_T_IN",
     "L2_IN_CH",
     "L2_K",
     "L2_N_CHUNKS",

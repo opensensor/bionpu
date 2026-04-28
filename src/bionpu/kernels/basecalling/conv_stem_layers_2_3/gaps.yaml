@@ -145,3 +145,87 @@ gaps:
     upstream_issue: null
     blocks: [""]
     severity: "blocker"
+
+  - id: "C-pyxrt-in-process-dispatch"
+    category: "host_dispatch"
+    op_or_pattern: "Replace subprocess host_runner with in-process pyxrt for DoradoFastConvStemLayer2 + Layer3"
+    attempted: |
+      Added BIONPU_CONV_STEM_LAYER2_DISPATCH and
+      BIONPU_CONV_STEM_LAYER3_DISPATCH env vars
+      ({subprocess,pyxrt}; also accepted as
+      DoradoFastConvStemLayer{2,3}.__call__(_impl=...)) routing
+      through bionpu.dispatch.npu.NpuBackend.run_xclbin (in-process
+      pyxrt). Subprocess path stays the default fallback.
+
+      Kernel arg layout reused from runner.cpp:
+        arg3=signal, arg4=wb, arg5=output, arg6=ctrlpkts(8),
+        arg7=trace(1).
+    failed_with: null
+    root_cause: |
+      Same as the linear_projection (a) story: each subprocess
+      invocation pays ~70-80 ms of fork + xrt::device::register_xclbin
+      + hw_context construction. The pyxrt path caches the device +
+      xclbin + kernel handles in the process-level NpuBackend
+      singleton.
+    workaround: |
+      Silicon-validated C_PYXRT_PASS at
+      results/basecalling/b-m10-pyxrt-rollout/measurements.json
+      (state/c-pyxrt-rollout-dorado_fast_conv_stem_layer{2,3}-*.json):
+
+      Layer 2:
+        subprocess wall/iter   ~280.1 ms (kernel ~183.0 ms)
+        pyxrt wall/iter         ~258.2 ms (kernel ~183.0 ms)
+        pyxrt 16-iter steady   ~205.9 ms wall/iter (~22.9 ms host overhead)
+        pyxrt vs subprocess output: byte-equal (max-abs-diff 0.0).
+        Steady-state savings: ~74.2 ms / chunk (kernel-bound; the
+        host-overhead gain is bounded by the 183 ms silicon time).
+
+      Layer 3:
+        subprocess wall/iter   ~928.3 ms (kernel ~660.3 ms)
+        pyxrt wall/iter         ~905.7 ms (kernel ~660.7 ms)
+        pyxrt 16-iter steady   ~746.3 ms wall/iter (~85.4 ms host overhead)
+        pyxrt vs subprocess output: byte-equal (max-abs-diff 0.0).
+        Steady-state savings: ~182.0 ms / chunk.
+    upstream_issue: null
+    blocks: []
+    severity: "performance"
+    status: "validated"
+
+  - id: "B-m12-long-shape-L1667"
+    category: "shape_coverage"
+    op_or_pattern: "Production-shape (long) artifacts for DoradoFastConvStemLayer{2,3} paired with the LSTM L=1667 path"
+    attempted: |
+      Built the L1667 sibling artifacts via the existing Makefile:
+        make NPU2=1 layer=2 time=10000 chunk=200 all
+        make NPU2=1 layer=3 time=10000 in_time=10018 out_time=1667 all
+      Installed at
+        bionpu/dispatch/_npu_artifacts/dorado_fast_conv_stem_layer2_L1667/
+        bionpu/dispatch/_npu_artifacts/dorado_fast_conv_stem_layer3_L1667/
+      with leaves final.xclbin / insts.bin / host_runner. Both op
+      classes grew a ``seq_len`` constructor arg that names the LSTM
+      timestep count (334 short / 1667 long), mirroring
+      DoradoFastLstmCellBf16Acc. Layer 3 derives t_out=seq_len (since
+      stride=6 reduces 10000 -> 1667 exactly) and padded_len=10018.
+      Encoder.py passes ``seq_len=expected_lstm_l`` derived from the
+      raw signal length. The legacy short-shape path is byte-identical;
+      the long-shape path is purely additive.
+    failed_with: null
+    root_cause: |
+      Legacy artifacts shape-checked the input as (1, 16, 2000) and
+      produced (1, 16, 2000) (L2) / (1, 96, 334) (L3). The encoder's
+      production_long path feeds (1, 16, 10000), so both layers fell
+      back to CPU. Building second xclbins with the IRON loop-trip-
+      count adjusted for 50 chunks (L2) and 1667 timesteps x 6 OC
+      groups = 10002 kernel invocations (L3) restores the NPU path.
+    workaround: |
+      Silicon-validated B_M12_PASS at
+      results/basecalling/b-m12-long-shape-rollout/measurements.json:
+        L2 subprocess wall/iter ~1020 ms (kernel ~912 ms)
+        L2 pyxrt wall/iter       ~954 ms (kernel ~912 ms)
+        L3 subprocess wall/iter ~3664 ms (kernel ~3298 ms)
+        L3 pyxrt wall/iter      ~3528 ms (kernel ~3298 ms)
+        pyxrt vs subprocess output: byte-equal (max-abs-diff 0.0).
+    upstream_issue: null
+    blocks: []
+    severity: "feature"
+    status: "validated"

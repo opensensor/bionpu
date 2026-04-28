@@ -36,9 +36,10 @@ device="npu")`` (which would fall through here as a passthrough).
 from __future__ import annotations
 
 import os
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
 # A `Literal` (rather than an `enum.StrEnum`) keeps the wire format
 # identical to JSON — the profile table serializes device names as plain
@@ -63,7 +64,18 @@ def _validate(device: str) -> Device:
         )
     return device  # type: ignore[return-value]
 
-def to_device(tensor: torch.Tensor, device: Device) -> torch.Tensor:
+def _torch_module():
+    """Import torch only when tensor movement actually needs it."""
+    try:
+        import torch  # noqa: PLC0415 - optional dependency, imported lazily
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyTorch is required to move tensor arguments between CPU/GPU. "
+            "Install torch or use the registered NPU-op path with numpy arrays."
+        ) from exc
+    return torch
+
+def to_device(tensor: "torch.Tensor", device: Device) -> "torch.Tensor":
     """Move `tensor` to the named logical device.
 
     - ``"cpu"``: ``tensor.to("cpu")``.
@@ -94,9 +106,11 @@ def to_device(tensor: torch.Tensor, device: Device) -> torch.Tensor:
     dev = _validate(device)
 
     if dev == "cpu":
+        _torch_module()
         return tensor.to("cpu")
 
     if dev == "gpu":
+        torch = _torch_module()
         if os.environ.get("BIONPU_FORCE_CPU") == "1":
             return tensor.to("cpu")
         if not torch.cuda.is_available():

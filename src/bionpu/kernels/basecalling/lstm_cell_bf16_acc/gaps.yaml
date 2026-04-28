@@ -55,3 +55,143 @@ gaps:
     upstream_issue: null
     blocks: []
     severity: "cosmetic"
+
+  - id: "B-M13-LSTM-BF16-ACC-FP32-OUTPUT-REVERTED"
+    category: "wire_format"
+    op_or_pattern: "DoradoFastLstmCellBf16Acc output dtype: bf16 vs FP32 wire format"
+    attempted: |
+      A WIP refactor on 2026-04-27 (~20:45) flipped the per-cell wire
+      format from bf16 output to FP32 output:
+        - lstm_cell_bf16_acc.cc: y_t parameter changed from
+          ``bfloat16*`` to ``float*``; final ``aie::store_v(y_t + ...,
+          h_new_bf)`` (bf16 narrow) replaced with
+          ``aie::store_v(y_t + ..., h_new_f)`` (FP32 store).
+        - lstm_cell_bf16_acc.py: out_step_ty / out_total_ty changed
+          from bf16 to float32.
+        - runner.cpp: bo_output sized ``OUT_TOTAL * sizeof(float)``,
+          writes via ``write_floats``.
+        - __init__.py: output read as ``np.fromfile(..., dtype=
+          np.float32)`` and reshaped directly (no bf16 unpack).
+      The host_runner binary was rebuilt to match the FP32 contract.
+      The L334 ``final.xclbin`` was NOT rebuilt — it still contains
+      the original bf16-emitting silicon (file mtime 2026-04-25
+      20:22, kernel object mtime 2026-04-27 02:55, both predate the
+      .cc edit at 20:45).
+    failed_with: |
+      End-to-end webui smoke at
+      ``BIONPU_DORADO_NPU_PRODUCTION_LONG=0`` /
+      ``BIONPU_DORADO_NPU_HYBRID_FAST=0`` /
+      ``BIONPU_DORADO_NPU_PRECISION=mixed-fp32-state`` produced 2,952
+      bases on smoke.pod5 (vs ~23 expected) with sequences like
+      ``AGGAGGAGGAGGAGG...GGGGGGGG`` — pure bit-pattern garbage.
+      Diagnosis: the silicon writes ``OUT_TOTAL * BYTES_PER_BF16 =
+      32064 * 2 = 64128`` bytes of bf16; the host reads as float32
+      from a buffer sized ``OUT_TOTAL * sizeof(float) = 128256``
+      bytes. Empirical byte dump confirms: half the float32 buffer
+      is exactly zero (50% of elements; the bf16 fill stops at the
+      midpoint), and the populated half reads as float32 values
+      reconstructed from bf16 byte pairs (top 16 bits = high bf16,
+      low 16 bits = low bf16). Net: every layer's per-cell output is
+      half-zero plus half pseudo-FP32, the LSTM stack compounds it
+      across 5 layers, the linear projection emits garbage logits,
+      and the decoder emits ~hundred-fold-too-many bases.
+    root_cause: |
+      Wire-format refactor was incomplete. The .cc / .py edits
+      changed source text but the silicon was never rebuilt; the
+      host runner + Python op were rebuilt against an FP32 contract
+      that the on-device kernel does not honour. Either the silicon
+      had to be rebuilt (a multi-hour aiecc + IRON pipeline) or the
+      host-side changes had to be reverted.
+    workaround: |
+      Reverted to bf16 output throughout. Smaller-diff option since
+      the silicon is the longest-pole artifact.
+        - runner.cpp: restored to ``bo_output = OUT_TOTAL *
+          BYTES_PER_BF16`` and ``write_bf16(...)``.
+        - lstm_cell_bf16_acc.cc: restored ``y_t`` to ``bfloat16*``
+          and the final ``aie::store_v(y_t + v*VEC, h_new_bf)``
+          narrowing.
+        - lstm_cell_bf16_acc.py: restored out_step_ty / out_total_ty
+          to ``np.dtype[_BF16]``.
+        - __init__.py: restored ``out_size = self.seq_len * HIDDEN *
+          2`` for pyxrt; restored ``output.bf16.bin`` + ``buf_u16 =
+          np.fromfile(..., dtype=np.uint16)`` + ``_unpack_output_bf16
+          (buf_u16, seq_len=self.seq_len)`` for subprocess. Kept the
+          orthogonal seq_len + artifact_dir + pyxrt-impl plumbing
+          additions; only the output-dtype lines were touched.
+        - Rebuilt the L334 host_runner from the reverted runner.cpp;
+          installed at
+          ``bionpu/dispatch/_npu_artifacts/dorado_fast_lstm_cell_bf16_acc/host_runner``.
+      Silicon validation post-revert (synthetic Gaussian L=334):
+        - max-abs vs CPU LSTM reference: 1.48e-3 (within bf16 quant
+          noise; mean abs diff 1.8e-4)
+        - Output buffer: low-half of every uint16 pair = 0 (bf16
+          stored in upper 16 bits of FP32 slot — expected after
+          ``_unpack_output_bf16``)
+        - All timesteps populated (no zeroed second half)
+        - No NaN / Inf
+      Webui smoke (smoke.pod5, production_long=0 + hybrid_fast=0 +
+      precision=mixed-fp32-state + stack_batch=0):
+        - PRE-REVERT: 2,952 bases / 10 reads — garbage
+        - POST-REVERT: 19 bases / 10 reads — sane (within ±10 of the
+          ~23 expected)
+      Caveat for L=1667 (production_long=1): the L1667 silicon
+      (built 2026-04-27 02:55) was also built from the OLD
+      bf16-emitting .cc, BUT the L1667 stack_runner.cpp (created
+      2026-04-27 02:58, untracked) and stack_host_runner (built
+      03:01) expect FP32 output. The L1667 stack path therefore has
+      the SAME wire-format mismatch and is independently broken; it
+      requires either rebuilding L1667 silicon to emit FP32 (track
+      (1)'s territory) OR reverting stack_runner.cpp + rebuilding
+      stack_host_runner. Out of scope for this reconcile pass.
+    upstream_issue: null
+    blocks: []
+    severity: "blocker"
+    status: "fixed"
+    decision_rationale: |
+      Reverting host-side (runner.cpp + __init__.py) is a ~50-line
+      diff plus a 1-second g++ rebuild; rebuilding L334 silicon from
+      the FP32-emitting .cc requires the full mlir-aie + Peano
+      pipeline (~hours when it works at all). Reverting is the
+      strictly smaller fix to restore production_long=0 sanity.
+
+  - id: "C-pyxrt-in-process-dispatch"
+    category: "host_dispatch"
+    op_or_pattern: "Replace subprocess host_runner with in-process pyxrt for DoradoFastLstmCellBf16Acc"
+    attempted: |
+      Added BIONPU_LSTM_CELL_BF16_ACC_DISPATCH={subprocess,pyxrt} env
+      var (also accepted as DoradoFastLstmCellBf16Acc.__call__(_impl=...))
+      routing through bionpu.dispatch.npu.NpuBackend.run_xclbin
+      (in-process pyxrt). Subprocess path stays the default fallback.
+
+      Kernel arg layout reused from runner.cpp:
+        arg3=input (bf16), arg4=weight (bf16, per-timestep expanded),
+        arg5=output (FP32), arg6=trace(1).
+
+      The runner expands the compact bf16 WB to a per-timestep stream
+      before pushing the BO; the pyxrt path replicates that
+      expansion in Python (see ``_expand_wb_bf16``) so the
+      bo_weight payload byte-matches the runner's output. Note: the
+      shipped host_runner binary at the artifact path was rebuilt
+      from runner.cpp on 2026-04-27 to match the FP32-output
+      contract documented in lstm_cell_bf16_acc.py (the kernel writes
+      FP32 to the FIFO; the bo_output BO must be sized FP32).
+    failed_with: null
+    root_cause: |
+      Same as the linear_projection (a) story: each subprocess
+      invocation pays ~70-80 ms of fork + xrt::device::register_xclbin
+      + hw_context construction, plus the bf16-acc runner does its
+      own compact->expanded WB build (28 M uint16 = 56 MB). pyxrt
+      caches device + xclbin + kernel handles process-wide.
+    workaround: |
+      Silicon-validated C_PYXRT_PASS at
+      results/basecalling/b-m10-pyxrt-rollout/measurements.json
+      (state/c-pyxrt-rollout-dorado_fast_lstm_cell_bf16_acc-*.json):
+        subprocess wall/iter   ~138.5 ms (kernel ~43.9 ms)
+        pyxrt wall/iter         ~108.0 ms (kernel ~43.9 ms)
+        pyxrt 16-iter steady   ~52.3 ms wall/iter (~8.3 ms host overhead)
+        pyxrt vs subprocess output: byte-equal (max-abs-diff 0.0).
+      Steady-state savings: ~86.2 ms / chunk.
+    upstream_issue: null
+    blocks: []
+    severity: "performance"
+    status: "validated"

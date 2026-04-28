@@ -291,6 +291,14 @@ class DNABERTEpiScorer:
     def _ensure_npu_loaded(self) -> None:
         if self._npu_loaded:
             return
+        if self.passport_dir is None or not (
+            self.passport_dir / "passport.json"
+        ).exists():
+            raise DNABERTEpiUnavailableError(
+                "device='npu' real-mode requires --passport-dir "
+                "produced by `bionpu score-quantize` (path must "
+                "contain passport.json + weights.npz)."
+            )
         try:
             import torch
             from transformers import AutoModel, AutoTokenizer
@@ -300,14 +308,6 @@ class DNABERTEpiScorer:
                 "`transformers` to be installed. Install them or "
                 "use `smoke=True`."
             ) from exc
-        if self.passport_dir is None or not (
-            self.passport_dir / "passport.json"
-        ).exists():
-            raise DNABERTEpiUnavailableError(
-                "device='npu' real-mode requires --passport-dir "
-                "produced by `bionpu score-quantize` (path must "
-                "contain passport.json + weights.npz)."
-            )
 
         import numpy as np
 
@@ -380,8 +380,9 @@ class DNABERTEpiScorer:
                     np.round(cls / self._npu_head_act_scale), -128, 127,
                 ).astype(np.int8)
 
-                # Dispatch through the bionpu NpuOp. Currently emulation
-                # by default; flips to silicon when the xclbin is wired.
+                # Dispatch through the bionpu NpuOp. Missing artifacts
+                # fall back to byte-equivalent host emulation; installed
+                # artifacts run through the in-process pyxrt backend.
                 y_int8 = bert_int8_matmul_head(
                     cls_int8,
                     self._npu_head_w,

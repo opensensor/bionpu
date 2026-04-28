@@ -16,4 +16,69 @@ compiler: "peano"
 build_date: "2026-04-25T07:00:00+00:00"
 host: "matteius-ProArt-P16-H7606WI"
 
-gaps: []
+gaps:
+  - id: "C-pyxrt-in-process-dispatch"
+    category: "host_dispatch"
+    op_or_pattern: "Replace subprocess host_runner with in-process pyxrt for DoradoFastConvStemLayer1"
+    attempted: |
+      Added BIONPU_CONV_STEM_LAYER1_DISPATCH={subprocess,pyxrt} env
+      var (also accepted as DoradoFastConvStemLayer1.__call__(_impl=...))
+      routing through bionpu.dispatch.npu.NpuBackend.run_xclbin
+      (in-process pyxrt). Subprocess path stays the default fallback.
+
+      Kernel arg layout reused from runner.cpp:
+        arg3=signal, arg4=wb, arg5=output, arg6=ctrlpkts(8), arg7=trace(1).
+    failed_with: null
+    root_cause: |
+      Same as the linear_projection (a) story: each subprocess
+      invocation pays ~70-80 ms of fork + xrt::device::register_xclbin
+      + hw_context construction. The pyxrt path caches the device +
+      xclbin + kernel handles in the process-level NpuBackend
+      singleton, so only BO alloc + kernel launch remains per
+      dispatch.
+    workaround: |
+      Silicon-validated C_PYXRT_PASS at
+      results/basecalling/b-m10-pyxrt-rollout/measurements.json
+      (state/c-pyxrt-rollout-dorado_fast_conv_stem_layer1-*.json):
+        subprocess wall/iter   ~93.4 ms (kernel ~11.4 ms)
+        pyxrt wall/iter         ~32.6 ms (kernel ~11.1 ms; warmup-dominated)
+        pyxrt 16-iter steady   ~12.5 ms wall/iter (~1.4 ms host overhead)
+        pyxrt vs subprocess output: byte-equal (max-abs-diff 0.0).
+      Steady-state per-chunk wall savings: ~80.8 ms vs subprocess.
+    upstream_issue: null
+    blocks: []
+    severity: "performance"
+    status: "validated"
+
+  - id: "B-m12-long-shape-L1667"
+    category: "shape_coverage"
+    op_or_pattern: "Production-shape (long) artifact for DoradoFastConvStemLayer1 paired with the LSTM L=1667 path"
+    attempted: |
+      Built the L1667 sibling artifact via the existing Makefile:
+        make NPU2=1 time=10000 chunk=200 all
+      Installed at
+        bionpu/dispatch/_npu_artifacts/dorado_fast_conv_stem_layer1_L1667/
+      with leaves final.xclbin / insts.bin / host_runner. The op class
+      grew a ``seq_len`` constructor arg that names the LSTM timestep
+      count (334 short / 1667 long), mirroring DoradoFastLstmCellBf16Acc.
+      Encoder.py passes ``seq_len=expected_lstm_l`` derived from the
+      raw signal length. The legacy short-shape path is byte-identical;
+      the long-shape path is purely additive.
+    failed_with: null
+    root_cause: |
+      The legacy artifact was built for T_in=2000 / L=334 and shape-
+      checked the input (1, 1, 2000). The encoder's production_long
+      path feeds (1, 1, 10000), so stem L1 fell back to CPU. Building
+      a second xclbin with the IRON loop-trip-count for 50 chunks
+      restores the NPU path.
+    workaround: |
+      Silicon-validated B_M12_PASS at
+      results/basecalling/b-m12-long-shape-rollout/measurements.json:
+        subprocess wall/iter   ~263 ms (kernel ~55.6 ms)
+        pyxrt wall/iter         ~110 ms (kernel ~55.3 ms)
+        pyxrt vs subprocess output: byte-equal (max-abs-diff 0.0).
+    upstream_issue: null
+    blocks: []
+    severity: "feature"
+    status: "validated"
+

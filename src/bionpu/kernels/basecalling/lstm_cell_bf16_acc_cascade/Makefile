@@ -16,8 +16,11 @@
 ##===----------------------------------------------------------------------===##
 
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
-repo_root := $(realpath ${srcdir}/../../../..)
-fork_python := ${repo_root}/third_party/mlir-aie/install/python
+# Post bionpu-public-submodule swap: kernel sits at
+#   genetics/bionpu-public/src/bionpu/kernels/basecalling/lstm_cell_bf16_acc_cascade
+# (6 levels into genetics). third_party/ remains at the genetics root.
+repo_root ?= $(realpath ${srcdir}/../../../../../..)
+fork_python ?= ${repo_root}/third_party/mlir-aie/install/python
 mlir_aie_dir ?= $(MLIR_AIE_DIR)
 
 ifeq ($(strip $(mlir_aie_dir)),)

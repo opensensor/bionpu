@@ -57,8 +57,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-import torch
-
 from bionpu.dispatch.devices import DEVICES, Device, to_device
 from bionpu.dispatch.npu import (
     NPU_OPS,
@@ -98,22 +96,35 @@ def _move_args(
     args: tuple[Any, ...], kwargs: dict[str, Any], device: Device
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
     """Move every Tensor in `args`/`kwargs` to `device`. Non-tensors pass through."""
+    tensor_type = _torch_tensor_type()
     new_args = tuple(
-        to_device(a, device) if isinstance(a, torch.Tensor) else a for a in args
+        to_device(a, device) if tensor_type and isinstance(a, tensor_type) else a
+        for a in args
     )
     new_kwargs = {
-        k: (to_device(v, device) if isinstance(v, torch.Tensor) else v)
+        k: (to_device(v, device) if tensor_type and isinstance(v, tensor_type) else v)
         for k, v in kwargs.items()
     }
     return new_args, new_kwargs
 
+def _torch_tensor_type() -> type[Any] | None:
+    """Return ``torch.Tensor`` when torch is installed, otherwise ``None``."""
+    try:
+        import torch  # noqa: PLC0415 - optional dependency, imported lazily
+    except ImportError:
+        return None
+    return torch.Tensor
+
 def _first_tensor_shape(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[int, ...]:
     """Return the shape of the first Tensor argument, for profile lookup."""
+    tensor_type = _torch_tensor_type()
+    if tensor_type is None:
+        return ()
     for a in args:
-        if isinstance(a, torch.Tensor):
+        if isinstance(a, tensor_type):
             return tuple(a.shape)
     for v in kwargs.values():
-        if isinstance(v, torch.Tensor):
+        if isinstance(v, tensor_type):
             return tuple(v.shape)
     # No tensor inputs: a scalar shape is a defensible default; the
     # profile table will simply miss and `best_device` will return

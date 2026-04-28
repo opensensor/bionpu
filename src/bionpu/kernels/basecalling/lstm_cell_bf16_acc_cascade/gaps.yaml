@@ -1242,3 +1242,83 @@ gaps:
       - ""
     severity: "blocker"
     status: "open"
+
+  - id: ""
+    category: "performance"
+    op_or_pattern: "Shim BD burst_length on cascade input/output ObjectFifos (192 B payloads)"
+    # Closure 2026-04-28 (Dorado-A2 sweep, b-m11-cascade-burst-length-falsified):
+    # FALSIFIED. All AM020-supported burst lengths {64,128,256,512} plus
+    # the IRON default (BL=0 → firmware "highest available") reproduce
+    # the G-T3.1-103 wedge fingerprint (per-iter wall 5-6s, output
+    # all-zero). BL=1024 BUILD_FAIL — toolchain rejects with "Requested
+    # burst length is not supported by the target. Supported burst
+    # lengths: 64 128 256 512", correcting our prior assumption that
+    # 1024 was supported. The "sub-cliff BD payload triggers stall"
+    # hypothesis from CRISPR pam_filter is therefore conclusively NOT
+    # the cascade wedge cause. Remaining suspects per b-m6d-cascade
+    # Followup G (weight ObjectFifo / memtile pressure, static state
+    # buffers, heavy aie_api math, or their combination with cascade)
+    # are now the next bisection surface. Sweep harness at
+    # tests/aie2p_microtests/cascade_burst_length_sweep/ remains
+    # available for future BL-related variants.
+    # Side-finding: the A1 monkey-patch's allowed-values list was
+    # corrected to drop 1024 (lstm_cell_bf16_acc_cascade.py).
+    attempted: |
+      Followup on G-T3.1-103 from the CRISPR-knob inventory. The
+      cascade build's three shim BDs (per
+      results/basecalling/b-m6d-cascade/measurements.json
+      topology_realized) are:
+
+        - input_in    (shim → core (0,5)):    memref<96 × bf16>     =  192 B
+        - weight_in_all (shim → memtile):     memref<26880 × bf16>  = 53760 B
+        - output_out  (core (1,2) → shim):    memref<96 × bf16>     =  192 B
+
+      Two of the three sit BELOW the 256 B sub-cliff that
+      ``tests/aie2p_microtests/dispatch_overhead_bisector`` previously
+      isolated as a deterministic stall on AIE2P shim DMA when
+      ``burst_length=0`` (the IRON ``DMATask.resolve`` default → firmware
+      "highest available" = 1024 B). The CRISPR
+      pam_filter track has the documented monkey-patch pattern at
+      ``bionpu/kernels/crispr/pam_filter/pam_filter.py:_maybe_install_burst_length_override``
+      which has NOT yet been swung at the cascade kernel.
+
+      Implemented 2026-04-27 in
+      ``lstm_cell_bf16_acc_cascade.py:_maybe_install_burst_length_override``,
+      activated by ``BIONPU_LSTM_CASCADE_SHIM_BURST_LENGTH`` ∈
+      {0, 64, 128, 256, 512, 1024}. Patches
+      ``aie.iron.runtime.dmatask.DMATask.resolve`` at lowering time to
+      forward the chosen ``burst_length`` to ``shim_dma_single_bd_task``
+      on every shim BD in the build.
+    failed_with: null
+    root_cause: |
+      Untested at the time of filing. Hypothesis: the firmware-default
+      burst path stalls on the two 192 B shim BDs because the
+      single-burst length exceeds payload, and the resulting BD ack
+      timing interacts with the cascade-tile firing pattern to surface
+      as the G-T3.1-103 wedge fingerprint (DPU PC 0xffffffff, Context
+      PC 0x28b060ad, msg 0x1d000001). The Followup G outcome (per-tile
+      0-jnz invariant satisfied, still wedged) is consistent with the
+      remaining cause being host-side DMA timing rather than per-tile
+      ELF.
+    workaround: |
+      Bisection plan once silicon is available:
+
+        1. Baseline: rebuild + run cascade with no env var (BL=0).
+           Confirms reproducibility of the G-T3.1-103 wedge fingerprint.
+        2. ``BIONPU_LSTM_CASCADE_SHIM_BURST_LENGTH=64``: smallest
+           supported burst, well below the 192 B payload. If wedge
+           clears, the cause is the BL ≥ payload mismatch.
+        3. ``BIONPU_LSTM_CASCADE_SHIM_BURST_LENGTH=256``: matches the
+           documented sub-cliff boundary.
+        4. ``BIONPU_LSTM_CASCADE_SHIM_BURST_LENGTH=512``,
+           ``=1024``: confirm that values ≥ payload are pathological
+           and that BL=0 (= 1024 default) is the upper-bound case.
+
+      Each variant is one ``make clean && BIONPU_LSTM_CASCADE_SHIM_BURST_LENGTH=N make NPU2=1 experiment=production seq=334`` build + one
+      silicon dispatch under ``bionpu.dispatch.npu_silicon_lock``.
+      Halt + capture on first WEDGE per project silicon-wedge etiquette.
+    upstream_issue: null
+    blocks:
+      - ""
+    severity: "performance"
+    status: "open"

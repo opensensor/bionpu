@@ -3,6 +3,428 @@ task_id: ""
 kernel_name: "dorado_fast_linear_projection"
 target: "aie2p"
 compiler: "peano"
-build_date: "2026-04-25T04:30:00+00:00"
+build_date: "2026-04-27T00:00:00+00:00"
 host: "matteius-ProArt-P16-H7606WI"
-gaps: []
+gaps:
+  # B-batched status (2026-04-28): silicon-PASS for N={1,2,4,8} via
+  # chunk-outer batching at the IRON layer. Single xclbin load + BO
+  # alloc + XRT submit covers N chunks. Per-chunk wall time scales:
+  #   N=1: 63.2 ms  (1.47x speedup vs single-chunk 93.3 ms)
+  #   N=2: 40.7 ms  (2.29x)
+  #   N=4: 27.1 ms  (3.45x)
+  #   N=8: 20.7 ms  (4.50x)
+  # Kernel time per chunk stays flat (~9.5-9.9 ms — same kernel doing
+  # same work), wall/chunk approaches kernel-time ceiling as N grows.
+  # Per-chunk byte-equal vs single-chunk bf16 reference (max-abs
+  # 3.125e-2, well below 5e-2 bf16 round-off gate).
+  # Measurements:
+  # - state/b-batched-validation-20260428T021240Z.json
+  # - results/basecalling/b-m9-batched/measurements.json
+  # Reference test: tests/test_linear_projection_fused_batched_correctness.py.
+
+  # B2 status: silicon-PASS using ironenv-bundled peano (full AIE2P
+  # sysroot at .../site-packages/llvm-aie/include/aie2p-none-unknown-elf/).
+  # The third_party/llvm-aie/build regression below is still
+  # outstanding for any work that needs that specific peano (e.g.
+  # AIE2P sparse-load intrinsics from Followup-I), but for the
+  # B1/B2 critical path the ironenv peano is canonical.
+
+  - id: "B-batched-stage3-host-amortisation"
+    category: "performance"
+    op_or_pattern: "linear_projection chunk-outer batching at IRON layer"
+    attempted: |
+      Build a batched variant of stage-3 fused-perts that processes
+      N_CHUNKS chunks per silicon dispatch. Single xclbin load per N
+      chunks, single weight slab (48 KiB bf16) shared across the
+      batch, IRON loop (chunk-outer + timestep-inner) walks the
+      input/output sequentially. Mirrors the CRISPR pam_filter
+      LAUNCH_CHUNKS pattern.
+    failed_with: |
+      n/a — silicon-PASS for N={1, 2, 4, 8}.
+    root_cause: |
+      n/a — feature add. The B3b bench's 100 ms/chunk host-overhead
+      delta (vs 10.65 ms kernel time) is the host-side dispatch
+      ceremony (xclbin reload, BO alloc, XRT submit, output sync).
+      Batching N chunks into one dispatch collapses this overhead
+      to once-per-N-chunks. Per-chunk wall converges toward kernel
+      time as N grows (2026-04-28 silicon: N=8 yields 20.7 ms/chunk
+      vs the 9.5 ms kernel-only ceiling — still ~11 ms host residual,
+      probably output-sync dominated).
+    workaround: |
+      Build via:
+        BIONPU_LINEAR_PROJECTION_BATCH_CHUNKS={1,2,4,8} \
+          make NPU2=1 experiment=fused-batched seq=334 all
+      Op class: DoradoFastLinearProjectionFusedBatched
+      Op name:  dorado_fast_linear_projection_fused_perts_batched
+      Wire format: input (N*L*HIDDEN bf16), weight (single 48-KiB
+      slab), output (N*L*OUT_DIM bf16). The C++ kernel is unchanged
+      (linear_projection_fused.cc); chunk-outer batching is purely
+      IRON-side.
+    upstream_issue: null
+    blocks: []
+    severity: "info"
+    status: "closed"
+    n_chunks_tested: [1, 2, 4, 8]
+    silicon_measurements:
+      - n_chunks: 1
+        dispatch_avg_us: 9812.0
+        wall_per_chunk_us: 63250.2
+        speedup_vs_single_chunk: 1.47
+        max_abs_vs_bf16_ref: 3.125e-2
+      - n_chunks: 2
+        dispatch_avg_us: 19715.5
+        wall_per_chunk_us: 40684.8
+        speedup_vs_single_chunk: 2.29
+        max_abs_vs_bf16_ref: 3.125e-2
+      - n_chunks: 4
+        dispatch_avg_us: 38273.5
+        wall_per_chunk_us: 27062.4
+        speedup_vs_single_chunk: 3.45
+        max_abs_vs_bf16_ref: 3.125e-2
+      - n_chunks: 8
+        dispatch_avg_us: 76419.0
+        wall_per_chunk_us: 20710.1
+        speedup_vs_single_chunk: 4.50
+        max_abs_vs_bf16_ref: 3.125e-2
+
+  - id: "B2-peano-libcxx-build-blocker"
+    category: "toolchain"
+    op_or_pattern: "Peano libcxx headers missing post-Followup-I rebuild"
+    attempted: |
+      B2 silicon-validate of dorado_fast_linear_projection_fused_perts.
+      Tried full xclbin build via:
+        make NPU2=1 experiment=fused-perts seq=334 all
+      after sourcing /opt/xilinx/xrt/setup.sh + ironenv venv +
+      MLIR_AIE_DIR + PEANO_INSTALL_DIR.
+    failed_with: |
+      Peano clang++ for aie2p-none-unknown-elf target cannot find
+      libcxx headers:
+        stdlib.h file not found  (initial)
+        algorithm file not found (after dropping unused stdlib.h —
+                                  aie_api/aie.hpp pulls <algorithm>)
+        __config_site file not found  (after -isystem libcxx/include —
+                                       __config_site is the .in template,
+                                       not generated)
+      Affects ALL kernels that include <aie_api/aie.hpp>, NOT just the
+      new fused-perts artifact. The existing per-group
+      linear_projection.cc and the LSTM lstm_cell_bf16_acc.cc both
+      reproduce the same error in the same env.
+    root_cause: |
+      Followup-I (AIE2P sparse-load intrinsics) rebuilt
+      third_party/llvm-aie/build without re-running the libcxx install
+      step. Last known-good kernel .o build is from 2026-04-27T02:55Z
+      (lstm_cell_bf16_acc.o); the rebuild dropped libcxx after that.
+      libcxx source is present at libcxx/include/ but __config_site is
+      the unprocessed .in template.
+    workaround: |
+      Two paths:
+
+      (1) Rebuild llvm-aie with libcxx install step:
+          cmake -DLLVM_ENABLE_RUNTIMES="cxx;cxxabi" ... && cmake --build
+          . --target cxx cxxabi install
+          (canonical fix; restores all kernel-rebuild capability).
+
+      (2) For B2 specifically without rebuild: silicon-validate by
+          running the EXISTING per-group xclbin (cached at
+          bionpu/dispatch/_npu_artifacts/dorado_fast_linear_projection/
+          final.xclbin) and the new fused-perts artifact ONCE the
+          rebuild lands. Cached xclbins are unaffected by this
+          regression — only fresh .cc compiles are blocked.
+
+      Diagnostic state captured at
+      state/b2-peano-libcxx-blocker-20260428T011043Z/b2-blocker.json.
+
+      NPU silicon itself is healthy: xrt-smi examine shows
+      NPU Strix [0000:67:00.1] aie2p 6x8, fw 1.1.2.64,
+      /dev/accel/accel0 present crw-rw-rw-+. Pure toolchain-side
+      blocker.
+    upstream_issue: null
+    blocks:
+      - "B1-fused-perts-stage3 (silicon validation)"
+    severity: "blocker"
+    status: "open"
+
+  - id: "B1-fused-perts-stage3"
+    category: "performance"
+    op_or_pattern: "linear_projection per-timestep call fusion (DESIGN-fusion.md stage 3)"
+    # Closure 2026-04-28 (B2): silicon-validated PASS at 9.68 ms/iter
+    # avg vs per-group baseline 563.49 ms/iter — 58.2x speedup, far
+    # exceeding the DESIGN-fusion.md stage-3 estimate of ~141 ms
+    # (4x). The author's per-call setup-overhead estimate (~422 us)
+    # was conservative; actual stage-3 wall-time is approaching
+    # stage-4's predicted "few ms" floor. bf16-reference max-abs
+    # drift = 2.92e-2 (under the 5e-2 gate), no NaN/Inf, output
+    # max-abs 4.84 (correct clamp band). Measurements committed at
+    # results/basecalling/b-m6-fused-perts/measurements.json.
+    attempted: |
+      Stage-3 fused-perts artifact: bf16 weights (full 48-KiB slab
+      acquired once per dispatch), bf16 input/output, kernel walks
+      4 OC groups internally per timestep; 334 calls/dispatch instead
+      of 1336. Implementation lands as:
+        - linear_projection_fused.py (IRON, depth=1 weight ObjectFifo)
+        - linear_projection_fused.cc (per-call inner OC-group loop)
+        - runner_fused.cpp (bf16 wire format)
+        - DoradoFastLinearProjectionFusedPerts in __init__.py
+        - Makefile experiment=fused-perts target
+    failed_with: null
+    root_cause: |
+      Per-call setup overhead in the per-group artifact (~422 µs/call
+      x 1336 calls = 564 ms wall, vs ~120 ns of math per call). See
+      conv_stem_layers_2_3/gaps.yaml entry  for the encoder-wide
+      pattern; DESIGN-fusion.md is the kernel-local plan.
+    workaround: |
+      Implemented; pending silicon validation (B2). Build clean: the
+      IRON Python lowers without errors and the C++ kernel compiles
+      against AIE2P bf16 mac primitives. Dispatch registered under op
+      name dorado_fast_linear_projection_fused_perts (separate from
+      the existing dorado_fast_linear_projection so encoder.py can
+      pick whichever artifact is built). Expected wall time: ~141 ms
+      (4x speedup over per-group); silicon round-trip required to
+      confirm and to byte-equal-test the bf16 reference.
+    upstream_issue: null
+    blocks: []
+    severity: "performance"
+    status: "open"
+
+  - id: "B1-fused-dispatch-stage4"
+    category: "performance"
+    op_or_pattern: "linear_projection single-call-per-dispatch (DESIGN-fusion.md stage 4)"
+    attempted: |
+      Stage-4 fused-dispatch artifact: distinct kernel symbol
+      (dorado_fast_linear_projection_fused_dispatch), distinct
+      artifact directory, inner-loop micro-opt (aie::reduce_add for
+      the per-OC scalar reduction tail vs stage 3's manual scalar
+      sum), wire format identical to stage 3 (bf16 input + bf16
+      weight slab + bf16 output). Implementation lands as:
+        - linear_projection_fused_dispatch.py (IRON, depth=1 weight
+          ObjectFifo; same SCF-loop shape as stage 3 — see fallback
+          rationale below)
+        - linear_projection_fused_dispatch.cc (per-call inner OC-group
+          loop with aie::reduce_add tail)
+        - runner_fused.cpp reused (wire format identical to stage 3)
+        - DoradoFastLinearProjectionFusedDispatch in __init__.py
+        - Makefile experiment=fused-dispatch target
+        - tests/test_linear_projection_fused_dispatch_correctness.py
+    failed_with: |
+      The literal stage-4 spec ("kernel takes ObjectFifo handles +
+      count L and walks the fifos internally for all L timesteps,
+      one func.call per dispatch") is NOT expressible at the current
+      IRON-Python layer:
+
+        * aie.iron.Kernel only accepts arg types of (numpy ndarray /
+          numpy dtype / scalar); see python/iron/kernel.py BaseKernel
+          and ExternalFunction signatures. There is no
+          objectfifo-handle ABI exposed to peano-compiled C++ kernels.
+        * aie.objectfifo.acquire / release are MLIR-level ops emitted
+          by the AIEObjectFifoStatefulTransform pass from scf.for-
+          driven IRON Python. They are not exposed as C-callable
+          intrinsics in the AIE2P sysroot
+          (/home/matteius/xdna-bringup/ironenv/lib/python3.14/
+           site-packages/llvm-aie/include/aie2p-none-unknown-elf/).
+        * Acquiring the FULL L*HIDDEN input + L*OUT_DIM output as
+          single big ObjectFifo elements (so a single kernel call
+          could walk them in C++) is blocked by tile DM size: the
+          AIE2P CoreTile localMemory is 0x10000 = 64 KiB, weight
+          alone takes 48 KiB, full input is ~62.6 KiB and full
+          output is ~167 KiB — output alone overflows.
+
+      Per the prompt's done-criteria escape hatch, fall back to the
+      "Python-loop-with-runtime-SCF approach (which collapses stage
+      4 to stage 3's shape)". The MLIR shape is byte-equivalent to
+      stage 3 — one scf.for over L=334 with one func.call per
+      iteration, one acquire/release pair per timestep on
+      input/output, weight acquired once per dispatch.
+    root_cause: |
+      IRON Python's Kernel/ExternalFunction ABI is fundamentally
+      pointer-and-scalar typed; there is no objectfifo-handle type
+      in the supported arg_types list. The stage-4 spec assumes a
+      capability the Python frontend does not (yet) expose. A future
+      IRON extension that adds an "ObjectFifoHandle" arg type +
+      lowers C-callable acquire/release intrinsics would unblock the
+      literal stage-4 shape.
+    workaround: |
+      Implemented as documented fallback. What stage 4 still
+      delivers vs stage 3:
+
+        - Distinct entry symbol
+          (dorado_fast_linear_projection_fused_dispatch) and
+          artifact path, allowing the dispatch registry to A/B
+          between stage 3 and stage 4 cleanly.
+        - Inner-loop micro-opt: per-OC reduction tail uses
+          aie::reduce_add instead of a scalar-sum-on-loaded-vector.
+          On AIE2P this is a single cross-lane reduction tree; the
+          stage-3 manual scalar loop emits 16 sequential f32 adds
+          per OC * 256 OCs * 334 timesteps.
+
+      Realistic stage-4 ceiling: marginal improvement over stage 3's
+      9.68 ms/iter (silicon-validated 2026-04-28). Possibly
+      indistinguishable from stage 3 within run-to-run variance —
+      the DESIGN-fusion.md "few ms" prediction over-attributed
+      savings to the call-count collapse, but stage 3 already showed
+      that per-call setup overhead in-tile is much smaller than the
+      author's 422 us model. Silicon validation is a separate
+      follow-up that will reuse state/b2-silicon-validation.py as a
+      template (just instantiate the new op class).
+
+      Build-clean status: the IRON Python lowers without errors via
+      `make experiment=fused-dispatch NPU2=1 seq=334
+      build/aie_fused_dispatch_L334.mlir`. The C++ kernel compiles
+      to .o under the ironenv-bundled peano (per
+      B2-peano-libcxx-build-blocker, the ironenv peano is canonical;
+      the third_party/llvm-aie/build peano is still missing libcxx).
+    upstream_issue: null
+    blocks: []
+    severity: "performance"
+    status: "open"
+
+  - id: "B3b-encoder-integration-env-var-hook"
+    category: "integration"
+    op_or_pattern: "linear_projection variant selection for v0.2 encoder pipeline"
+    attempted: |
+      Landed env-var dispatch helper at the basecalling package level:
+        bionpu.kernels.basecalling.get_linear_projection_op()
+      Reads BIONPU_DORADO_LINEAR_PROJECTION_VARIANT in
+      {'per_group' (default), 'fused_perts'} and returns the registered
+      NpuOp from bionpu.dispatch.npu.NPU_OPS. Pattern matches the
+      existing crispr.pam_filter env-var hint
+      (BIONPU_PAM_FILTER_LAUNCH_CHUNKS).
+    failed_with: null
+    root_cause: |
+      No caller exists yet — the encoder pipeline driver
+      (benchmarks/basecalling/run_pod5.sh, src/bionpu/.../encoder.py)
+      is v0.2 scope per run_pod5.sh:12. B3b lands the integration hook
+      in advance so that when the encoder pipeline does land, the
+      stage-3 cutover is a one-env-var flip rather than a code change.
+    workaround: |
+      Default stays at 'per_group' (FP32-precise, silicon-validated
+      since b-m6) until v0.2 lands. Tests in
+      tests/test_basecalling_dispatch_helper.py guard the helper
+      contract (default, both variants resolvable, invalid value
+      raises with clear message, both ops remain registered).
+
+      Multi-dispatch silicon validation in
+      benchmarks/basecalling/bench_linear_projection_block.py confirms
+      the 58x speedup holds under encoder-realistic load (many chunks,
+      shared weight, single npu_silicon_lock acquire).
+
+      To flip the default once v0.2 encoder lands and the bf16-output
+      precision contract is validated end-to-end:
+        - LINEAR_PROJECTION_DEFAULT_VARIANT = "fused_perts" in
+          src/bionpu/kernels/basecalling/__init__.py
+        - update tests/test_basecalling_dispatch_helper.py
+          test_default_returns_per_group_op accordingly
+    upstream_issue: null
+    blocks:
+      - "v0.2-encoder-pipeline-driver"
+    severity: "integration"
+    status: "scaffolded"
+
+  - id: "B1-fused-perts-objectfifo-48k-chunk"
+    category: "expressibility"
+    op_or_pattern: "ObjectFifo single-shot 48-KiB element acquire (linear_projection fused weight slab)"
+    attempted: |
+      stage-3 IRON file declares the weight ObjectFifo with depth=1
+      and a 24576-bf16 element type (48 KiB). The expected lowering is
+      one shim DMA -> tile-DM transfer that completes before the
+      timestep loop starts.
+    failed_with: null
+    root_cause: |
+      DESIGN-fusion.md flags this as an open question: "Verify the
+      IRON ObjectFifo lowering produces a single shim DMA -> tile-DM
+      transfer (not a chunked one) for a 48 KiB element." Untested in
+      a build-clean-only environment; the MLIR-emit step shows the
+      ObjectFifo declaration but does not confirm the runtime DMA
+      shape. mlir-aie's matrix_multiplication/single_core uses a
+      similar one-shot weight pattern but at a smaller size.
+    workaround: |
+      None needed yet. If silicon shows the slab gets chunked
+      (multi-BD tile-DM transfer), candidate fallbacks: (a) split the
+      slab into 2x24-KiB halves with depth=2 weight fifo, (b) drop to
+      OC-group-stationary stage 3.5 (acquire one OC-group slab per
+      group, hold across timesteps inside the kernel — still 4 weight
+      acquires per dispatch but per-timestep weight DMA is gone).
+    upstream_issue: null
+    blocks: []
+    severity: "performance"
+    status: "open"
+
+  - id: "A-pyxrt-in-process-dispatch"
+    category: "host_dispatch"
+    op_or_pattern: "Replace subprocess host_runner with in-process pyxrt for both linear_projection variants"
+    attempted: |
+      Added BIONPU_LINEAR_PROJECTION_DISPATCH={subprocess,pyxrt} env
+      var (also accepted as DoradoFastLinearProjection{,FusedPerts}
+      __call__(_impl=...)) routing both ops through
+      bionpu.dispatch.npu.NpuBackend.run_xclbin (in-process pyxrt).
+      Subprocess path stays as default fallback for envs without
+      /opt/xilinx/xrt/python on PYTHONPATH.
+
+      Kernel arg layout reused from runner.cpp / runner_fused.cpp:
+        arg3=input, arg4=weight, arg5=output, arg6=trace.
+      Both runners use the same layout; only buffer dtype + size
+      differ (FP32 per_group, bf16 fused_perts).
+    failed_with: null
+    root_cause: |
+      Per b-m7 bench, fused_perts kernel time was ~9.7 ms but
+      end-to-end wall was ~112 ms — ~100 ms/dispatch was
+      subprocess fork + xrt::device::register_xclbin + hw_context
+      construction ceremony, repeated per chunk. pyxrt path caches
+      the device + xclbin + kernel handles in a process-level
+      NpuBackend singleton, so only the BO alloc + kernel launch
+      cost remains per dispatch.
+    workaround: |
+      Silicon-validated A_PYXRT_PASS at
+      results/basecalling/b-m8-pyxrt/measurements.json
+      (state/a-pyxrt-validation-20260428T020716Z.json):
+        per_group / subprocess wall   987.3 ms
+        per_group / pyxrt wall        882.1 ms   (1.12x; kernel-dominated)
+        fused_perts / subprocess wall 160.8 ms
+        fused_perts / pyxrt wall       26.8 ms   (6.0x)
+        fused_perts / pyxrt 16-iter steady-state wall/iter 10.9 us
+            (kernel avg 9.65 ms; ~1.25 ms host overhead per iter)
+        pyxrt vs subprocess output: byte-equal (max-abs-diff 0.0) for both.
+      The 16-iter steady-state number is the encoder-style realistic
+      win: a single pyxrt session amortises the xclbin load + BO
+      group-id lookup, so per-chunk wall collapses from 112 ms (b-m7)
+      to ~10.9 ms — closing the gap to silicon-bound throughput.
+    upstream_issue: null
+    blocks: []
+    severity: "performance"
+    status: "validated"
+
+  - id: "B-m12-long-shape-L1667"
+    category: "shape_coverage"
+    op_or_pattern: "Production-shape (long) artifacts for DoradoFastLinearProjection{,FusedPerts} paired with the LSTM L=1667 path"
+    attempted: |
+      Built the L1667 sibling artifacts via the existing Makefile:
+        make NPU2=1 experiment=production seq=1667 all
+        make NPU2=1 experiment=fused-perts seq=1667 all
+      Installed at
+        bionpu/dispatch/_npu_artifacts/dorado_fast_linear_projection_L1667/
+        bionpu/dispatch/_npu_artifacts/dorado_fast_linear_projection_fused_perts_L1667/
+      with leaves final.xclbin / insts.bin / host_runner. Both op
+      classes grew a ``seq_len`` constructor arg defaulting to L=334;
+      ``get_linear_projection_op(seq_len=...)`` forwards it. Encoder.py
+      now passes ``seq_len=cur.shape[0]`` (the LSTM timestep count) to
+      the helper, picking up either the short or long artifact based
+      on what the upstream blocks produced. The legacy short-shape
+      path is byte-identical; the long-shape path is purely additive.
+    failed_with: null
+    root_cause: |
+      Legacy artifacts shape-checked the input as (334, 1, 96) and
+      produced (334, 1, 256). The encoder's production_long path
+      feeds (1667, 1, 96) post-LSTM, so the linear projection fell
+      back to CPU. Building second xclbins with the IRON loop-trip-
+      count adjusted for 1667 timesteps restores the NPU path.
+    workaround: |
+      Silicon-validated B_M12_PASS at
+      results/basecalling/b-m12-long-shape-rollout/measurements.json:
+        per_group  / subprocess wall/iter ~3115 ms (kernel ~2812 ms)
+        per_group  / pyxrt wall/iter       ~2980 ms (kernel ~2812 ms)
+        fused_perts/ subprocess wall/iter   ~146 ms (kernel ~48.5 ms)
+        fused_perts/ pyxrt wall/iter         ~91 ms (kernel ~48.4 ms)
+        pyxrt vs subprocess output: byte-equal (max-abs-diff 0.0) for both.
+    upstream_issue: null
+    blocks: []
+    severity: "feature"
+    status: "validated"

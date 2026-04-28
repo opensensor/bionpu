@@ -92,6 +92,7 @@
 from __future__ import annotations
 
 import argparse
+import os as _os
 import sys
 
 import numpy as np
@@ -111,6 +112,86 @@ N_LAYERS = 5
 # Cascade chain placement: column 0, rows 2..6.
 COLUMN = 0
 STARTING_ROW = 2
+
+
+# Re-attack on G-T3.1-103 (Followup G silicon-falsified Fix C; remaining
+# suspects per b-m6d-cascade/measurements.json are weight ObjectFifo /
+# memtile pressure + static state buffers + heavy aie_api math). The
+# CRISPR pam_filter track demonstrated that AIE2P shim DMA stalls
+# deterministically when burst_length is left at the IRON default
+# (`burst_length=0` → firmware "highest available" = 1024 B) while the
+# actual per-BD payload is small. The IRON-Python `Runtime.fill /
+# Runtime.drain` does not expose a `burst_length` knob — it is
+# hardcoded inside `aie.iron.runtime.dmatask.DMATask.resolve`. This
+# module monkey-patches `DMATask.resolve` at lowering time to inject a
+# non-zero `burst_length` so the cascade build can be parameterised
+# across the documented AM020 burst sizes {64, 256, 512, 1024} B.
+#
+# Audit (per topology_realized in b-m6d-cascade/measurements.json):
+# - input_in (shim → core 0,5):              memref<96 × bf16>      = 192 B   < 256 B cliff
+# - weight_in_all (shim → memtile):          memref<26880 × bf16>   = 53760 B
+# - output_out (core 1,2 → shim):            memref<96 × bf16>      = 192 B   < 256 B cliff
+#
+# The two 192-byte BDs sit BELOW the 256 B sub-cliff that
+# dispatch_overhead_bisector previously isolated as a deterministic
+# stall floor on AIE2P shim DMA. burst_length=0 is the firmware default
+# the cliff was characterised against. This is the first knob in the
+# CRISPR-derived attack surface that has not been swung at the cascade
+# wedge.
+#
+# Activate by setting `BIONPU_LSTM_CASCADE_SHIM_BURST_LENGTH` in the
+# environment to one of {64, 128, 256, 512, 1024} before invoking
+# `python3 lstm_cell_bf16_acc_cascade.py -d npu2`. Default behaviour
+# (no env var) is unchanged.
+def _maybe_install_burst_length_override() -> int:
+    """Install a DMATask.resolve override per BIONPU_LSTM_CASCADE_SHIM_BURST_LENGTH.
+
+    Returns the burst length in effect (0 = IRON default).
+    """
+    val = _os.environ.get("BIONPU_LSTM_CASCADE_SHIM_BURST_LENGTH")
+    if val is None:
+        return 0
+    try:
+        bl = int(val)
+    except ValueError as exc:
+        raise ValueError(
+            f"BIONPU_LSTM_CASCADE_SHIM_BURST_LENGTH={val!r} is not an integer"
+        ) from exc
+    # AM020 supported burst lengths on AIE2P writebd: {64, 128, 256, 512}.
+    # 0 = IRON default (firmware "highest available"). 1024 was previously
+    # listed but the AIECC lowering rejects it with "Requested burst length
+    # is not supported by the target" — confirmed by 2026-04-28 sweep
+    # (b-m11-cascade-burst-length-falsified/measurements.json).
+    if bl not in (0, 64, 128, 256, 512):
+        raise ValueError(
+            f"BIONPU_LSTM_CASCADE_SHIM_BURST_LENGTH={bl} not in "
+            "{0, 64, 128, 256, 512}"
+        )
+    if bl == 0:
+        return 0
+
+    from aie.dialects._aiex_ops_gen import dma_start_task  # type: ignore
+    from aie.dialects.aiex import shim_dma_single_bd_task
+    from aie.iron.runtime import dmatask as _dmatask_mod  # type: ignore
+
+    def _resolve_with_burst_length(self, loc=None, ip=None):
+        self._task = shim_dma_single_bd_task(
+            self._object_fifo.op,
+            self._rt_data.op,
+            tap=self._tap,
+            issue_token=self._wait,
+            burst_length=bl,
+        )
+        dma_start_task(self._task)
+
+    _dmatask_mod.DMATask.resolve = _resolve_with_burst_length
+    print(
+        f"[lstm_cell_bf16_acc_cascade.py] "
+        f"BIONPU_LSTM_CASCADE_SHIM_BURST_LENGTH={bl}: "
+        f"DMATask.resolve patched to inject burst_length={bl} on all shim BDs",
+        file=sys.stderr,
+    )
+    return bl
 
 def my_dorado_fast_lstm_stack_bf16_acc_cascade(
     dev,
@@ -2269,6 +2350,11 @@ def _select_device(name: str):
 if __name__ == "__main__":
     opts = _parse_args(sys.argv[1:])
     dev = _select_device(opts.device)
+    # Cascade re-attack: optionally inject burst_length on shim BDs via
+    # the BIONPU_LSTM_CASCADE_SHIM_BURST_LENGTH env var. No-op when
+    # unset. Patch must land BEFORE Program.resolve_program(), so it
+    # goes here at the top of __main__ before any my_dorado_* call.
+    _maybe_install_burst_length_override()
     if opts.experiment == "hidden-state-only":
         module = my_dorado_hidden_state_cascade_only(dev, L=opts.seq)
     elif opts.experiment == "hidden-state-math":

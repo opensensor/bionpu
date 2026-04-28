@@ -5,19 +5,36 @@ the DNABERT-Epi AIE2P scorer port. v0 is a single-tile correctness
 path; memtile streaming + multi-tile cascade is the v0.5 follow-up
 (see `docs/aie2p-scorer-port-design.md` § "Concrete first task").
 
-## Op contract
+## Op contract — bionpu Python API (`bert_int8_matmul_head`)
 
 Input | shape | dtype | layout
 ---|---|---|---
-`x`   | M × K | int8 | row-major (token-major)
-`w`   | K × N | int8 | output-channel-major (W is provided as N × K,
-      |       |      | i.e. each row = one output channel's weights)
-`scales_in`   | scalar | float32 | per-tensor symmetric input scale
-`scales_w`    | N      | float32 | per-output-channel symmetric weight scale
-`scales_out`  | scalar | float32 | per-tensor symmetric output scale
+`x`               | M × K | int8 | row-major (token-major)
+`w`               | N × K | int8 | output-channel-major (each row = one output channel's weights)
+`scales_combined` | N + 1 | float32 | first N entries = `(scales_in * scales_w[n]) / scales_out`; trailing entry reserved for bias (unused in v0)
 Output | shape | dtype | layout
 ---|---|---|---
-`y`   | M × N | int8 | row-major
+`y` | M × N | int8 | row-major
+
+## Op contract — AIE2P silicon wire format (compute-tile DMA)
+
+The CoreTile only has 2 input + 2 output DMA channels, so the v0
+topology cannot afford 3 separate input ObjectFifos. The host runner
+packs `w` and `scales_combined` into a single byte buffer:
+
+```
+ws_buf = w.tobytes() + scales_combined.tobytes()  # padded to multiple of 4
+```
+
+The kernel slices it back via byte offsets:
+
+```c
+const int8_t *w      = ws_buf;
+const float  *scales = (const float *)(ws_buf + N * K);
+```
+
+This is an implementation detail of the silicon dispatch path. The
+bionpu Python API stays unchanged.
 
 Computes:
 
@@ -95,16 +112,36 @@ allows.
 
 ## Status
 
-🚧 **Skeleton scaffold (v0.4-alpha).** The IRON topology, kernel C++,
-host runner, and Makefile are committed but the kernel has NOT yet
-been built or run on silicon. The next concrete step is:
+✅ **Working on AIE2P silicon (v0.4-alpha, first kernel).** Built,
+deployed, and verified byte-equivalent vs the numpy host-emulation
+reference on the ProArt host (2026-04-28):
 
-1. Source the bring-up env on the ProArt host.
-2. `make NPU2=1 all` from this directory.
-3. Run the host runner with a synthetic 47×768·int8 input + 2×768·int8
-   weight + scales; verify output matches a CPU reference within
-   1 ULP (INT8 saturation makes equivalence stricter than INT8 GEMM
-   on GPU/CPU, where rounding modes can drift).
+```
+$ ./bert_int8_matmul --xclbin build/head/final.xclbin \
+                     --insts  build/head/insts.bin \
+                     --x x.bin --ws ws.bin --out y_npu.bin
+$ python3 -c "..."
+y_ref bytes: 94, y_npu bytes: 96  (96 = 94 padded to multiple of 4)
+first 8 ref: [ 3  1  0 -1  0  1  0  2]
+first 8 npu: [ 3  1  0 -1  0  1  0  2]
+max |ref - npu|: 0
+BYTE-EQUAL: True
+```
+
+This validates: the IRON Python topology lowers, the Peano AIE2P
+clang++ compiles the scalar kernel, the NPU instruction stream runs
+on real silicon, and the per-channel-symmetric INT8 arithmetic
+matches the host-emulation reference exactly.
+
+## Build artifacts (v0.4-alpha, head specialization)
+
+| file | bytes | role |
+|---|---|---|
+| `build/head/aie.mlir`  |  2,938 | IRON-lowered MLIR-AIE topology |
+| `build/head/bert_int8_matmul.o` | 1,752 | Peano AIE2P kernel object |
+| `build/head/final.xclbin` | 10,314 | NPU-loadable kernel binary |
+| `build/head/insts.bin` | 420 | NPU instruction stream |
+| `bert_int8_matmul` | 34,160 | XRT host runner |
 
 ## Next sub-tasks (per design doc)
 

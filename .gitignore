@@ -41,3 +41,7 @@ data_cache/
 *~
 _npu_artifacts/  # pre-built kernel cache; rebuilt via 'make' in each kernel dir
 src/bionpu/dispatch/_npu_artifacts/
+
+# bert_int8_matmul smoke fixtures + host runner (regenerable)
+src/bionpu/kernels/scoring/bert_int8_matmul/bert_int8_matmul
+src/bionpu/kernels/scoring/bert_int8_matmul/*.bin

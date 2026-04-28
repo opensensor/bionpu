@@ -13,32 +13,23 @@
 # Shapes (per CLI flags, default = head specialization):
 #   x:           M × K  int8           (token-major)
 #   w:           N × K  int8           (output-channel-major)
-#   scales:      K + 1  fp32           (combined per-output FP32 scales)
+#   scales:      N + 1  fp32           (combined per-output FP32 scales)
 #   y:           M × N  int8           (token-major)
 #
-# Topology:
-#   shim ──x ──→ compute_tile
-#   shim ──w ──→ compute_tile
-#   shim ──s ──→ compute_tile
-#   compute_tile ──y ──→ shim
-#
-# The four ObjectFifos all live on the same column. v0.5 will split
-# w (and possibly y) across N-axis to multiple tiles when shape grows.
+# Topology (single column, single compute tile):
+#   shim ──x── compute_tile ──y── shim
+#   shim ──w── compute_tile
+#   shim ──s── compute_tile
 
 from __future__ import annotations
 
 import argparse
 import sys
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU1Col1, NPU2Col1
-from aie.dialects.aie import device
-from aie.helpers.dialects.ext.scf import _for as range_
+import numpy as np
 
-# Element types — IRON's MemRef-style declarations.
-from aie.dialects.aiex import npu_dma_memcpy_nd  # noqa: F401  (helps lowering import)
-from aie.helpers.taplib import TensorAccessPattern  # noqa: F401  (memtile path)
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron.device import NPU1Col1, NPU2Col1
 
 
 def emit_mlir(M: int, K: int, N: int, target: str = "npu2") -> str:
@@ -52,75 +43,86 @@ def emit_mlir(M: int, K: int, N: int, target: str = "npu2") -> str:
     elif target == "npu":
         dev = NPU1Col1()
     else:
-        raise ValueError(f"unknown target: {target!r}")
+        raise ValueError(f"unknown device target: {target!r}")
 
-    # ObjectFifo element types: int8 buffers + one float32 scales buffer.
-    # IRON's array typing uses (shape, elemTy) tuples on the Iron API.
-    # NB: the head shape (M=47, K=768, N=2) gives:
-    #   x  =  47 × 768 = 36 096  bytes (one shim DMA fill)
-    #   w  =   2 × 768 =  1 536  bytes
-    #   s  =   2 + 1   = 12     bytes (combined per-output + bias)
-    #   y  =  47 × 2   = 94     bytes (round up for DMA alignment)
-    # Tile-resident: every input fits inside the compute tile DM at
-    # once. v0 keeps the kernel single-pass (no chunking inside the
-    # tile); v0.5 introduces an outer K-chunking loop for the larger
-    # qkvo / ffn shapes.
+    # ObjectFifo element types — flat byte arrays per IRON convention.
+    #
+    # AIE2P CoreTiles only have 2 input + 2 output DMA channels, so
+    # we cannot afford 3 separate input ObjectFifos (x, w, s). The
+    # smaller two (w + scales) are concatenated into a single byte
+    # buffer; the kernel C++ slices it back into typed pointers via
+    # known byte offsets. Layout (head shape):
+    #   ws[0 .. N*K - 1]                  = int8 weights (N rows × K cols)
+    #   ws[N*K .. N*K + (N+1)*4 - 1]      = float32 fused scales (N+1 entries)
+    # AIE2P shim DMA requires transfer length to be a multiple of 4
+    # bytes (`aie.dma_bd` op constraint). Pad each fifo size up to the
+    # next multiple of 4 so the lowering succeeds. The kernel C++
+    # writes only the useful prefix; the host runner reads the same
+    # useful prefix and ignores any trailing pad bytes.
+    def _round4(n: int) -> int:
+        return ((n + 3) // 4) * 4
 
-    of_x = ObjectFifo("x_in", (M, K), depth=2, elemTy="i8")
-    of_w = ObjectFifo("w_in", (N, K), depth=2, elemTy="i8")
-    of_s = ObjectFifo("s_in", (N + 1,), depth=2, elemTy="f32")
-    of_y = ObjectFifo("y_out", (M, N), depth=2, elemTy="i8")
+    x_size = _round4(M * K)
+    ws_bytes = _round4(N * K + (N + 1) * 4)   # int8 weights + float32 scales
+    y_size = _round4(M * N)
+    x_ty  = np.ndarray[(x_size,), np.dtype[np.int8]]
+    ws_ty = np.ndarray[(ws_bytes,), np.dtype[np.int8]]
+    y_ty  = np.ndarray[(y_size,), np.dtype[np.int8]]
 
-    # Compute kernel — scalar inner loop, fused-scale requantize, int8
-    # saturate. The C++ symbol is `bert_int8_matmul_head` for the head
-    # specialization; rebuild with `make M=... K=... N=...` to produce
-    # the qkvo / ffn variants. The kernel signature mirrors the
-    # ObjectFifo element layouts above.
+    # depth=1 in v0 — there's only one chunk per launch and the
+    # 36 KB x buffer is large enough that depth=2 (72 KB) blows the
+    # 64 KB tile DM cap. v0.5 will introduce K-chunking so each
+    # ObjectFifo holds a small slice and depth=2 fits comfortably.
+    of_x  = ObjectFifo(x_ty,  name="x_in",  depth=1)
+    of_ws = ObjectFifo(ws_ty, name="ws_in", depth=1)
+    of_y  = ObjectFifo(y_ty,  name="y_out", depth=1)
+
+    # Compute kernel — scalar inner loop, fused-scale requantize, INT8
+    # saturate. Symbol is `bert_int8_matmul_<N>` so the same .py / .cc
+    # compile to multiple specializations via the Makefile.
+    matmul_sym = f"bert_int8_matmul_{N}"
     matmul = Kernel(
-        f"bert_int8_matmul_{N}",          # symbol resolved per-shape
+        matmul_sym,
         "bert_int8_matmul.o",
-        [(M, K), (N, K), (N + 1,), (M, N)],
+        [x_ty, ws_ty, y_ty],
     )
 
-    def core_body(of_x, of_w, of_s, of_y):
-        # One launch per (input chunk × weight chunk). v0 = one chunk
-        # of each; v0.5 will iterate K-chunks here.
-        x_buf = of_x.acquire(1)
-        w_buf = of_w.acquire(1)
-        s_buf = of_s.acquire(1)
-        y_buf = of_y.acquire(1)
-        matmul(x_buf, w_buf, s_buf, y_buf)
+    # v0 = one chunk in / one chunk out per launch. v0.5 will
+    # iterate K-chunks here for the larger qkvo / ffn shapes. The
+    # Kernel must be passed *into* the body as an arg (not closed
+    # over) so the IRON resolver can bind the symbol at lower-time.
+    def core_body(of_x, of_ws, of_y, matmul_kernel):
+        x_buf  = of_x.acquire(1)
+        ws_buf = of_ws.acquire(1)
+        y_buf  = of_y.acquire(1)
+        matmul_kernel(x_buf, ws_buf, y_buf)
         of_x.release(1)
-        of_w.release(1)
-        of_s.release(1)
+        of_ws.release(1)
         of_y.release(1)
 
-    worker = Worker(core_body, [of_x.cons(), of_w.cons(), of_s.cons(), of_y.prod()])
+    worker = Worker(
+        core_body,
+        fn_args=[of_x.cons(), of_ws.cons(), of_y.prod(), matmul],
+    )
 
     rt = Runtime()
-    with rt.sequence(of_x.prod(), of_w.prod(), of_s.prod(), of_y.cons()) as (x, w, s, y):
-        # The host runner (runner.cpp) writes x/w/s into shim BD slots;
-        # the runtime sequence below dispatches a single launch per
-        # input chunk.
+    with rt.sequence(x_ty, ws_ty, y_ty) as (x, ws, y):
         rt.start(worker)
         rt.fill(of_x.prod(), x)
-        rt.fill(of_w.prod(), w)
-        rt.fill(of_s.prod(), s)
+        rt.fill(of_ws.prod(), ws)
         rt.drain(of_y.cons(), y, wait=True)
 
-    program = Program(dev, rt)
-    placer = SequentialPlacer()
-    return program.resolve_program(placer)
+    return Program(dev, rt).resolve_program()
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-d", "--target", choices=["npu", "npu2"], default="npu2")
-    p.add_argument("--M", type=int, default=47, help="batch × seq length")
-    p.add_argument("--K", type=int, default=768, help="reduction axis (BERT hidden)")
-    p.add_argument("--N", type=int, default=2, help="output channels")
+    p.add_argument("--M", type=int, default=47)
+    p.add_argument("--K", type=int, default=768)
+    p.add_argument("--N", type=int, default=2)
     args = p.parse_args()
-    sys.stdout.write(emit_mlir(M=args.M, K=args.K, N=args.N, target=args.target))
+    sys.stdout.write(str(emit_mlir(M=args.M, K=args.K, N=args.N, target=args.target)))
 
 
 if __name__ == "__main__":

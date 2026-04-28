@@ -44,12 +44,21 @@ inline int8_t saturate_int8(int32_t v) {
     return static_cast<int8_t>(v);
 }
 
-// f32 round-to-nearest, ties-to-even. AIE2P FPU rounds the same way
-// by default; we leave the rounding mode at FE_TONEAREST and use
-// the standard library helper.
+// f32 round-half-away-from-zero, manual.
+//
+// The "obvious" `__builtin_nearbyintf` crashes the Peano AIE2P GISel
+// Legalizer in this version of llvm-aie (memory: similar issues with
+// scalar-FP32 round-to-int ops surface in BM-spill paths). Hand-rolled
+// add-half-then-truncate sidesteps that legalization rule entirely
+// and lowers cleanly.
+//
+// Tie-handling difference vs nearbyintf (round-half-to-even) is
+// strictly bounded — at most 1 LSB of the i8 output, well inside the
+// 1 ULP byte-equivalence tolerance the verify harness allows.
 inline int32_t round_nearest_int32(float v) {
-    // AIE2P clang lowers nearbyint to a single FPU op.
-    return static_cast<int32_t>(__builtin_nearbyintf(v));
+    return v >= 0.0f
+        ? static_cast<int32_t>(v + 0.5f)
+        : static_cast<int32_t>(v - 0.5f);
 }
 
 }  // namespace
@@ -62,26 +71,27 @@ extern "C" {
 // through unchanged.
 //
 // Inputs:
-//   x:        M × K  int8 row-major
-//   w:        N × K  int8 row-major (each row = one output channel)
-//   scales:   N + 1 float32   — first N entries are `combined[n]`,
-//             trailing entry is reserved for an optional bias term.
+//   x:        M × K   int8 row-major
+//   ws_buf:   N*K + (N+1)*4 bytes — int8 weights followed by float32 scales.
+//             The 3-input-fifo design (x, w, scales separately) doesn't
+//             fit AIE2P's 2-in / 2-out CoreTile DMA budget; w + scales
+//             concatenate at the host into a single byte buffer.
+//             Layout:
+//               ws_buf[0 .. N*K - 1]                   = int8 weights (N×K)
+//               ws_buf[N*K .. N*K + (N+1)*4 - 1]       = float32 scales (N+1)
 // Output:
 //   y:        M × N int8 row-major
-//
-// Note on memory ordering: x/w/y are passed as flat arrays via the
-// IRON ObjectFifo lowering. The IRON Python topology elects to lay
-// them out row-major; this matches how the host runner writes them
-// from disk.
 void bert_int8_matmul_2(
-    const int8_t  * __restrict__ x,
-    const int8_t  * __restrict__ w,
-    const float   * __restrict__ scales,
-          int8_t  * __restrict__ y
+    const int8_t * __restrict__ x,
+    const int8_t * __restrict__ ws_buf,
+          int8_t * __restrict__ y
 ) {
     constexpr int M = BIONPU_BERT_M;
     constexpr int K = BIONPU_BERT_K;
     constexpr int N = BIONPU_BERT_N;
+
+    const int8_t *w      = ws_buf;
+    const float  *scales = reinterpret_cast<const float *>(ws_buf + N * K);
 
     // For each output cell: i32 accumulator over the K reduction.
     // Inner loop is scalar; v0.5 swaps in 64-lane ::aie::vector.

@@ -1,0 +1,57 @@
+{
+  "schema_version": "0.1",
+  "doc": "20-gene set for PRD-guide-design v0.2 §4.3 hard-gate validation against CRISPOR. Coordinates are NCBI RefSeq GRCh38 (1-based inclusive on the reference, padded to whole-gene window matching the BRCA1 entry already in _RESOLVE_GENE_TO_LOCUS). Stratification rationale below.",
+  "genome_build": "GRCh38",
+  "genome_build_patch": "GRCh38.p14 (NCBI Annotation Release 110 / RefSeq)",
+  "fasta_in_repo": "data_cache/genomes/grch38/hg38.fa",
+  "crispor_pin_commit": "ed47b7e856010ad0f9f1660872563ef9f736e76c",
+  "crispor_cli_invocation": "python3 crispor.py --pam=NGG --maxOcc=60000 --mm=4 --guideLen=20 hg38 input.fa guides.tsv -o offtargets.tsv",
+  "stratification_rationale": {
+    "tier_a_canonical_validation": {
+      "doc": "High-citation canonical CRISPR validation loci. These are the genes any new guide-design tool is expected to reproduce CRISPOR top-N agreement on; they appear in Doench 2014 / 2016 / Hsu 2013 / Listgarten 2018 figures.",
+      "members": ["EMX1", "FANCF", "RNF2", "VEGFA", "HBB", "BRCA1", "BRCA2", "TP53", "ATM", "MYC"]
+    },
+    "tier_b_listgarten_2018_guide_seq_intersection": {
+      "doc": "The 4 genes flagged by state/spike/composite_scoring/phase0_audit.json as the Doench-2016 ∩ Listgarten-2018-GUIDE-seq paired-row intersection. These are the only entries with both on-target activity AND experimental off-target (GUIDE-seq) measurements available; bonus value for off-target gate. Per Phase 0 audit `doench_2016_x_listgarten_2018_guide_seq` = 4 distinct sgRNAs, which map back to a small list of host genes — we pin VEGFA/EMX1/FANCF/RNF2 (the canonical Listgarten 2018 4-guide validation set; intersects tier_a).",
+      "members": ["VEGFA", "EMX1", "FANCF", "RNF2"],
+      "note": "Set-overlap with tier_a is intentional and noted in the per-gene `tiers` array below."
+    },
+    "tier_c_screen_essential_or_disease_genes": {
+      "doc": "Brunello-screen / disease-relevant loci representative of typical bench-biologist queries. Spread across chromosomes to surface any per-chromosome resolver bug.",
+      "members": ["CCR5", "CD33", "CXCR4", "KRAS", "TET2", "RUNX1", "DNMT1", "HPRT1"]
+    },
+    "tier_d_safe_harbor_loci": {
+      "doc": "Safe-harbor / synthetic-biology loci.",
+      "members": ["AAVS1", "CFTR"]
+    }
+  },
+  "expected_total_genes": 20,
+  "doench_x_listgarten_paired_count_per_phase0_audit": 4,
+  "genes": [
+    {"symbol": "BRCA1",  "chrom": "chr17", "start_1b": 43044295, "end_1b": 43125483, "tiers": ["tier_a"], "note": "DNA-damage repair; canonical exon-2 guides in Doench 2016. Pre-existing entry; unchanged."},
+    {"symbol": "BRCA2",  "chrom": "chr13", "start_1b": 32315086, "end_1b": 32400266, "tiers": ["tier_a"], "note": "DNA-damage repair sister gene to BRCA1."},
+    {"symbol": "EMX1",   "chrom": "chr2",  "start_1b": 72950915, "end_1b": 72952010, "tiers": ["tier_a", "tier_b"], "note": "Empty Spiracles Homeobox 1; the canonical 'EMX1 site' is a single-locus gene (~1 kbp). Listgarten 2018 paired."},
+    {"symbol": "FANCF",  "chrom": "chr11", "start_1b": 22622352, "end_1b": 22647105, "tiers": ["tier_a", "tier_b"], "note": "Fanconi Anemia complementation group F; classic Doench RS1/RS2 training-set locus. Listgarten 2018 paired."},
+    {"symbol": "RNF2",   "chrom": "chr1",  "start_1b": 185179770, "end_1b": 185279091, "tiers": ["tier_a", "tier_b"], "note": "Ring Finger Protein 2; Doench/Listgarten paired locus."},
+    {"symbol": "VEGFA",  "chrom": "chr6",  "start_1b": 43770209, "end_1b": 43795797, "tiers": ["tier_a", "tier_b"], "note": "VEGFA site 1/2/3 are the canonical Tsai 2015 GUIDE-seq guides; Listgarten 2018 paired."},
+    {"symbol": "HBB",    "chrom": "chr11", "start_1b": 5225464, "end_1b": 5229395, "tiers": ["tier_a"], "note": "Hemoglobin Beta; sickle-cell editing target (CIRCLE-seq / GUIDE-seq class)."},
+    {"symbol": "TP53",   "chrom": "chr17", "start_1b": 7668421, "end_1b": 7687490, "tiers": ["tier_a"], "note": "Tumor suppressor; Brunello-screened heavily."},
+    {"symbol": "ATM",    "chrom": "chr11", "start_1b": 108222484, "end_1b": 108369102, "tiers": ["tier_a"], "note": "Ataxia-telangiectasia mutated; large gene, exercises locus-size scaling."},
+    {"symbol": "MYC",    "chrom": "chr8",  "start_1b": 127736231, "end_1b": 127741434, "tiers": ["tier_a"], "note": "Compact oncogene; Brunello-screened."},
+    {"symbol": "CCR5",   "chrom": "chr3",  "start_1b": 46370154, "end_1b": 46376206, "tiers": ["tier_c"], "note": "HIV co-receptor; classic safe-harbor / clinical editing target."},
+    {"symbol": "CD33",   "chrom": "chr19", "start_1b": 51225956, "end_1b": 51235170, "tiers": ["tier_c"], "note": "Doench 2016 STable 18 CD33_OffTargetdata source — derived the Hsu/Doench mismatch matrix used in CFD."},
+    {"symbol": "CXCR4",  "chrom": "chr2",  "start_1b": 136114349, "end_1b": 136118149, "tiers": ["tier_c"], "note": "GPCR; Tsai 2015 / Listgarten 2018 referenced."},
+    {"symbol": "KRAS",   "chrom": "chr12", "start_1b": 25205246, "end_1b": 25250929, "tiers": ["tier_c"], "note": "Compact oncogene."},
+    {"symbol": "TET2",   "chrom": "chr4",  "start_1b": 105146876, "end_1b": 105279816, "tiers": ["tier_c"], "note": "DNA-demethylase; large gene."},
+    {"symbol": "RUNX1",  "chrom": "chr21", "start_1b": 34787800, "end_1b": 36054533, "tiers": ["tier_c"], "note": "Hematopoiesis transcription factor; large locus."},
+    {"symbol": "DNMT1",  "chrom": "chr19", "start_1b": 10133345, "end_1b": 10194977, "tiers": ["tier_c"], "note": "Maintenance DNA methyltransferase."},
+    {"symbol": "HPRT1",  "chrom": "chrX",  "start_1b": 134460164, "end_1b": 134500668, "tiers": ["tier_c"], "note": "Doench 2016 STable 14 source screen locus; X-chromosome smoke."},
+    {"symbol": "AAVS1",  "chrom": "chr19", "start_1b": 55115750, "end_1b": 55117600, "tiers": ["tier_d"], "note": "PPP1R12C intron / safe-harbor locus widely used for transgene knock-in."},
+    {"symbol": "CFTR",   "chrom": "chr7",  "start_1b": 117480025, "end_1b": 117668665, "tiers": ["tier_d"], "note": "Cystic-fibrosis target; large gene with high-citation editing literature."}
+  ],
+  "limitations": [
+    "Coordinates pinned from NCBI RefSeq GRCh38.p14 / Annotation Release 110 entries via public NCBI Gene records; not programmatically resolved at fixture-author time. CRISPOR's default RefSeq pin is 109 — boundary cases on a small number of genes may differ. Document any boundary mismatches in DELTAS.md.",
+    "AAVS1 is not a HGNC gene symbol; it's a locus name (PPP1R12C intron 1). Keeping the 'AAVS1' alias because CRISPOR recognises it via its bioGuides table and bench biologists reach for it by name.",
+    "CRISPOR resolves gene symbols via its own internal annotation; bionpu Tier 1 resolver hardcodes coords. The two paths can disagree on which transcript variant is the primary; this fixture uses NCBI primary-RefSeq spans."
+  ]
+}

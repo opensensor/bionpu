@@ -97,6 +97,7 @@ __all__ = [
     "EMIT_SLOT_BYTES",
     "EMIT_SLOT_RECORDS",
     "GUIDES_PER_TILE",
+    "KERNEL_HARDCODED_MAX_MISMATCHES",
     "N_CHUNKS",
     "N_GUIDES",
     "N_MATCH_TILES",
@@ -104,6 +105,7 @@ __all__ = [
     "NpuArtifactsMissingError",
     "PAM_BYTES",
     "PAM_LEN",
+    "infer_slot_bytes_from_blob",
     "SPACER_BYTES",
     "SPACER_LEN",
     "SparseHit",
@@ -132,6 +134,17 @@ GUIDES_PER_TILE = N_GUIDES // N_MATCH_TILES  # 64
 
 # Sparse-emit record layout (8 bytes — see tile_a_filter.cc / DESIGN.md §4).
 EMIT_RECORD_BYTES = 8
+
+# Hardcoded on-tile mismatch threshold compiled into the vendored xclbin's
+# Tile-Z runtime sequence (``pam_filter.py`` line 486 — ``emit_kernel(...
+# 4, # max_mismatches (host can override post-hoc)``). The IRON runtime
+# sequence does not currently accept ``max_mismatches`` as a runtime
+# argument, so the silicon path always emits records with mismatch count
+# <= 4. The host applies the user-supplied threshold via post-filter for
+# values <= 4, and falls back to host emulation when the user requests a
+# threshold > 4 (the kernel would silently drop records with mismatch in
+# the (4, max_mismatches] range).
+KERNEL_HARDCODED_MAX_MISMATCHES: int = 4
 
 # Per-chunk geometry (mirrors ).
 WINDOWS_PER_CHUNK = 64
@@ -352,12 +365,40 @@ def decode_sparse_buffer(blob: bytes) -> list[SparseHit]:
         out.append(SparseHit(window_idx=wnd, guide_idx=g, mismatches=mm))
     return out
 
+def infer_slot_bytes_from_blob(blob_len: int, n_slots: int = N_CHUNKS) -> int:
+    """Infer per-slot byte size from the on-disk blob length.
+
+    Different vendored xclbins emit different slot capacities (the
+    pre-2026-04-26 build emits 256-record / 2048-byte slots; the
+    post-2026-04-26 build emits 1024-record / 8192-byte slots — see the
+    `EMIT_SLOT_RECORDS` constant in `tile_a_filter.cc`). The blob is
+    laid out as ``n_slots`` back-to-back fixed-size slots, so dividing
+    the on-disk length by ``n_slots`` recovers the actual slot size.
+
+    Returns:
+        Bytes per slot. Used by :func:`decode_per_slot_sparse_buffer`
+        when called without an explicit ``slot_bytes`` to auto-tune to
+        the vendored artifact.
+
+    Raises:
+        ValueError: blob length is not a multiple of ``n_slots`` (would
+        indicate a truncated or padded blob).
+    """
+    if blob_len % n_slots != 0:
+        raise ValueError(
+            f"blob length {blob_len} is not a multiple of n_slots={n_slots}; "
+            "cannot infer slot_bytes — check that the host runner wrote a "
+            "complete buffer"
+        )
+    return blob_len // n_slots
+
+
 def decode_per_slot_sparse_buffer(
     blob: bytes,
     *,
     n_slots: int = N_CHUNKS,
-    slot_bytes: int = EMIT_SLOT_BYTES,
-    slot_records: int = EMIT_SLOT_RECORDS,
+    slot_bytes: int | None = None,
+    slot_records: int | None = None,
     windows_per_slot: int = WINDOWS_PER_CHUNK,
 ) -> list[SparseHit]:
     """Decode the per-slot sparse-emit layout the AIE2P kernel produces.
@@ -369,10 +410,10 @@ def decode_per_slot_sparse_buffer(
     back-to-back into the host's sparse-out buffer, so the on-disk
     layout is::
 
-        slot 0  : bytes        0  .. 2047  (count_0 + records_0 + pad)
-        slot 1  : bytes     2048  .. 4095  (count_1 + records_1 + pad)
+        slot 0  : bytes              0  .. slot_bytes-1   (count_0 + records_0 + pad)
+        slot 1  : bytes      slot_bytes  .. 2*slot_bytes-1
         ...
-        slot 63 : bytes  129024  .. 131071 (count_63 + records_63 + pad)
+        slot N-1: bytes (N-1)*slot_bytes .. N*slot_bytes-1
 
     Each slot is itself length-prefixed (4-byte little-endian count
     followed by ``count * EMIT_RECORD_BYTES`` 8-byte records) with
@@ -394,18 +435,20 @@ def decode_per_slot_sparse_buffer(
     ``_host_emulate_match_and_emit``.
 
     Args:
-        blob: the host-side sparse-out buffer (``4 +
-            N_WINDOWS*N_GUIDES*EMIT_RECORD_BYTES`` bytes for the v1
-            kernel; this decoder reads only the first
-            ``n_slots * slot_bytes`` bytes).
+        blob: the host-side sparse-out buffer.
         n_slots: number of slots in the blob (default
             ``N_CHUNKS = 64``).
-        slot_bytes: bytes per slot (default
-            ``EMIT_SLOT_BYTES = 2048``).
-        slot_records: cap on records per slot (default
-            ``EMIT_SLOT_RECORDS = 256``); slots whose count exceeds
-            this are truncated to the cap with a silent drop (matches
-            the on-tile ``goto done`` short-circuit in
+        slot_bytes: bytes per slot. When ``None`` (the default), the
+            value is inferred from ``len(blob) // n_slots`` so the
+            decoder works with both the pre-2026-04-26 vendored
+            artifacts (slot_bytes=2048, 256 records/slot) and the
+            post-2026-04-26 rebuilds (slot_bytes=8192, 1024
+            records/slot). Pass an explicit value to override.
+        slot_records: cap on records per slot. When ``None``, derived
+            from ``slot_bytes`` as ``(slot_bytes - 4) //
+            EMIT_RECORD_BYTES``. Slots whose count exceeds this are
+            truncated to the cap with a silent drop (matches the
+            on-tile ``goto done`` short-circuit in
             ``tile_a_filter.cc``).
         windows_per_slot: ``WINDOWS_PER_CHUNK`` for the kernel that
             produced the blob (default ``WINDOWS_PER_CHUNK = 64``).
@@ -416,6 +459,10 @@ def decode_per_slot_sparse_buffer(
         on the same input, so the two are byte-equal after
         ``bionpu.data.canonical_sites.normalize_file``.
     """
+    if slot_bytes is None:
+        slot_bytes = infer_slot_bytes_from_blob(len(blob), n_slots)
+    if slot_records is None:
+        slot_records = max(0, (slot_bytes - 4) // EMIT_RECORD_BYTES)
     out: list[SparseHit] = []
     for s in range(n_slots):
         off = s * slot_bytes
@@ -687,14 +734,20 @@ class _CrisprPamFilterBase(NpuOp):
             # n_records: sum of per-slot counts ( fix; the
             # blob is laid out as N_CHUNKS back-to-back length-
             # prefixed slots, NOT as one monolithic length-prefixed
-            # stream).
+            # stream). The actual slot byte size is inferred from the
+            # blob length so we accept both the pre-2026-04-26 (256
+            # records / 2048 bytes) and post-2026-04-26 (1024 records /
+            # 8192 bytes) vendored artifacts; see
+            # :func:`infer_slot_bytes_from_blob`.
+            actual_slot_bytes = infer_slot_bytes_from_blob(len(blob), N_CHUNKS)
+            actual_slot_records = max(0, (actual_slot_bytes - 4) // EMIT_RECORD_BYTES)
             n_recs = 0
             for s in range(N_CHUNKS):
-                off = s * EMIT_SLOT_BYTES
+                off = s * actual_slot_bytes
                 if off + 4 > len(blob):
                     break
                 slot_n = struct.unpack_from("<I", blob, off)[0]
-                n_recs += min(int(slot_n), EMIT_SLOT_RECORDS)
+                n_recs += min(int(slot_n), actual_slot_records)
             info = _RunInfo(
                 avg_us=avg, min_us=mn, max_us=mx, n_iters=n_iters,
                 used_npu=True, n_records=n_recs,
@@ -771,24 +824,39 @@ class _CrisprPamFilterBase(NpuOp):
                     proc.stderr + "\n[bionpu] could not parse NPU timing",
                 )
             blob = out_bin.read_bytes()
-            expected = len(windows_batch) * N_CHUNKS * EMIT_SLOT_BYTES
-            if len(blob) != expected:
+            # Slot byte size is determined by the vendored host_runner /
+            # xclbin pair (256-record / 2048-byte for pre-2026-04-26
+            # artifacts; 1024-record / 8192-byte for post-2026-04-26
+            # rebuilds). Infer from the on-disk length so the host stays
+            # compatible with both — the runner allocates a fixed-size
+            # SPARSE_OUT_VOL per launch and writes exactly that.
+            n_launches = len(windows_batch)
+            if blob and (len(blob) % (n_launches * N_CHUNKS) != 0):
                 raise NpuRunFailed(
                     proc.returncode,
                     proc.stdout,
                     proc.stderr
-                    + f"\n[bionpu] batch output bytes {len(blob)} != {expected}",
+                    + f"\n[bionpu] batch output bytes {len(blob)} not "
+                    f"divisible by n_launches*N_CHUNKS = "
+                    f"{n_launches}*{N_CHUNKS}",
                 )
+            actual_slot_bytes = (
+                len(blob) // (n_launches * N_CHUNKS) if n_launches else 0
+            )
+            actual_slot_records = max(
+                0, (actual_slot_bytes - 4) // EMIT_RECORD_BYTES
+            )
+            chunk_bytes = N_CHUNKS * actual_slot_bytes
             chunks = [
-                blob[i * N_CHUNKS * EMIT_SLOT_BYTES : (i + 1) * N_CHUNKS * EMIT_SLOT_BYTES]
-                for i in range(len(windows_batch))
+                blob[i * chunk_bytes : (i + 1) * chunk_bytes]
+                for i in range(n_launches)
             ]
             n_recs = 0
             for chunk_blob in chunks:
                 for s in range(N_CHUNKS):
-                    off = s * EMIT_SLOT_BYTES
+                    off = s * actual_slot_bytes
                     slot_n = struct.unpack_from("<I", chunk_blob, off)[0]
-                    n_recs += min(int(slot_n), EMIT_SLOT_RECORDS)
+                    n_recs += min(int(slot_n), actual_slot_records)
             info = _RunInfo(
                 avg_us=avg,
                 min_us=mn,
@@ -808,7 +876,11 @@ class _CrisprPamFilterBase(NpuOp):
         force_host: bool = False,
     ) -> list[list[SparseHit]]:
         """Run many chunks through this op, preserving per-chunk hit lists."""
-        if force_host or not self.artifacts_present():
+        # See `__call__` for rationale: the vendored xclbin hardcodes the
+        # mismatch threshold; widen-via-host fall back when the user asks
+        # for more than the kernel can emit.
+        kernel_threshold_too_low = max_mismatches > KERNEL_HARDCODED_MAX_MISMATCHES
+        if force_host or not self.artifacts_present() or kernel_threshold_too_low:
             return [
                 self(
                     guides_2bit=guides_2bit,
@@ -823,6 +895,11 @@ class _CrisprPamFilterBase(NpuOp):
             guides_2bit, windows_batch, max_mismatches
         )
         out = [decode_per_slot_sparse_buffer(blob) for blob in blobs]
+        if max_mismatches < KERNEL_HARDCODED_MAX_MISMATCHES:
+            out = [
+                [h for h in hits if h.mismatches <= max_mismatches]
+                for hits in out
+            ]
         n_pam_pass = 0
         for windows_in in windows_batch:
             n_pam_pass += sum(
@@ -854,7 +931,16 @@ class _CrisprPamFilterBase(NpuOp):
     ) -> list[SparseHit]:
         self._validate_inputs(guides_2bit, windows_in)
 
-        if force_host or not self.artifacts_present():
+        # The vendored xclbin compiles ``max_mismatches = 4`` into the
+        # runtime sequence (see ``pam_filter.py`` Tile-Z body). The
+        # silicon path therefore cannot widen the threshold beyond
+        # KERNEL_HARDCODED_MAX_MISMATCHES; for callers requesting a
+        # wider threshold we transparently fall back to the host
+        # emulator (which produces byte-equal output to silicon at the
+        # kernel-supported threshold by construction).
+        kernel_threshold_too_low = max_mismatches > KERNEL_HARDCODED_MAX_MISMATCHES
+
+        if force_host or not self.artifacts_present() or kernel_threshold_too_low:
             # Host-emulation path. Produces byte-equal output to the NPU
             # path by construction (same arithmetic). Used both as fallback
             # and as the byte-equality reference for tests.
@@ -893,6 +979,13 @@ class _CrisprPamFilterBase(NpuOp):
         # reapplies the slot_index * WINDOWS_PER_CHUNK offset to the
         # window index that the kernel writes as a chunk-local 0..63.
         hits = decode_per_slot_sparse_buffer(blob)
+        # Apply user-supplied threshold on top of the kernel's hardcoded
+        # threshold. The kernel emits records with mismatch <= 4; if the
+        # caller requested a stricter threshold (mm <= 0/1/2/3), drop
+        # records above it. (For mm > 4 we already redirected to the
+        # host emulator above.)
+        if max_mismatches < KERNEL_HARDCODED_MAX_MISMATCHES:
+            hits = [h for h in hits if h.mismatches <= max_mismatches]
         # Refresh the last_run with PAM-pass count (also derivable from
         # the input bytes; we keep it for symmetry with the host path).
         n_pam_pass = sum(

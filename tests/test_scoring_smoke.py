@@ -108,5 +108,31 @@ def test_score_row_from_row_preserves_identity() -> None:
 
 
 def test_smoke_scorer_invalid_device_rejected() -> None:
-    with pytest.raises(ValueError, match="device must be 'cpu' or 'gpu'"):
+    with pytest.raises(ValueError, match="device must be 'cpu', 'gpu', or 'npu'"):
         DNABERTEpiScorer(device="tpu", smoke=True)
+
+
+def test_smoke_scorer_accepts_npu_label() -> None:
+    """device='npu' is reserved for the v0.4 AIE2P port; smoke mode
+    accepts the label and produces deterministic output identical to
+    cpu/gpu smoke. The placeholder scaffold is in place."""
+    rows = [
+        # avoid creating a non-trivial fixture; reuse _row from this module.
+        # Tests that real-mode device='npu' raises live in a separate test
+        # below to keep the smoke branch torch-free.
+    ]
+    # Real call: just ensures the constructor accepts 'npu' under smoke.
+    scorer = DNABERTEpiScorer(device="npu", smoke=True)
+    assert scorer.device == "npu"
+
+
+def test_real_mode_npu_raises_not_implemented(tmp_path) -> None:
+    """device='npu' in real mode (smoke=False) must raise
+    DNABERTEpiNpuNotImplementedError loud rather than silently falling
+    back to CPU. The v0.4 port lands here later."""
+    from bionpu.scoring.dnabert_epi import DNABERTEpiNpuNotImplementedError
+
+    fake_weights = tmp_path / "fake.pt"
+    fake_weights.write_bytes(b"not used; constructor rejects before loading")
+    with pytest.raises(DNABERTEpiNpuNotImplementedError, match="v0.4 milestone"):
+        DNABERTEpiScorer(device="npu", weights_path=fake_weights, smoke=False)

@@ -62,12 +62,13 @@ from bionpu.data.canonical_sites import CasOFFinderRow
 from .types import ScoreRow
 
 __all__ = [
+    "DNABERTEpiNpuNotImplementedError",
     "DNABERTEpiScorer",
     "DNABERTEpiUnavailableError",
 ]
 
 
-Device = Literal["cpu", "gpu"]
+Device = Literal["cpu", "gpu", "npu"]
 
 
 class DNABERTEpiUnavailableError(RuntimeError):
@@ -76,14 +77,25 @@ class DNABERTEpiUnavailableError(RuntimeError):
     not available."""
 
 
+class DNABERTEpiNpuNotImplementedError(NotImplementedError):
+    """Raised when ``device='npu'`` is requested but the AIE2P scorer
+    port hasn't landed yet. Tracked in
+    ``docs/aie2p-scorer-port-design.md``; v0.4 milestone."""
+
+
 class DNABERTEpiScorer:
     """DNABERT-Epi (no-epi variant) off-target scorer.
 
     Parameters
     ----------
     device:
-        ``"cpu"`` or ``"gpu"``. ``"gpu"`` requires ``torch.cuda`` to be
-        importable and at least one CUDA device visible.
+        ``"cpu"``, ``"gpu"``, or ``"npu"``. ``"gpu"`` requires
+        ``torch.cuda`` to be importable and at least one CUDA device
+        visible. ``"npu"`` is reserved for the AIE2P scorer port
+        (PRD-1 v0.4 follow-up; see
+        ``docs/aie2p-scorer-port-design.md``); it currently raises
+        :class:`DNABERTEpiNpuNotImplementedError` rather than
+        silently falling through.
     weights_path:
         Path to a fine-tuned classifier checkpoint (``state_dict``
         pickled by ``torch.save``). Required when ``smoke=False``.
@@ -113,8 +125,17 @@ class DNABERTEpiScorer:
         smoke: bool = False,
         seed: int = 0,
     ) -> None:
-        if device not in ("cpu", "gpu"):
-            raise ValueError(f"device must be 'cpu' or 'gpu'; got {device!r}")
+        if device not in ("cpu", "gpu", "npu"):
+            raise ValueError(
+                f"device must be 'cpu', 'gpu', or 'npu'; got {device!r}"
+            )
+        if device == "npu" and not smoke:
+            raise DNABERTEpiNpuNotImplementedError(
+                "device='npu' real-mode scoring is the v0.4 milestone "
+                "(see docs/aie2p-scorer-port-design.md). Use "
+                "device='cpu' or device='gpu' for now, or smoke=True "
+                "for the torch-free placeholder path."
+            )
         self.device = device
         self.weights_path = Path(weights_path) if weights_path else None
         self.base_model = base_model

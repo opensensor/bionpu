@@ -167,7 +167,11 @@ def _cmd_score(args: argparse.Namespace) -> int:
     keyed by row identity), useful for CI and CLI demonstration.
     """
     from .data.canonical_sites import parse_tsv
-    from .scoring.dnabert_epi import DNABERTEpiScorer, DNABERTEpiUnavailableError
+    from .scoring.dnabert_epi import (
+        DNABERTEpiNpuNotImplementedError,
+        DNABERTEpiScorer,
+        DNABERTEpiUnavailableError,
+    )
     from .scoring.types import write_score_tsv
 
     rows = parse_tsv(pathlib.Path(args.candidates))
@@ -197,6 +201,9 @@ def _cmd_score(args: argparse.Namespace) -> int:
     except DNABERTEpiUnavailableError as exc:
         print(f"bionpu score: {exc}", file=sys.stderr)
         return 3
+    except DNABERTEpiNpuNotImplementedError as exc:
+        print(f"bionpu score: {exc}", file=sys.stderr)
+        return 4
 
     out_path = pathlib.Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -507,10 +514,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_score.add_argument(
         "--device",
         default="cpu",
-        choices=["cpu", "gpu"],
+        choices=["cpu", "gpu", "npu"],
         help=(
             "Compute device. cpu = baseline + byte-equivalence reference; "
-            "gpu = CUDA-accelerated (requires torch.cuda)."
+            "gpu = CUDA-accelerated (requires torch.cuda); "
+            "npu = AIE2P silicon (v0.4 milestone — currently raises "
+            "DNABERTEpiNpuNotImplementedError; see "
+            "docs/aie2p-scorer-port-design.md)."
         ),
     )
     p_score.add_argument(

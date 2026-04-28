@@ -718,10 +718,12 @@ def _cmd_crispr_design(args: argparse.Namespace) -> int:
         DEFAULT_TOP_N,
         GeneNotFoundError,
         design_guides_for_target,
+        format_result_json,
     )
 
+    target_fasta_path = pathlib.Path(args.target_fasta) if args.target_fasta else None
     fasta_path = pathlib.Path(args.fasta or _default_grch38_fasta())
-    if not fasta_path.is_file():
+    if target_fasta_path is None and not fasta_path.is_file():
         print(
             f"bionpu crispr design: reference FASTA not found at "
             f"{fasta_path!s}. Pass --fasta <path-to-grch38.fa> to override "
@@ -743,6 +745,7 @@ def _cmd_crispr_design(args: argparse.Namespace) -> int:
             device=args.device,
             rank_by=args.rank_by,
             silicon_lock_label=args.silicon_lock_label,
+            target_fasta_path=target_fasta_path,
         )
     except GeneNotFoundError as exc:
         print(f"bionpu crispr design: {exc}", file=sys.stderr)
@@ -751,13 +754,19 @@ def _cmd_crispr_design(args: argparse.Namespace) -> int:
         print(f"bionpu crispr design: {exc}", file=sys.stderr)
         return 2
 
+    out_bytes = (
+        format_result_json(result)
+        if args.format == "json"
+        else result.tsv_bytes
+    )
+
     if args.output and args.output != "-":
         out_path = pathlib.Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(result.tsv_bytes)
+        out_path.write_bytes(out_bytes)
         print(
             f"bionpu crispr design: wrote {len(result.ranked)} ranked "
-            f"guides to {out_path} "
+            f"guides as {args.format} to {out_path} "
             f"(target={result.target.gene} "
             f"{result.target.chrom}:{result.target.start}-{result.target.end}, "
             f"locus={result.target.length:,} bp, "
@@ -768,7 +777,7 @@ def _cmd_crispr_design(args: argparse.Namespace) -> int:
         for stage, secs in result.stage_timings_s.items():
             print(f"  stage {stage}: {secs:.3f}s", file=sys.stderr)
     else:
-        sys.stdout.buffer.write(result.tsv_bytes)
+        sys.stdout.buffer.write(out_bytes)
     return 0
 
 
@@ -1294,7 +1303,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "crispr",
         help=(
             "CRISPR end-to-end guide design wrapper (Tier 1: BRCA1 only, "
-            "TSV output, locus-scope off-target scan)."
+            "locus-scope off-target scan)."
         ),
     )
     sub_crispr = p_crispr.add_subparsers(dest="crispr_kind")
@@ -1311,15 +1320,15 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "Gene symbol (Mode A; PRD §3.1). Tier 1: BRCA1 is the only "
-            "gene wired into the resolver. Mode B (chrN:start-end) and "
-            "Mode C (--target-fasta) are deferred to follow-up agents."
+            "gene wired into the resolver. With --target-fasta, this is "
+            "only the output label."
         ),
     )
     p_c_design.add_argument(
         "--genome",
         default="GRCh38",
-        choices=["GRCh38"],
-        help="Reference build. Tier 1: only GRCh38 is wired.",
+        choices=["GRCh38", "none"],
+        help="Reference build. Use 'none' with --target-fasta.",
     )
     p_c_design.add_argument(
         "--fasta",
@@ -1328,6 +1337,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "Path to the GRCh38 reference FASTA. Defaults to "
             "$BIONPU_GRCH38_FASTA, then to the in-tree cache "
             "data_cache/genomes/grch38/hg38.fa."
+        ),
+    )
+    p_c_design.add_argument(
+        "--target-fasta",
+        default=None,
+        help=(
+            "Mode C: design guides against the first record in a local "
+            "target FASTA using local coordinates. Does not require GRCh38."
         ),
     )
     p_c_design.add_argument(
@@ -1386,9 +1403,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_c_design.add_argument(
+        "--format",
+        default="tsv",
+        choices=["tsv", "json"],
+        help="Output format. Default: tsv.",
+    )
+    p_c_design.add_argument(
         "--output",
         default="-",
-        help="Output TSV path. '-' (default) writes to stdout.",
+        help="Output path. '-' (default) writes to stdout.",
     )
     p_c_design.set_defaults(func=_cmd_crispr_design)
 

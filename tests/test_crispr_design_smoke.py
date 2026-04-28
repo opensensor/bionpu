@@ -30,6 +30,7 @@ across runs.
 from __future__ import annotations
 
 import io
+import json
 import random
 import time
 from pathlib import Path
@@ -289,3 +290,67 @@ def test_slice_chrom_rejects_missing_contig(tmp_path) -> None:
         cd.slice_chrom_from_fasta(
             fasta_path=fasta, chrom="not_a_chrom", start=0, end=10
         )
+
+
+def test_gene_edge_guides_use_widened_doench_context(tmp_path, monkeypatch) -> None:
+    """Guides at the requested locus edge still get Doench context."""
+    chrom = "edge_chr"
+    # Four upstream bases are outside the requested target slice but inside
+    # the chromosome. The first target bases form a valid +strand NGG site.
+    target = "AAGCTGAAACATTCATTAGGTGG" + ("ACGT" * 20)
+    seq = "TTTT" + target + "CCCC"
+    fasta = tmp_path / "edge.fa"
+    fasta.write_text(f">{chrom}\n{seq}\n", encoding="ascii")
+    monkeypatch.setitem(
+        cd._RESOLVE_GENE_TO_LOCUS,
+        "EDGE",
+        (chrom, 5, 4 + len(target)),
+    )
+
+    result = cd.design_guides_for_target(
+        target="EDGE",
+        genome="GRCh38",
+        fasta_path=fasta,
+        top_n=10,
+        device="cpu",
+    )
+
+    edge_rows = [g for g in result.ranked if g.target_pos == 4]
+    assert edge_rows
+    assert edge_rows[0].on_target_score > 0.0
+
+
+def test_target_fasta_json_cli_mode(tmp_path, capsys) -> None:
+    """Mode C target FASTA works without a GRCh38 reference and emits JSON."""
+    from bionpu.cli import main
+
+    target = "AAGCTGAAACATTCATTAGGTGG" + ("ACGT" * 20)
+    fasta = tmp_path / "construct.fa"
+    fasta.write_text(f">construct_1\n{target}\n", encoding="ascii")
+
+    rc = main(
+        [
+            "crispr",
+            "design",
+            "--target",
+            "construct",
+            "--genome",
+            "none",
+            "--target-fasta",
+            str(fasta),
+            "--top",
+            "3",
+            "--device",
+            "cpu",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["target"]["gene"] == "construct"
+    assert payload["target"]["chrom"] == "construct_1"
+    assert payload["target"]["start"] == 0
+    assert payload["ranked"]
+    assert payload["ranked"][0]["guide_seq"]

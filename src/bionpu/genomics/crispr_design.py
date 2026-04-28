@@ -73,6 +73,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+import dataclasses
+import json
 from pathlib import Path
 
 from bionpu.data.canonical_sites import CasOFFinderRow
@@ -91,7 +93,9 @@ __all__ = [
     "compute_composite_crispor",
     "design_guides_for_target",
     "format_guides_tsv",
+    "format_result_json",
     "rank_guides",
+    "resolve_target_fasta",
     "resolve_target",
     "select_locus_guides",
     "slice_chrom_from_fasta",
@@ -195,6 +199,51 @@ def resolve_target(
         chrom=chrom,
         start=zero_start,
         end=zero_end,
+        sequence=seq,
+    )
+
+
+def resolve_target_fasta(
+    *,
+    target_fasta_path: Path | str,
+    target_name: str | None = None,
+) -> ResolvedTarget:
+    """Resolve Mode C input: a single-record FASTA target sequence.
+
+    ``--target-fasta`` is intended for synthetic biology and local
+    construct design where there is no GRCh38 coordinate system. The
+    returned target uses local 0-based coordinates and the FASTA record
+    header as ``chrom``. If multiple records are present, the first
+    record is used and the rest are ignored deliberately.
+    """
+    path = Path(target_fasta_path)
+    if not path.is_file():
+        raise ValueError(f"target FASTA not found: {path}")
+    chrom: str | None = None
+    pieces: list[str] = []
+    with path.open("rt", encoding="ascii") as fh:
+        for line in fh:
+            if line.startswith(">"):
+                if chrom is not None:
+                    break
+                chrom = line[1:].strip().split(None, 1)[0] or path.stem
+                continue
+            if chrom is None:
+                continue
+            stripped = line.strip()
+            if stripped:
+                pieces.append(stripped.upper())
+    if chrom is None:
+        raise ValueError(f"target FASTA has no header: {path}")
+    seq = "".join(pieces)
+    if not seq:
+        raise ValueError(f"target FASTA has an empty first record: {path}")
+    name = target_name or path.stem
+    return ResolvedTarget(
+        gene=name,
+        chrom=chrom,
+        start=0,
+        end=len(seq),
         sequence=seq,
     )
 
@@ -586,8 +635,6 @@ def rank_guides(
     top = candidates[:top_n]
     # Re-rank in place. ``RankedGuide`` is slots=True so ``__dict__``
     # isn't available; ``dataclasses.replace`` is the right tool.
-    import dataclasses
-
     return [
         dataclasses.replace(g, rank=i + 1)
         for i, g in enumerate(top)
@@ -629,6 +676,18 @@ def format_guides_tsv(rows: Iterable[RankedGuide]) -> bytes:
     return blob.encode("utf-8")
 
 
+def format_result_json(result: "DesignRunResult") -> bytes:
+    """Serialise a design run to stable, machine-readable JSON."""
+    payload = {
+        "target": dataclasses.asdict(result.target),
+        "n_candidates_total": result.n_candidates_total,
+        "n_off_target_hits": result.n_off_target_hits,
+        "stage_timings_s": result.stage_timings_s,
+        "ranked": [dataclasses.asdict(g) for g in result.ranked],
+    }
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # End-to-end orchestrator.
 # ---------------------------------------------------------------------------
@@ -657,13 +716,15 @@ def design_guides_for_target(
     device: str = "cpu",
     rank_by: str = "crispor",
     silicon_lock_label: str | None = None,
+    target_fasta_path: Path | str | None = None,
 ) -> DesignRunResult:
     """Run the full Tier 1 pipeline and return ranked guides + TSV bytes.
 
     Parameters
     ----------
     target, genome:
-        Tier 1 inputs to :func:`resolve_target` (Mode A only).
+        Inputs to :func:`resolve_target` unless ``target_fasta_path`` is
+        supplied.
     fasta_path:
         GRCh38 reference FASTA. Used both for the locus slice and for
         the Doench-RS1 30-mer context lookup.
@@ -678,6 +739,9 @@ def design_guides_for_target(
         ``"crispor"`` (Tier 1 default) or ``"bionpu"``.
     silicon_lock_label:
         Optional diagnostic label for the silicon lock PID sidecar.
+    target_fasta_path:
+        Mode C target FASTA. When supplied, ``target`` is used only as
+        the output label and ``genome`` may be ``"none"``.
 
     Returns
     -------
@@ -689,9 +753,15 @@ def design_guides_for_target(
 
     # Stage 1 — target resolution.
     t0 = time.perf_counter()
-    resolved = resolve_target(
-        target=target, genome=genome, fasta_path=fasta_path
-    )
+    if target_fasta_path is not None:
+        resolved = resolve_target_fasta(
+            target_fasta_path=target_fasta_path,
+            target_name=target,
+        )
+    else:
+        resolved = resolve_target(
+            target=target, genome=genome, fasta_path=fasta_path
+        )
     timings["target_resolve"] = time.perf_counter() - t0
 
     # Stage 2 — PAM scan over the locus to enumerate candidate guides.
@@ -742,11 +812,16 @@ def design_guides_for_target(
 
     # Stage 4a — on-target scoring (Doench RS1).
     t0 = time.perf_counter()
+    scoring_chrom, scoring_offset, scoring_seq = _load_scoring_context(
+        resolved=resolved,
+        fasta_path=Path(fasta_path),
+        target_fasta_path=Path(target_fasta_path) if target_fasta_path else None,
+    )
     on_target_scores = _score_on_target(
         on_target_rows=on_target_rows,
-        chrom=resolved.chrom,
-        chrom_seq_offset=resolved.start,
-        chrom_seq=resolved.sequence,
+        chrom=scoring_chrom,
+        chrom_seq_offset=scoring_offset,
+        chrom_seq=scoring_seq,
     )
     timings["on_target_score"] = time.perf_counter() - t0
 
@@ -900,6 +975,40 @@ def _scan_locus_for_offtargets(
     return shifted
 
 
+def _load_scoring_context(
+    *,
+    resolved: ResolvedTarget,
+    fasta_path: Path,
+    target_fasta_path: Path | None,
+) -> tuple[str, int, str]:
+    """Return ``(chrom, offset, seq)`` for Doench 30-mer context lookup.
+
+    Guide enumeration and off-target scanning stay constrained to the
+    requested locus. On-target scoring, however, needs flanking context
+    outside that locus. For Mode A/GRCh38 inputs we load a small widened
+    slice from the reference FASTA so edge guides do not silently get
+    score 0.0 just because the target slice stopped at the gene
+    boundary.
+    """
+    flank = 4
+    if target_fasta_path is not None:
+        return resolved.chrom, resolved.start, resolved.sequence
+    ctx_start = max(0, resolved.start - flank)
+    ctx_end = resolved.end + flank
+    try:
+        seq = slice_chrom_from_fasta(
+            fasta_path=fasta_path,
+            chrom=resolved.chrom,
+            start=ctx_start,
+            end=ctx_end,
+        )
+    except ValueError:
+        # Keep the design run usable on truncated developer fixtures.
+        # Rows that still lack true context remain unscored below.
+        return resolved.chrom, resolved.start, resolved.sequence
+    return resolved.chrom, ctx_start, seq
+
+
 def _score_on_target(
     *,
     on_target_rows: Sequence[CasOFFinderRow],
@@ -918,9 +1027,9 @@ def _score_on_target(
     if not on_target_rows:
         return {}
 
-    # Build a locus-coord chrom_lookup. The scorer indexes by
+    # Build a context-slice chrom_lookup. The scorer indexes by
     # row.chrom and slices ``chrom_seq[start:start+30mer_window]``.
-    # We pass the locus sequence under the locus chrom name and rewrite
+    # We pass the sequence under the locus chrom name and rewrite
     # each row's start to be locus-relative for the scoring call only.
     locus_lookup = {chrom: chrom_seq}
     scorer = DoenchRS1Scorer(chrom_lookup=locus_lookup)
@@ -943,14 +1052,10 @@ def _score_on_target(
             )
         )
 
-    # Filter rows whose 30-mer context window would fall off the locus
-    # slice. RS1's window is 4nt-flank + 20nt + 3nt PAM + 3nt-flank =
-    # 30 nt total. The Doench helper's `+` and `-` strand layouts both
-    # slice an absolute window covering at most ``[start - 4,
-    # start + 27)`` in the slice's coordinate space; if either boundary
-    # is out of range the row is unscorable and we skip it. Guides in
-    # the missing-context region show up in the output with on-target
-    # score 0.0; a follow-up agent widens the slice to recover them.
+    # Filter rows whose 30-mer context window still falls off the
+    # scoring slice. Mode A callers pass a widened slice, so gene-edge
+    # guides score normally. This guard remains for target FASTA mode
+    # and genuinely contig-edge cases.
     locus_len = len(chrom_seq)
     scratch_rows = [
         r for r in scratch_rows

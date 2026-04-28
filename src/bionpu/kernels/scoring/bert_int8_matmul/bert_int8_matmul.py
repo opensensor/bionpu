@@ -405,7 +405,15 @@ def emit_mlir(
     # same shape. ffn{1,2}_h256 emit the qkvo-sized 256-output group
     # kernel; host dispatch streams the larger FFN weight matrix in
     # row-major 256-output groups.
-    if variant == "head":
+    #
+    # Per-head Q·Kᵀ and scores·V (step 0.3b SCOPE-1) reuse the head-
+    # style single-tile lowering. scores·V K=47 violates the qkvo
+    # K%K_CHUNK==0 contract; the head lowering has no such constraint
+    # (it streams full K resident on one tile), and the per-head
+    # workload (47×47×64 / 47×64×47) trivially fits a single tile DM
+    # (~8.5 KB / 64 KB), so the simplest correct path is head-style
+    # single-tile. See SCOPE-1 design note in PRD-dnabert-epi v0.1.4.
+    if variant in ("head", "qkt", "sv"):
         return emit_mlir_head(M=M, K=K, N=N, dev=dev)
     elif variant in ("qkvo", "qkvo_h256"):
         return emit_mlir_qkvo(M=M, K=K, N=N, K_CHUNK=K_CHUNK, dev=dev)
@@ -429,7 +437,8 @@ def emit_mlir(
         raise ValueError(
             f"unknown variant: {variant!r} "
             f"(expected 'head', 'qkvo', 'ffn1', 'ffn2', "
-            f"'qkvo_h256', 'ffn1_h256', or 'ffn2_h256')"
+            f"'qkvo_h256', 'ffn1_h256', 'ffn2_h256', "
+            f"'qkt', or 'sv')"
         )
 
 
@@ -445,6 +454,7 @@ def main():
             "head",
             "qkvo", "ffn1", "ffn2",
             "qkvo_h256", "ffn1_h256", "ffn2_h256",
+            "qkt", "sv",
         ],
         default="head",
     )

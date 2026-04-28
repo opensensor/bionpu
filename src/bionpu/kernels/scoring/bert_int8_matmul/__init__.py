@@ -153,6 +153,23 @@ def _pack_head_ws(w: np.ndarray, scales_combined: np.ndarray) -> bytes:
     return _pad_bytes(w.tobytes() + scales_combined.tobytes(), size)
 
 
+def _pack_head_ws_param(
+    w: np.ndarray, scales_combined: np.ndarray, *, k: int, n: int
+) -> bytes:
+    """Parameterised head-style ws packer used by step-0.3b qkt/sv variants."""
+    size = _round4(n * k + (n + 1) * 4)
+    return _pad_bytes(w.tobytes() + scales_combined.tobytes(), size)
+
+
+def _pad_rows_param(x: np.ndarray, *, m_pad: int, cols: int) -> np.ndarray:
+    """Parameterised row-pad helper used by step-0.3b qkt/sv variants."""
+    if x.shape[0] == m_pad:
+        return np.ascontiguousarray(x, dtype=np.int8)
+    out = np.zeros((m_pad, cols), dtype=np.int8)
+    out[: x.shape[0], :] = x
+    return out
+
+
 def _pack_grouped_xs(
     x: np.ndarray,
     scales_combined: np.ndarray,
@@ -728,6 +745,151 @@ def bert_int8_matmul_ffn2_h256(
     )
 
 
+# ─── Per-head Q·Kᵀ / scores·V (step 0.3b SCOPE-1) ────────────────────
+#
+# Q·Kᵀ per head:   (M=47, K=64, N=47)
+# scores·V per head: (M=47, K=47, N=64)  — K=47 is the unaligned shape
+#                                          that motivated SCOPE-1.
+#
+# Both reuse the head-style single-tile lowering. The head path streams
+# full K resident on one tile (no K_CHUNK requirement), so K=47 needs
+# no padding or new IRON lowering. Per-tile DM at scores·V shape:
+#   x:        47×47 = 2,209 B
+#   ws:       64×47 + 65×4 = 3,268 B
+#   y:        47×64 = 3,008 B
+#   total:    ~8.5 KB (~13% of 64 KiB DM)
+# Trivial fit; the qkvo K%K_CHUNK==0 contract is bypassed entirely.
+
+
+def _bert_int8_matmul_head_param(
+    x: np.ndarray,
+    w: np.ndarray,
+    scales_combined: np.ndarray,
+    *,
+    expected_k: int,
+    expected_n: int,
+    variant: str,
+    artifacts_dir: Path | str | None,
+) -> np.ndarray:
+    """Parameterised head-style dispatch shared by the BERT-base classifier
+    head (K=768, N=2) and the step-0.3b per-head Q·Kᵀ / scores·V variants.
+    """
+    reference = _emulate(
+        x, w, scales_combined,
+        expected_n=expected_n, expected_k=expected_k,
+    )
+    artifacts_path = Path(artifacts_dir) if artifacts_dir is not None else (
+        _default_artifacts_dir(variant)
+    )
+    if not _has_silicon_artifacts(artifacts_path):
+        return reference
+
+    x_full = _pad_rows_param(x, m_pad=_MAX_M, cols=expected_k)
+    x_size = _round4(_MAX_M * expected_k)
+    y_size = _round4(_MAX_M * expected_n)
+    raw, _, _, _ = default_backend().run_xclbin(
+        xclbin=artifacts_path / "final.xclbin",
+        insts=artifacts_path / "insts.bin",
+        kernel_name="MLIR_AIE",
+        in_buffers=[
+            (_pad_bytes(x_full.tobytes(), x_size), _ARG_X),
+            (_pack_head_ws_param(
+                np.ascontiguousarray(w), scales_combined,
+                k=expected_k, n=expected_n,
+            ), _ARG_WS),
+        ],
+        out_size=y_size,
+        out_arg_index=_ARG_Y,
+    )
+    y = np.frombuffer(raw, dtype=np.int8, count=_MAX_M * expected_n)
+    return y.reshape(_MAX_M, expected_n)[: x.shape[0], :].copy()
+
+
+_QKT_K = 64
+_QKT_N = 47
+_SV_K = 47
+_SV_N = 64
+
+
+class _BertInt8MatmulQkt(NpuOp):
+    """``bert_int8_matmul_qkt`` — Q·Kᵀ per-head (M=47, K=64, N=47)."""
+
+    name = "bert_int8_matmul_qkt"
+
+    def __call__(
+        self,
+        *,
+        x: np.ndarray,
+        w: np.ndarray,
+        scales_combined: np.ndarray,
+        artifacts_dir: Path | str | None = None,
+    ) -> np.ndarray:
+        return bert_int8_matmul_qkt(
+            x, w, scales_combined, artifacts_dir=artifacts_dir
+        )
+
+
+def bert_int8_matmul_qkt(
+    x: np.ndarray,
+    w: np.ndarray,
+    scales_combined: np.ndarray,
+    *,
+    artifacts_dir: Path | str | None = None,
+) -> np.ndarray:
+    """Per-head Q·Kᵀ INT8 matmul (M=47, K=64, N=47).
+
+    K (head_dim=64) is the reduction; N (=47=M) is the second token's
+    attention-target index. Output is the per-head (47, 47) attention
+    score matrix in INT8 (host-side dequantises and softmax-scales).
+    """
+    return _bert_int8_matmul_head_param(
+        x, w, scales_combined,
+        expected_k=_QKT_K, expected_n=_QKT_N,
+        variant="qkt",
+        artifacts_dir=artifacts_dir,
+    )
+
+
+class _BertInt8MatmulSv(NpuOp):
+    """``bert_int8_matmul_sv`` — scores·V per-head (M=47, K=47, N=64)."""
+
+    name = "bert_int8_matmul_sv"
+
+    def __call__(
+        self,
+        *,
+        x: np.ndarray,
+        w: np.ndarray,
+        scales_combined: np.ndarray,
+        artifacts_dir: Path | str | None = None,
+    ) -> np.ndarray:
+        return bert_int8_matmul_sv(
+            x, w, scales_combined, artifacts_dir=artifacts_dir
+        )
+
+
+def bert_int8_matmul_sv(
+    x: np.ndarray,
+    w: np.ndarray,
+    scales_combined: np.ndarray,
+    *,
+    artifacts_dir: Path | str | None = None,
+) -> np.ndarray:
+    """Per-head scores·V INT8 matmul (M=47, K=47, N=64).
+
+    K (=47=M) is the attention-token reduction; N (head_dim=64) is the
+    output projection per head. The INT8 zero-pad-to-multiple-of-8
+    workaround the qkvo path would need is sidestepped by using the
+    head-style single-tile lowering (no K%K_CHUNK constraint).
+    """
+    return _bert_int8_matmul_head_param(
+        x, w, scales_combined,
+        expected_k=_SV_K, expected_n=_SV_N,
+        variant="sv",
+        artifacts_dir=artifacts_dir,
+    )
+
+
 # ─── Op registration ─────────────────────────────────────────────────
 
 register_npu_op("bert_int8_matmul_head", _BertInt8MatmulHead())
@@ -739,3 +901,7 @@ register_npu_op("bert_int8_matmul_ffn2", _BertInt8MatmulFfn2())
 register_npu_op("bert_int8_matmul_qkvo_h256", _BertInt8MatmulQkvoH256())
 register_npu_op("bert_int8_matmul_ffn1_h256", _BertInt8MatmulFfn1H256())
 register_npu_op("bert_int8_matmul_ffn2_h256", _BertInt8MatmulFfn2H256())
+
+# step 0.3b SCOPE-1: per-head Q·Kᵀ + scores·V (head-style single-tile).
+register_npu_op("bert_int8_matmul_qkt", _BertInt8MatmulQkt())
+register_npu_op("bert_int8_matmul_sv", _BertInt8MatmulSv())

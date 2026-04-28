@@ -37,6 +37,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import sys
 
@@ -155,6 +156,116 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         ))
         return 0 if result.equal else 1
     return 0
+
+
+def _cmd_design(args: argparse.Namespace) -> int:
+    """Enumerate CRISPR guides and run the host-side seed prefilter."""
+    from .genomics import GuideFilter, design_guides
+    from .scan import read_fasta
+
+    target_chrom, target_seq = read_fasta(args.target)
+    ref_chrom, ref_seq = read_fasta(args.reference)
+    pams = tuple(args.pam or ["NGG"])
+
+    guide_filter = GuideFilter(
+        min_gc=args.min_gc,
+        max_gc=args.max_gc,
+        max_n_fraction=args.max_n_fraction,
+        max_homopolymer=args.max_homopolymer,
+        min_entropy_bits=args.min_entropy_bits,
+    )
+    run = design_guides(
+        target_seq,
+        {ref_chrom or "reference": ref_seq},
+        chrom=target_chrom or "target",
+        pam_templates=pams,
+        guide_filter=guide_filter,
+        seed_length=args.seed_length,
+        max_seed_mismatches=args.max_seed_mismatches,
+        include_reverse=not args.forward_only,
+        pam_aware=not args.ignore_reference_pam,
+    )
+
+    payload = {
+        "target": {
+            "chrom": target_chrom or "target",
+            "bases": len(target_seq),
+        },
+        "reference": {
+            "chrom": ref_chrom or "reference",
+            "bases": len(ref_seq),
+        },
+        "pam_templates": list(pams),
+        "seed_length": args.seed_length,
+        "max_seed_mismatches": args.max_seed_mismatches,
+        "n_candidates": len(run.candidates),
+        "n_passing": len(run.passing_guides),
+        "n_rejected": len(run.rejected_guides),
+        "seed_hit_count": run.seed_hit_count,
+        "guides": [_design_result_to_json(result) for result in run.results],
+        "rejected": [
+            _guide_candidate_to_json(guide) for guide in run.rejected_guides
+        ],
+    }
+
+    body = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    if args.out == "-":
+        sys.stdout.write(body)
+    else:
+        out_path = pathlib.Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(body)
+        print(
+            f"bionpu design: wrote {len(run.results)} passing guides and "
+            f"{run.seed_hit_count} seed hits to {out_path}",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _guide_candidate_to_json(guide) -> dict[str, object]:
+    return {
+        "guide_id": guide.guide_id,
+        "spacer": guide.spacer,
+        "pam": guide.pam,
+        "chrom": guide.chrom,
+        "window_start": guide.window_start,
+        "spacer_start": guide.spacer_start,
+        "strand": guide.strand,
+        "canonical_key": guide.canonical_key,
+        "gc": guide.gc,
+        "n_fraction": guide.n_frac,
+        "max_homopolymer": guide.max_homopolymer,
+        "low_complexity": guide.low_complexity,
+        "passes_filters": guide.passes_filters,
+        "rejection_reasons": list(guide.rejection_reasons),
+    }
+
+
+def _design_result_to_json(result) -> dict[str, object]:
+    guide = _guide_candidate_to_json(result.guide)
+    guide.update(
+        {
+            "seed_hit_count": result.seed_hit_count,
+            "exact_seed_hit_count": result.exact_seed_hit_count,
+            "mismatched_seed_hit_count": result.mismatched_seed_hit_count,
+            "reference_names": list(result.reference_names),
+            "off_targets": [
+                {
+                    "ref_name": hit.ref_name,
+                    "position": hit.position,
+                    "strand": hit.strand,
+                    "seed": hit.seed,
+                    "target_seed": hit.target_seed,
+                    "seed_mismatches": hit.seed_mismatches,
+                    "seed_mismatch_positions": list(hit.seed_mismatch_positions),
+                    "pam": hit.pam,
+                }
+                for hit in result.off_targets
+            ],
+        }
+    )
+    return guide
 
 
 def _cmd_score(args: argparse.Namespace) -> int:
@@ -675,6 +786,86 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_scan.set_defaults(func=_cmd_scan)
+
+    # design
+    p_design = sub.add_parser(
+        "design",
+        help="CRISPR guide enumeration plus CPU seed-off-target prefilter.",
+    )
+    p_design.add_argument(
+        "--target",
+        required=True,
+        help="FASTA file with the target sequence to enumerate guides from.",
+    )
+    p_design.add_argument(
+        "--reference",
+        required=True,
+        help="FASTA file with the reference sequence to seed-prefilter against.",
+    )
+    p_design.add_argument(
+        "--out",
+        required=True,
+        help="Output JSON path, or '-' for stdout.",
+    )
+    p_design.add_argument(
+        "--pam",
+        action="append",
+        default=None,
+        help="PAM template to accept. May be repeated. Defaults to NGG.",
+    )
+    p_design.add_argument(
+        "--seed-length",
+        type=int,
+        default=12,
+        help="PAM-proximal seed length used for off-target prefiltering.",
+    )
+    p_design.add_argument(
+        "--max-seed-mismatches",
+        type=int,
+        default=0,
+        help="Maximum seed mismatches retained by the prefilter.",
+    )
+    p_design.add_argument(
+        "--min-gc",
+        type=float,
+        default=0.40,
+        help="Minimum guide-spacer GC fraction.",
+    )
+    p_design.add_argument(
+        "--max-gc",
+        type=float,
+        default=0.70,
+        help="Maximum guide-spacer GC fraction.",
+    )
+    p_design.add_argument(
+        "--max-n-fraction",
+        type=float,
+        default=0.0,
+        help="Maximum allowed N fraction in a guide spacer.",
+    )
+    p_design.add_argument(
+        "--max-homopolymer",
+        type=int,
+        default=4,
+        help="Maximum allowed same-base run in a guide spacer.",
+    )
+    p_design.add_argument(
+        "--min-entropy-bits",
+        type=float,
+        default=1.2,
+        help="Minimum guide-spacer Shannon entropy in bits.",
+    )
+    p_design.add_argument(
+        "--forward-only",
+        action="store_true",
+        help="Only enumerate forward-strand target candidates.",
+    )
+    p_design.add_argument(
+        "--ignore-reference-pam",
+        action="store_true",
+        help="Seed-prefilter reference windows without checking adjacent PAMs.",
+    )
+    p_design.set_defaults(func=_cmd_design)
 
     # score
     p_score = sub.add_parser(

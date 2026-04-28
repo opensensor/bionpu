@@ -22,11 +22,25 @@
 //                                  vectors so the host can stream them
 //                                  alongside the residual input.
 //
+//   bert_mini_gelu              — per-vector tanh-approximation GELU
+//                                  (step 0.3b SCOPE-4). Pure elementwise
+//                                  bf16; a per-row dispatch handles one
+//                                  HIDDEN-wide chunk at a time. The host
+//                                  dequantises ffn1 INT8 output to bf16,
+//                                  invokes this op, then re-quantises
+//                                  before ffn2. Fusing GELU into ffn1's
+//                                  finalise pass would require inventing
+//                                  an INT8→bf16→GELU→INT8 primitive; the
+//                                  standalone path matches the softmax /
+//                                  LN posture and reuses the same
+//                                  per-row dispatch discipline.
+//
 // Adapted from upstream mlir-aie reference kernels:
 //   third_party/mlir-aie/install/include/aie_kernels/aie2p/softmax.cc
 //   third_party/mlir-aie/install/include/aie_kernels/aie2p/layer_norm.cc
+//   third_party/mlir-aie/install/include/aie_kernels/aie2p/gelu.cc
 //
-// Both reference kernels are Apache-2.0 WITH LLVM-exception (compatible).
+// All three reference kernels are Apache-2.0 WITH LLVM-exception (compatible).
 
 #include <cstdint>
 #include <cstring>
@@ -326,6 +340,97 @@ void bert_mini_layer_norm_packed(
     const uint16_t *gamma = gb;
     const uint16_t *beta  = gb + BIONPU_LN_PAD;
     bert_mini_layer_norm(in_row, gamma, beta, out_row);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// GELU (tanh approximation) — bf16 elementwise (PRD step 0.3b SCOPE-4)
+// ──────────────────────────────────────────────────────────────────────────
+//
+// gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+//
+// Adapted from upstream mlir-aie/install/include/aie_kernels/aie2p/gelu.cc
+// (Apache-2.0 WITH LLVM-exception). Operates on one HIDDEN-wide row of
+// bf16 activation per dispatch, mirroring the per-row softmax / LN
+// dispatch contract so a single IRON `range_` loop covers M rows.
+
+#ifndef BIONPU_GELU_PAD
+#define BIONPU_GELU_PAD BIONPU_LN_PAD
+#endif
+
+void bert_mini_gelu(
+    const uint16_t * __restrict__ in_row,    // bf16 stored as u16
+          uint16_t * __restrict__ out_row
+) {
+#if BIONPU_HAS_AIE_API
+    constexpr int N = 16;  // upstream gelu.cc uses 16-lane bf16 vectors
+    constexpr int PAD = BIONPU_GELU_PAD;
+    static_assert(PAD % N == 0, "GELU_PAD must be multiple of 16");
+    constexpr int CHUNKS = PAD / N;
+
+    const bfloat16 *input  = reinterpret_cast<const bfloat16 *>(in_row);
+          bfloat16 *output = reinterpret_cast<bfloat16 *>(out_row);
+
+    const bfloat16 k0_5 = 0.5f;
+    const bfloat16 k1   = 1.0f;
+    const bfloat16 sqrt_2_over_pi = 0.79788456f;  // ≈ √(2/π)
+    const bfloat16 kBeta = 0.044715f;
+
+    auto v05    = aie::broadcast<bfloat16, N>(k0_5);
+    auto v1     = aie::broadcast<bfloat16, N>(k1);
+    auto vs2opi = aie::broadcast<bfloat16, N>(sqrt_2_over_pi);
+    auto vBeta  = aie::broadcast<bfloat16, N>(kBeta);
+
+    // Match upstream aie_kernels/aie2p/gelu.cc verbatim — it relies on
+    // `auto` so the intermediate `aie::mul` results stay as accums and
+    // chain into the next op without explicit conversions.
+    for (int c = 0; c < CHUNKS; ++c) {
+        aie::vector<bfloat16, N> input_v = aie::load_v<N>(input + c * N);
+        auto x = input_v;
+
+        aie::vector<bfloat16, N> x2 = aie::mul(x, x);   // x^2
+        aie::vector<bfloat16, N> x3 = aie::mul(x, x2);  // x^3
+
+        aie::vector<bfloat16, N> x3_beta = aie::mul(x3, vBeta);
+        aie::vector<bfloat16, N> inner = aie::add(x, x3_beta);
+        auto inner1 = aie::mul(inner, vs2opi);
+
+        auto tanh_out = aie::tanh<bfloat16>(inner1.template to_vector<float>());
+
+        aie::vector<bfloat16, N> one_plus_tanh = aie::add(tanh_out, v1);
+        aie::vector<bfloat16, N> mul_v05 = aie::mul(v05, one_plus_tanh);
+        auto result = aie::mul(x, mul_v05);
+
+        aie::store_v(output + c * N, result.template to_vector<bfloat16>());
+    }
+#else
+    // Scalar host-emulation. Same bf16 round-trip pattern as softmax /
+    // LN fallbacks so byte-equal compares remain meaningful.
+    constexpr int PAD = BIONPU_GELU_PAD;
+    auto bf16_to_f = [](uint16_t b) {
+        uint32_t bits = uint32_t(b) << 16;
+        float f;
+        std::memcpy(&f, &bits, sizeof(f));
+        return f;
+    };
+    auto f_to_bf16 = [](float f) {
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof(bits));
+        uint32_t lsb = (bits >> 16) & 1u;
+        uint32_t rounding_bias = 0x7FFFu + lsb;
+        bits += rounding_bias;
+        return (uint16_t)(bits >> 16);
+    };
+    const float sqrt_2_over_pi = 0.79788456f;
+    const float kBeta = 0.044715f;
+    for (int i = 0; i < PAD; ++i) {
+        float x = bf16_to_f(in_row[i]);
+        float x3 = x * x * x;
+        float inner = sqrt_2_over_pi * (x + kBeta * x3);
+        float t = tanhf(inner);
+        float r = 0.5f * x * (1.0f + t);
+        out_row[i] = f_to_bf16(r);
+    }
+#endif
 }
 
 }  // extern "C"

@@ -32,6 +32,7 @@ _HIDDEN = 256
 _HEAD_DIM = 64
 _NUM_HEADS = 4
 _SOFTMAX_PAD = 64        # pad M=47 to multiple of bf16 vector lane (32)
+_GELU_HIDDEN = 1024      # BERT-mini FFN expansion dim (= 4 * _HIDDEN)
 
 _ARG_X = 3
 _ARG_GB = 4
@@ -304,7 +305,102 @@ def bert_mini_layer_norm(
     return _bf16_to_f32(out_bf16.reshape(M, H).copy())
 
 
+# ─── GELU (step 0.3b SCOPE-4) ────────────────────────────────────────
+
+
+def _gelu_reference(x: np.ndarray) -> np.ndarray:
+    """Byte-equal numpy reference for bert_mini_gelu.
+
+    Tanh-approximation GELU with bf16 round-trip on the result so the
+    reference matches silicon storage type.
+
+        gelu(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))
+
+    Args:
+        x: (M, HIDDEN) f32 — FFN expansion-layer activation in float.
+
+    Returns:
+        (M, HIDDEN) f32 — GELU(x) with bf16 round-trip applied.
+    """
+    sqrt_2_over_pi = np.float32(0.79788456)
+    kBeta = np.float32(0.044715)
+    out = np.empty_like(x, dtype=np.float32)
+    for r in range(x.shape[0]):
+        row = x[r].astype(np.float32)
+        x3 = row * row * row
+        inner = sqrt_2_over_pi * (row + kBeta * x3)
+        t = np.tanh(inner).astype(np.float32)
+        result = np.float32(0.5) * row * (np.float32(1.0) + t)
+        out[r] = _bf16_to_f32(_f32_to_bf16(result))
+    return out
+
+
+class _BertMiniGelu(NpuOp):
+    """``bert_mini_gelu`` — per-row tanh-approximation GELU over (M, HIDDEN)."""
+
+    name = "bert_mini_gelu"
+
+    def __call__(
+        self,
+        *,
+        x: np.ndarray,
+        artifacts_dir: Path | str | None = None,
+    ) -> np.ndarray:
+        return bert_mini_gelu(x, artifacts_dir=artifacts_dir)
+
+
+def bert_mini_gelu(
+    x: np.ndarray,
+    *,
+    artifacts_dir: Path | str | None = None,
+) -> np.ndarray:
+    """Run per-row tanh-GELU over (M, HIDDEN) f32 activations.
+
+    Default shape (BERT-mini step 0.3b): M=47, HIDDEN=1024 (= 4×256
+    FFN expansion). HIDDEN must be a multiple of 16 (the upstream
+    bf16 GELU vector width).
+
+    Args:
+        x: (M, HIDDEN) f32 row-major activations.
+
+    Returns:
+        (M, HIDDEN) f32 GELU output (bf16 round-trip applied).
+    """
+    if x.dtype != np.float32:
+        x = x.astype(np.float32)
+    if x.ndim != 2 or x.shape[1] % 16 != 0:
+        raise ValueError(
+            f"gelu: x must be (M, HIDDEN) f32 with HIDDEN%16==0, got {x.shape}"
+        )
+
+    reference = _gelu_reference(x)
+    artifacts_path = Path(artifacts_dir) if artifacts_dir is not None else (
+        _default_artifacts_dir("gelu")
+    )
+    if not _has_silicon_artifacts(artifacts_path):
+        return reference
+
+    M, H = x.shape
+    in_bf16 = _f32_to_bf16(x)
+    in_bytes = _round4(M * H * 2)
+    out_bytes = _round4(M * H * 2)
+    in_payload = in_bf16.tobytes() + bytes(in_bytes - in_bf16.nbytes)
+
+    # GELU ABI mirrors softmax: arg 3 = input, arg 4 = output.
+    raw, _, _, _ = default_backend().run_xclbin(
+        xclbin=artifacts_path / "final.xclbin",
+        insts=artifacts_path / "insts.bin",
+        kernel_name="MLIR_AIE",
+        in_buffers=[(in_payload, 3)],
+        out_size=out_bytes,
+        out_arg_index=4,
+    )
+    out_bf16 = np.frombuffer(raw, dtype=np.uint16, count=M * H)
+    return _bf16_to_f32(out_bf16.reshape(M, H).copy())
+
+
 # ─── Op registration ─────────────────────────────────────────────────
 
 register_npu_op("bert_mini_attention_softmax", _BertMiniAttentionSoftmax())
 register_npu_op("bert_mini_layer_norm", _BertMiniLayerNorm())
+register_npu_op("bert_mini_gelu", _BertMiniGelu())

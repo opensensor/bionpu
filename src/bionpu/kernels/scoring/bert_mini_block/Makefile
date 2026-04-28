@@ -28,22 +28,28 @@ aie_cc_src   = bert_mini_block.cc
 # Per-kernel IRON-Python lowering files.
 softmax_py_src    = bert_mini_softmax.py
 layer_norm_py_src = bert_mini_layer_norm.py
+gelu_py_src       = bert_mini_gelu.py
 
 M ?= 47
 HIDDEN ?= 256
 SOFTMAX_PAD ?= 64
 NUM_HEADS ?= 4
+# GELU operates on the FFN expansion activation; HIDDEN_FFN = 4 * HIDDEN
+# at BERT-mini's standard 4× ffn ratio (256 -> 1024).
+GELU_HIDDEN ?= 1024
 
 AIE_API_INCLUDE ?= -I${MLIR_AIE_DIR}/install/include -I${MLIR_AIE_DIR}/third_party/aie_api/include
 SHAPE_FLAGS = -DBIONPU_BERT_MINI_M=$(M) \
               -DBIONPU_BERT_MINI_HIDDEN=$(HIDDEN) \
               -DBIONPU_SOFTMAX_PAD=$(SOFTMAX_PAD) \
-              -DBIONPU_LN_PAD=$(HIDDEN)
+              -DBIONPU_LN_PAD=$(HIDDEN) \
+              -DBIONPU_GELU_PAD=$(GELU_HIDDEN)
 
 AIE_ALLOC_SCHEME ?= basic-sequential
 
 all: build/softmax/final.xclbin build/softmax/insts.bin \
-     build/layer_norm/final.xclbin build/layer_norm/insts.bin
+     build/layer_norm/final.xclbin build/layer_norm/insts.bin \
+     build/gelu/final.xclbin build/gelu/insts.bin
 
 # ─── shared object — bert_mini_block.cc ────────────────────────────
 build/softmax/bert_mini_block.o: ${aie_cc_src}
@@ -101,7 +107,34 @@ softmax: build/softmax/final.xclbin build/softmax/insts.bin
 
 layer_norm: build/layer_norm/final.xclbin build/layer_norm/insts.bin
 
+gelu: build/gelu/final.xclbin build/gelu/insts.bin
+
+# ─── gelu variant (PRD step 0.3b SCOPE-4) ──────────────────────────
+build/gelu/bert_mini_block.o: ${aie_cc_src}
+	mkdir -p ${@D}
+ifeq ($(devicename),npu2)
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} \
+	    ${AIE_API_INCLUDE} ${SHAPE_FLAGS} -c $(srcdir)/${aie_cc_src} -o ${@F}
+else
+	@false
+endif
+
+build/gelu/aie.mlir: ${srcdir}/${gelu_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} --M $(M) --HIDDEN $(GELU_HIDDEN) > $@
+
+build/gelu/final.xclbin: build/gelu/aie.mlir build/gelu/bert_mini_block.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --aie-generate-xclbin --no-compile-host \
+	    --xclbin-name=$(@F) \
+	    --alloc-scheme=$(AIE_ALLOC_SCHEME) \
+	    --no-xchesscc --no-xbridge \
+	    --aie-generate-npu-insts --npu-insts-name=insts.bin aie.mlir
+
+build/gelu/insts.bin: build/gelu/final.xclbin
+	@test -f $@ || (echo "ERROR: aiecc did not produce $@"; exit 1)
+
 clean:
 	rm -rf build
 
-.PHONY: all clean softmax layer_norm
+.PHONY: all clean softmax layer_norm gelu

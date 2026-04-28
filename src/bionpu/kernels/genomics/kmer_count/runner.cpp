@@ -55,19 +55,27 @@ namespace {
 
 constexpr int32_t SEQ_IN_CHUNK_BYTES_BASE = 4096;
 
-// Per-k overlap = ceil((k-1)/4) bytes. Pinned per T1 contract.
-constexpr int32_t SEQ_IN_OVERLAP_K15 = 4;   // ceil((15-1)/4) = 4
-constexpr int32_t SEQ_IN_OVERLAP_K21 = 5;   // ceil((21-1)/4) = 5
-constexpr int32_t SEQ_IN_OVERLAP_K31 = 8;   // ceil((31-1)/4) = 8
+// Per-k overlap = max(ceil((k-1)/4), 4-byte alignment requirement).
+// Total chunk = SEQ_IN_CHUNK_BYTES_BASE + overlap MUST be a multiple
+// of 4 because aiecc rejects `aie.dma_bd` ops with non-4-aligned
+// transfer length. ceil((21-1)/4) = 5 was correct for k-mer overlap
+// but 4096+5=4101 fails the alignment check; round up to 8.
+//   k=15: ceil((15-1)/4) = 4; 4096+4 = 4100, aligned (no change)
+//   k=21: ceil((21-1)/4) = 5; bump to 8 so 4096+8 = 4104, aligned
+//   k=31: ceil((31-1)/4) = 8; 4096+8 = 4104, aligned (no change)
+constexpr int32_t SEQ_IN_OVERLAP_K15 = 4;   // 4-aligned; k-mer overlap need = 4
+constexpr int32_t SEQ_IN_OVERLAP_K21 = 8;   // 4-aligned; k-mer overlap need = 5 (rounded up)
+constexpr int32_t SEQ_IN_OVERLAP_K31 = 8;   // 4-aligned; k-mer overlap need = 8
 
-// Catch silent contract drift at compile time. The integer rounding
-// rule is ((k-1) + 3) / 4 == ceil((k-1)/4) for k >= 1.
-static_assert(((15 - 1) + 3) / 4 == SEQ_IN_OVERLAP_K15,
-              "k=15 overlap must be 4 bytes per T1 contract");
-static_assert(((21 - 1) + 3) / 4 == SEQ_IN_OVERLAP_K21,
-              "k=21 overlap must be 5 bytes per T1 contract");
-static_assert(((31 - 1) + 3) / 4 == SEQ_IN_OVERLAP_K31,
-              "k=31 overlap must be 8 bytes per T1 contract");
+// Catch silent contract drift at compile time:
+//   1. overlap covers the (k-1)-base k-mer span: overlap_bytes >= ceil((k-1)/4)
+//   2. total chunk + overlap is 4-byte aligned (aiecc requirement)
+static_assert(SEQ_IN_OVERLAP_K15 >= ((15 - 1) + 3) / 4 && (SEQ_IN_CHUNK_BYTES_BASE + SEQ_IN_OVERLAP_K15) % 4 == 0,
+              "k=15 overlap must cover (k-1) bases AND keep total 4-byte aligned");
+static_assert(SEQ_IN_OVERLAP_K21 >= ((21 - 1) + 3) / 4 && (SEQ_IN_CHUNK_BYTES_BASE + SEQ_IN_OVERLAP_K21) % 4 == 0,
+              "k=21 overlap must cover (k-1) bases AND keep total 4-byte aligned");
+static_assert(SEQ_IN_OVERLAP_K31 >= ((31 - 1) + 3) / 4 && (SEQ_IN_CHUNK_BYTES_BASE + SEQ_IN_OVERLAP_K31) % 4 == 0,
+              "k=31 overlap must cover (k-1) bases AND keep total 4-byte aligned");
 
 // EmitRecord layout (16 B). Mirrors kmer_count_constants.h.
 struct EmitRecord {

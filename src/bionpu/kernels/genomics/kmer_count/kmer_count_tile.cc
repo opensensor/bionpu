@@ -62,8 +62,11 @@ static_assert(sizeof(CountRecord) == 12,
               "CountRecord must be 12 bytes packed (T1 contract)");
 static_assert(sizeof(EmitRecord) == 16,
               "EmitRecord must be 16 bytes packed (T1 contract)");
-static_assert(HASH_BUCKETS_PER_TILE * sizeof(CountRecord) <= 48 * 1024,
-              "count table exceeds 48 KiB tile-DM cap (T1 contract)");
+// Tightened from 48 KiB to 16 KiB after T11 build failure forced the
+// 4096->1024 bucket revision (depth=2 partial ping-pong was the
+// missing budget term). 1024 * 12 = 12 KiB, well under 16 KiB.
+static_assert(HASH_BUCKETS_PER_TILE * sizeof(CountRecord) <= 16 * 1024,
+              "count table exceeds 16 KiB tile-DM budget (T1 revision 2026-04-28)");
 static_assert((HASH_BUCKETS_PER_TILE & (HASH_BUCKETS_PER_TILE - 1)) == 0,
               "HASH_BUCKETS_PER_TILE must be a power of two for "
               "canonical & (HASH_BUCKETS_PER_TILE-1) bucket math");

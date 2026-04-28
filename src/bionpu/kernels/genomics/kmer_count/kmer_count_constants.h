@@ -32,10 +32,14 @@ static constexpr uint64_t KMER_MASK_K31 = (1ULL << 62) - 1ULL;
 // pairs. The packed RC mask (apply XOR before bit-reverse) for k bases
 // is exactly the per-k mask above (every 2-bit pair flipped).
 
-// Per-tile count-table geometry. 4096 buckets * 12 bytes = 48 KiB.
-// Fits in 64 KiB AIE2P L1 with ~16 KiB headroom for stack + fifo
-// double-buffers + code.
-static constexpr int32_t HASH_BUCKETS_PER_TILE = 4096;
+// Per-tile count-table geometry. 1024 buckets * 12 bytes = 12 KiB.
+// Combined with the depth=2 ping-pong on the partial ObjectFifo
+// (24 KiB) and seq_in chunk (~8 KiB), total tile DM ~50 KiB fits
+// in 64 KiB AIE2P L1 with comfortable headroom for stack + code.
+// Was 4096 in the initial T1 contract; T11 silicon build failed
+// due to depth=2 ping-pong doubling the partial buffer to 96 KiB,
+// exceeding the 64 KiB cap (2026-04-28). See T1 contract revision.
+static constexpr int32_t HASH_BUCKETS_PER_TILE = 1024;
 
 // Open-addressed linear probing — emit-on-evict overflow.
 static constexpr int32_t OVERFLOW_THRESHOLD = 8;

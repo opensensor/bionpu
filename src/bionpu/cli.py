@@ -240,6 +240,37 @@ def _cmd_score(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_score_quantize(args: argparse.Namespace) -> int:
+    """Calibrate DNABERT-Epi to INT8 + write quantization passport.
+
+    Produces the AIE2P-targeted quant passport (raw INT8 weight
+    arrays + per-channel scales + per-tensor activation scales) that
+    the v0.4 NPU scorer kernels consume. See
+    docs/aie2p-scorer-port-design.md for the full pipeline.
+    """
+    from .scoring.quantize import calibrate_dnabert_epi
+
+    weights = pathlib.Path(args.weights)
+    out_dir = pathlib.Path(args.out_dir)
+    try:
+        passport = calibrate_dnabert_epi(
+            weights_path=weights,
+            out_dir=out_dir,
+            calibration_corpus_id=args.calibration_id,
+            n_samples_target=args.n_samples,
+        )
+    except RuntimeError as exc:
+        print(f"bionpu score-quantize: {exc}", file=sys.stderr)
+        return 3
+    print(
+        f"bionpu score-quantize: wrote passport for {len(passport.weights)} "
+        f"linear layers + {len(passport.activations)} activation scales "
+        f"(n_calib={passport.n_calibration_samples}) to {out_dir}",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def _cmd_score_extract_head(args: argparse.Namespace) -> int:
     """Convert an upstream DNABERT-Epi checkpoint into a bionpu head dict.
 
@@ -594,6 +625,44 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output path for the bionpu head state_dict.",
     )
     p_xhead.set_defaults(func=_cmd_score_extract_head)
+
+    # score-quantize — INT8 calibration + AIE2P quantization passport
+    p_quant = sub.add_parser(
+        "score-quantize",
+        help=(
+            "Calibrate a fine-tuned DNABERT-Epi state-dict to INT8 "
+            "and write the AIE2P-targeted quantization passport "
+            "(raw INT8 weights + per-channel scales + per-tensor "
+            "activation scales). v0.4 milestone — feeds the NPU "
+            "scorer kernels."
+        ),
+    )
+    p_quant.add_argument(
+        "--weights",
+        required=True,
+        help="Path to the fine-tuned classifier head state-dict.",
+    )
+    p_quant.add_argument(
+        "--out-dir",
+        required=True,
+        help="Output directory for passport.json + weights.npz.",
+    )
+    p_quant.add_argument(
+        "--calibration-id",
+        default="synthetic_seed42_n128",
+        help=(
+            "Stable identifier for the calibration corpus, recorded "
+            "in the passport. Default uses the deterministic "
+            "synthetic corpus baked into the calibrator."
+        ),
+    )
+    p_quant.add_argument(
+        "--n-samples",
+        type=int,
+        default=128,
+        help="Cap on calibration samples consumed.",
+    )
+    p_quant.set_defaults(func=_cmd_score_quantize)
 
     # bench
     p_bench = sub.add_parser(

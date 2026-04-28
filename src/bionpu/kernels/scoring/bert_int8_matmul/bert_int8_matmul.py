@@ -13,12 +13,18 @@
 #   ~38 KB / 64 KB).
 #
 # * ``qkvo`` (v0.4-beta):
-#   four compute tiles, N-axis fan-out (192 channels per tile),
-#   K-chunked along the reduction axis (K_CHUNK=64 → 12 chunks per
-#   launch). Memtile splits the per-K-chunk weight tile into 4 N-slices
-#   (one per compute tile) and broadcasts the per-K-chunk x slice to
-#   all four. Memtile joins the four 47×192 INT8 partial outputs into
-#   the final 47×768 INT8 result.
+#   four compute tiles, M-axis fan-out (12 padded token rows per tile),
+#   K-chunked along the reduction axis. Both x and w stream directly
+#   from DDR/shim to all compute tiles; memtile flat-concats the four
+#   row slabs into a row-major output. This replaces the earlier N-axis
+#   fan-out whose memtile join produced slice-major output.
+#
+# * ``ffn1`` / ``ffn2`` (v0.4-rc):
+#   DDR-streamed feed-forward projections. The generated AIE program is
+#   the qkvo-sized 768-output group kernel; host dispatch streams the
+#   larger FFN weight matrix in row-major 768-output groups. This keeps
+#   per-tile state at a qkvo-sized row slab while allowing
+#   the 3072-wide FFN expansion weight to live in DDR.
 #
 # Shapes (per CLI flags):
 #   x:           M × K  int8           (token-major)
@@ -85,9 +91,10 @@ def emit_mlir_head(M: int, K: int, N: int, dev) -> str:
     of_ws = ObjectFifo(ws_ty, name="ws_in", depth=1)
     of_y  = ObjectFifo(y_ty,  name="y_out", depth=1)
 
-    # Compute kernel — scalar inner loop, fused-scale requantize, INT8
-    # saturate. Symbol is `bert_int8_matmul_<N>` so the same .py / .cc
-    # compile to multiple specializations via the Makefile.
+    # Compute kernel — AIE builds take the vectorized INT8 dot-product
+    # path; host builds keep the scalar fallback. Symbol is
+    # `bert_int8_matmul_<N>` so the same .py / .cc compile to multiple
+    # specializations via the Makefile.
     matmul_sym = f"bert_int8_matmul_{N}"
     matmul = Kernel(
         matmul_sym,
@@ -123,47 +130,33 @@ def emit_mlir_head(M: int, K: int, N: int, dev) -> str:
 
 
 def emit_mlir_qkvo(M: int, K: int, N: int, K_CHUNK: int, dev) -> str:
-    """v0.4-beta multi-tile + memtile-split + K-chunked path.
+    """v0.4-beta/rc row-major multi-tile + K-chunked path.
 
     Topology:
-        shim ──xs_chunk──→ broadcast to 4 compute tiles  (1 shim MM2S)
-        shim ──w_chunk───→ memtile ──split(N)──→ 4 cores (1 shim MM2S)
-        4 cores ──y_part──→ memtile ──join(N)──→ shim    (1 shim S2MM)
+        shim ──xs_chunk──→ broadcast to 4 compute tiles (1 shim MM2S)
+        shim ──w_chunk───→ broadcast to 4 compute tiles (1 shim MM2S)
+        4 cores ──row slabs──→ memtile ──join(M)──→ shim (1 shim S2MM)
 
-    Each launch streams K_CHUNKS=12 K-chunks (K=768 / K_CHUNK=64) through
-    the xs and w ObjectFifos; the four compute tiles each accumulate into
-    a tile-local INT32 Buffer (qkvo_acc, 47×192=36 KB), then finalize to
-    INT8 once the K loop is done. Scales ride along the xs stream
-    (packed into the trailing bytes of each xs_chunk); the kernel
-    re-stashes the per-tile slice on every call into a tile-local fp32
-    Buffer (qkvo_scales, 192+1 entries = 772 B).
+    Each tile owns a contiguous slab of padded token rows and all output
+    channels. The memtile join is therefore a flat row-slab concat,
+    which directly produces row-major output and removes the host-side
+    slice-major unscramble step.
 
     Per-tile DM budget (actual, observed in linker layout, depth=1):
 
-      qkvo_acc i32          :  47 × 192 × 4   = 36,096 B
-      w_to_core i8 (slice)  : 192 × 64        = 12,288 B
-      y_part out i8         :  47 × 192       =  9,024 B
-      xs_in i8 (+scales)    : 47×64 + 769×4   =  6,084 B
-      qkvo_scales fp32      : 192+1 fp32      =    772 B
+      qkvo_acc i32          :  12 × 768 × 4   = 36,864 B
+      w_to_core i8          : 768 × 8         =  6,144 B
+      y_part out i8         :  12 × 768       =  9,216 B
+      xs_in i8 (+scales)    : 47×8 + 769×4    =  3,452 B
+      qkvo_scales fp32      : 768+1 fp32      =  3,076 B
       stack                 : —               =  1,024 B
       ──────────────────────────────────────────
-      total                                   = 65,288 B  (~99.6% of 64 KiB)
-
-    Memtile budget (out of 512 KB):
-      S2MM  : w_in (1) + 4× y_part_i (4)     = 5/6 channels
-      MM2S  : 4× w_to_core_i (4) + y_out (1) = 5/6 channels
-      Memory: w_chunk (49152) + 4× y_part_buf (9024)
-            + y_total (36096) + scratch     ≈ 122 KB / 512 KB
+      total                                   = 59,776 B
 
     Shim budget (out of 2 MM2S + 2 S2MM):
       MM2S: xs (1) + w (1)                   = 2/2 channels
       S2MM: y_out (1)                        = 1/2 channels
     """
-    if N % 4 != 0:
-        raise ValueError(
-            f"qkvo variant requires N divisible by 4 (one slice per compute "
-            f"tile), got N={N}"
-        )
     if K % K_CHUNK != 0:
         raise ValueError(
             f"qkvo variant requires K divisible by K_CHUNK, got K={K}, "
@@ -171,8 +164,9 @@ def emit_mlir_qkvo(M: int, K: int, N: int, K_CHUNK: int, dev) -> str:
         )
 
     N_TILES = 4
-    N_PER_TILE = N // N_TILES        # 192 for qkvo
-    K_CHUNKS = K // K_CHUNK          # 12 for qkvo
+    M_PAD = ((M + N_TILES - 1) // N_TILES) * N_TILES
+    M_PER_TILE = M_PAD // N_TILES
+    K_CHUNKS = K // K_CHUNK
 
     # ─── Whole-runtime tensor types (host-visible flat buffers) ───
     # Streaming layout — host writes them in chunk-major order so the
@@ -182,13 +176,12 @@ def emit_mlir_qkvo(M: int, K: int, N: int, K_CHUNK: int, dev) -> str:
     #              repeated) scales fp32 array. Trick lets us collapse 3
     #              shim MM2S streams (x, w, s) into 2 (xs, w), fitting
     #              the NPU2Col1 shim's 2-MM2S budget.
-    #   w_total  : K_CHUNKS * (N * K_CHUNK) bytes — one N×K_CHUNK slab per
-    #              chunk (N-major within each slab so memtile-split works).
-    #   y_total  : M * N int8 — final output, joined N-axis from 4 partials.
-    #              Slice-major layout: tile i owns bytes
-    #              [i*M*N_PER_TILE .. (i+1)*M*N_PER_TILE).
+    #   w_total  : K_CHUNKS * (N * K_CHUNK) bytes — one N×K_CHUNK slab
+    #              per chunk.
+    #   y_total  : M_PAD * N int8 — final row-major output, joined as
+    #              contiguous row slabs from the four compute tiles.
     w_total_bytes      = _round4(K_CHUNKS * N * K_CHUNK)
-    y_total_bytes      = _round4(M * N)
+    y_total_bytes      = _round4(M_PAD * N)
 
     w_total_ty      = np.ndarray[(w_total_bytes,), np.dtype[np.int8]]
     y_total_ty      = np.ndarray[(y_total_bytes,), np.dtype[np.int8]]
@@ -196,16 +189,15 @@ def emit_mlir_qkvo(M: int, K: int, N: int, K_CHUNK: int, dev) -> str:
     # ─── Per-chunk types (visible to memtile + compute tiles) ───
     # xs_chunk: x slab + scales packing (see big block comment further down
     # in the ObjectFifos section for rationale).
-    xs_chunk_size      = _round4(M * K_CHUNK + (N + 1) * 4)  # 6084 bytes
+    xs_chunk_size      = _round4(M * K_CHUNK + (N + 1) * 4)
     xs_total_bytes     = _round4(K_CHUNKS * xs_chunk_size)
-    w_chunk_size       = _round4(N * K_CHUNK)               # 49152 (768×64) — full w_chunk on memtile
-    w_slice_chunk_size = _round4(N_PER_TILE * K_CHUNK)      # 12288 (192×64) — per-tile w slice
-    y_part_size        = _round4(M * N_PER_TILE)            # 9024 (47×192)
+    # 49152 B at qkvo shape (768×64): full w_chunk on memtile.
+    w_chunk_size       = _round4(N * K_CHUNK)
+    y_part_size        = _round4(M_PER_TILE * N)
 
     xs_chunk_ty      = np.ndarray[(xs_chunk_size,),      np.dtype[np.int8]]
     xs_total_ty      = np.ndarray[(xs_total_bytes,),     np.dtype[np.int8]]
     w_chunk_ty       = np.ndarray[(w_chunk_size,),       np.dtype[np.int8]]
-    w_slice_chunk_ty = np.ndarray[(w_slice_chunk_size,), np.dtype[np.int8]]
     y_part_ty        = np.ndarray[(y_part_size,),        np.dtype[np.int8]]
 
     # ─── Compute kernels — three symbols for the K-chunked accumulator pattern.
@@ -228,11 +220,8 @@ def emit_mlir_qkvo(M: int, K: int, N: int, K_CHUNK: int, dev) -> str:
     # live in their own DM segment). This is the canonical pattern for
     # tile-resident scratch state; static C++ arrays would land in `.bss`
     # which is squeezed by the ObjectFifo buffer placements.
-    # Per-tile stashed scales: only this tile's N_PER_TILE entries plus
-    # one trailing fp32 slot reserved for the bias (matching the host
-    # contract where scales_combined has length N+1). 192+1 fp32 = 772 B.
-    acc_ty        = np.ndarray[(M * N_PER_TILE,),    np.dtype[np.int32]]
-    scales_buf_ty = np.ndarray[((N_PER_TILE + 1),), np.dtype[np.float32]]
+    acc_ty        = np.ndarray[(M_PER_TILE * N,), np.dtype[np.int32]]
+    scales_buf_ty = np.ndarray[((N + 1),),        np.dtype[np.float32]]
 
     matmul_init = Kernel(
         "bert_int8_matmul_qkvo_init",
@@ -244,15 +233,14 @@ def emit_mlir_qkvo(M: int, K: int, N: int, K_CHUNK: int, dev) -> str:
         "bert_int8_matmul.o",
         [
             xs_chunk_ty,           # x slab for this K_CHUNK + trailing scales
-            w_slice_chunk_ty,      # this tile's w slice for this K_CHUNK
+            w_chunk_ty,            # full N x K_CHUNK weight slab
             acc_ty,                # tile-local i32 accumulator
             scales_buf_ty,         # tile-local fp32 scales-stash (acc_k
                                    # writes the per-tile slice every call —
                                    # last write wins; only the last call's
                                    # values are read by finalize, so this is
                                    # correct without a "first-call" gate)
-            np.int32,              # tile_idx (0..3) — selects which N_PER_TILE
-                                   # slice of the xs_chunk scales prefix to stash
+            np.int32,              # tile_idx (0..3) — selects row slab
         ],
     )
     matmul_finalize = Kernel(
@@ -302,23 +290,13 @@ def emit_mlir_qkvo(M: int, K: int, N: int, K_CHUNK: int, dev) -> str:
     # xs: shim → 4 compute tiles (direct switchbox broadcast).
     of_xs = ObjectFifo(xs_chunk_ty, name="xs_in", depth=1)
 
-    # w_chunk: shim → memtile → split into 4 N-slices → 4 compute tiles.
+    # w_chunk: shim → 4 compute tiles (direct switchbox broadcast).
     of_w_in  = ObjectFifo(w_chunk_ty, name="w_in",  depth=1)
     of_y_out = ObjectFifo(y_total_ty, name="y_out", depth=1)
 
-    w_split_offsets = [i * N_PER_TILE * K_CHUNK for i in range(N_TILES)]
-    of_w_to_cores = of_w_in.cons().split(
-        w_split_offsets,
-        obj_types=[w_slice_chunk_ty] * N_TILES,
-        names=[f"w_to_core{i}" for i in range(N_TILES)],
-    )
-
-    # y output: 4 compute tiles → memtile → join along N → shim.
-    # Each tile's 47×192 partial lands at byte offset i*y_part_size in the
-    # joined 47×768 output. This produces a slice-major layout (tile i
-    # owns the contiguous byte block at offset i*y_part_size). The host
-    # emulation reorders y back to row-major to match the simple einsum
-    # reference.
+    # y output: 4 compute tiles → memtile → join along M row slabs → shim.
+    # Each tile's M_PER_TILE×N partial lands at byte offset i*y_part_size
+    # in the joined M_PAD×N output, which is already row-major.
     y_join_offsets = [i * y_part_size for i in range(N_TILES)]
     of_y_partials = of_y_out.prod().join(
         y_join_offsets,
@@ -357,7 +335,7 @@ def emit_mlir_qkvo(M: int, K: int, N: int, K_CHUNK: int, dev) -> str:
             core_body,
             fn_args=[
                 of_xs.cons(),                 # direct shim-broadcast xs consumer
-                of_w_to_cores[i].cons(),      # per-tile w slice consumer (memtile-split)
+                of_w_in.cons(),               # direct shim-broadcast w consumer
                 of_y_partials[i].prod(),      # per-tile output producer (memtile-join)
                 acc_buf,
                 scales_buf,
@@ -377,7 +355,7 @@ def emit_mlir_qkvo(M: int, K: int, N: int, K_CHUNK: int, dev) -> str:
     # Runtime sequence: shim drives 2 input streams and 1 output stream.
     #   xs_total : K_CHUNKS × xs_chunk_size bytes (x_chunk + scales)
     #   w_total  : K_CHUNKS × w_chunk_size bytes  (full N×K_CHUNK slabs)
-    #   y_total  : M × N bytes (slice-major joined output)
+    #   y_total  : M_PAD × N bytes (row-major joined output)
     rt = Runtime()
     with rt.sequence(xs_total_ty, w_total_ty, y_total_ty) as (
         xs_total, w_total, y_total,
@@ -396,7 +374,7 @@ def emit_mlir(
     N: int,
     target: str = "npu2",
     variant: str = "head",
-    K_CHUNK: int = 64,
+    K_CHUNK: int = 8,
 ) -> str:
     """Emit IRON Python -> MLIR-AIE for the given matmul shape.
 
@@ -406,10 +384,12 @@ def emit_mlir(
     Args:
         M, K, N: matmul shape.
         target: "npu" (NPU1, Phoenix) or "npu2" (NPU2 / AIE2P / Strix).
-        variant: "head" (single-tile, weights resident) or
-                 "qkvo" (4-tile fan-out + K-chunked memtile streaming).
-        K_CHUNK: K-axis chunk size for the qkvo variant. Default 64
-                 hits the per-tile DM budget for M=47, N=192/tile.
+        variant: "head" (single-tile, weights resident),
+                 "qkvo" (4-tile fan-out + K-chunked memtile streaming),
+                 or "ffn1"/"ffn2" (same qkvo-sized group kernel used by
+                 the host-side DDR-streamed FFN dispatcher).
+        K_CHUNK: K-axis chunk size for the qkvo/ffn variants. Default
+                 8 keeps the full N=768 row-slab state inside tile DM.
     """
     if target == "npu2":
         dev = NPU2Col1()
@@ -422,8 +402,19 @@ def emit_mlir(
         return emit_mlir_head(M=M, K=K, N=N, dev=dev)
     elif variant == "qkvo":
         return emit_mlir_qkvo(M=M, K=K, N=N, K_CHUNK=K_CHUNK, dev=dev)
+    elif variant in ("ffn1", "ffn2"):
+        if N != 768:
+            raise ValueError(
+                f"{variant} lowering emits one DDR-streamed 768-output "
+                f"group per dispatch; pass N=768 for the group kernel, "
+                f"got N={N}"
+            )
+        return emit_mlir_qkvo(M=M, K=K, N=N, K_CHUNK=K_CHUNK, dev=dev)
     else:
-        raise ValueError(f"unknown variant: {variant!r} (expected 'head' or 'qkvo')")
+        raise ValueError(
+            f"unknown variant: {variant!r} "
+            f"(expected 'head', 'qkvo', 'ffn1', or 'ffn2')"
+        )
 
 
 def main():
@@ -432,9 +423,9 @@ def main():
     p.add_argument("--M", type=int, default=47)
     p.add_argument("--K", type=int, default=768)
     p.add_argument("--N", type=int, default=2)
-    p.add_argument("--variant", choices=["head", "qkvo"], default="head")
-    p.add_argument("--K-chunk", type=int, default=64,
-                   help="K-axis chunk size for the qkvo variant (default 64).")
+    p.add_argument("--variant", choices=["head", "qkvo", "ffn1", "ffn2"], default="head")
+    p.add_argument("--K-chunk", type=int, default=8,
+                   help="K-axis chunk size for qkvo/ffn variants (default 8).")
     args = p.parse_args()
     sys.stdout.write(str(emit_mlir(
         M=args.M, K=args.K, N=args.N, target=args.target,

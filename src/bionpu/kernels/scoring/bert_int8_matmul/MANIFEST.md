@@ -76,7 +76,7 @@ instances will be additional `Makefile` targets that lower the same
 | name | role |
 |---|---|
 | `bert_int8_matmul.py` | IRON-Python lowering. Emits MLIR-AIE for a single compute tile + 4 ObjectFifos (x in, w in, scales in, y out). |
-| `bert_int8_matmul.cc` | AIE2P C++ kernel — scalar i8×i8 → i32 inner loop, FP32 fused-scale requantization, INT8 saturate-and-pack. **No vector intrinsics in v0** — correctness first; the AIE-API vectorization is the v0.5 perf pass. |
+| `bert_int8_matmul.cc` | AIE2P C++ kernel — AIE-API vectorized i8×i8 → i32 dot-product path with scalar host fallback, FP32 fused-scale requantization, INT8 saturate-and-pack. |
 | `runner.cpp` | Host C++ XRT runner — file-backed I/O for x/w/scales/y; consumes a small byte format compatible with `bionpu.scoring.quantize.QuantizationPassport.weights.npz` indices. |
 | `Makefile` | Builds head specialization (M=47, K=768, N=2) + the host runner. |
 | `__init__.py` | Python `NpuOp` registration: `bert_int8_matmul_head`. |
@@ -155,10 +155,10 @@ $ ./bert_int8_matmul --variant qkvo \
                      --xclbin build/qkvo/final.xclbin \
                      --insts  build/qkvo/insts.bin \
                      --xs xs.bin --w w.bin --out y_npu.bin
-$ python3 -c "<unscramble slice-major to row-major; compare>"
-y_ref bytes: 36096, y_npu bytes: 36096
+$ python3 -c "<compare row-major output>"
+y_ref bytes: 36096, y_npu bytes: 36864  (48 padded rows)
 first 8 ref:        [ 1  1  0 -1 -1  0  0 -2]
-first 8 npu (unsr): [ 1  1  0 -1 -1  0  0 -2]
+first 8 npu:        [ 1  1  0 -1 -1  0  0 -2]
 max |ref - npu|: 0
 mismatch count : 0 / 36096
 BYTE-EQUAL: True
@@ -166,38 +166,33 @@ BYTE-EQUAL: True
 
 ### Topology
 
-4 compute tiles, N-axis fan-out (192 channels per tile), K-chunked
-along the reduction axis (K_CHUNK=64 → 12 chunks per launch). All
-per-tile state is held in IRON `Buffer` objects (the i32 accumulator
-and the per-tile fp32 scales-stash) to escape the tight `.bss` budget
-that static C++ globals would face.
+v0.4-beta used N-axis fan-out and produced slice-major output. v0.4-rc
+switches to M-axis fan-out: each compute tile owns 12 padded token rows
+and all 768 output channels. Because each producer emits a contiguous
+row slab, the memtile `join()` flat-concat directly produces row-major
+output.
 
 ```
 shim ──xs──→ broadcast to 4 compute tiles (1 shim MM2S)
-shim ──w───→ memtile ──split(N)──→ 4 compute tiles (1 shim MM2S, memtile resident relay)
-4 cores ──y_part──→ memtile ──join(N)──→ shim (1 shim S2MM)
+shim ──w───→ broadcast to 4 compute tiles (1 shim MM2S)
+4 cores ──row slabs──→ memtile ──join(M)──→ shim (1 shim S2MM)
 ```
 
-### Per-tile DM utilization (actual, observed in linker layout)
+### Per-tile DM utilization (v0.4-rc design)
 
 | resident | bytes | role |
 |---|---|---|
-| qkvo_acc (i32 accumulator) | 36,096 | persistent across K loop |
-| w_to_core slice (i8) | 12,288 | one 192×64 slab |
-| xs_in (i8) | 6,084 | x_chunk + scales prefix |
-| y_part out (i8) | 9,024 | one 47×192 partial |
-| qkvo_scales (fp32, per-tile slice) | 772 | this tile's 192+1 entries |
+| qkvo_acc (i32 accumulator) | 36,864 | 12×768, persistent across K loop |
+| w_to_core slab (i8) | 6,144 | one 768×8 slab |
+| xs_in (i8) | 3,452 | 47×8 x_chunk + 769 fp32 scales |
+| y_part out (i8) | 9,216 | one 12×768 row slab |
+| qkvo_scales (fp32) | 3,076 | full 768+1 scale vector |
 | stack | 1,024 | crt0 |
-| **total** | **65,288** | **~99.6% of 64 KiB tile DM** |
+| **total** | **59,776** | fits 64 KiB tile DM |
 
-The design doc's predicted budget of 51 KB underestimated by ~13 KB
-because (a) scales are packed into xs_chunk via 3076-byte tail bytes
-duplicated per chunk, growing xs_chunk from 3008 → 6084 B, and (b) the
-per-tile fp32 scales-stash + 1024-byte stack weren't counted. The
-tighter 99.6% utilization is acceptable for v0.4-beta; v0.4-rc / v0.5
-will need to either drop the scales-suffix-on-every-chunk pattern (if
-shim DMA programming gets a 3rd MM2S slot via memtile-routing) or move
-the i32 accumulator to a tile-shared memtile slot.
+The row-slab topology deliberately trades more K chunks for a memtile
+join that is already row-major. `K_CHUNK=8` keeps the full 768-output
+row-slab state inside tile DM.
 
 ### Build artifacts (v0.4-beta, qkvo specialization)
 
@@ -213,39 +208,30 @@ the i32 accumulator to a tile-shared memtile slot.
 The IRON topology streams two file-backed buffers; they're chunk-major
 to match the K-chunked weight stream:
 
-* `xs.bin` — `K_CHUNKS × xs_chunk_size` = `12 × 6084` = **73,008 bytes**.
+* `xs.bin` — `K_CHUNKS × xs_chunk_size` = `96 × 3452` =
+  **331,392 bytes**.
   Each xs_chunk is `[ M × K_CHUNK int8 x slab | (N+1) fp32 scales ]`.
   The host duplicates the scales prefix on every chunk to keep the
   ObjectFifo element type uniform-sized (the kernel re-stashes scales
   into its tile-local `qkvo_scales` Buffer on every call; only the last
   call's stash is read by finalize, which is correct because the input
   scales never change within a launch).
-* `w.bin` — `K_CHUNKS × (N × K_CHUNK)` = `12 × 49152` = **589,824 bytes**.
+* `w.bin` — `K_CHUNKS × (N × K_CHUNK)` = `96 × 6144` =
+  **589,824 bytes**.
   Each chunk is N rows × K_CHUNK cols of int8 weights, N-major. Host
   must lay this out so that bytes `[c*N*K_CHUNK + n*K_CHUNK ..
   c*N*K_CHUNK + (n+1)*K_CHUNK)` = `w[n, c*K_CHUNK:(c+1)*K_CHUNK]`.
 
 Output:
 
-* `y.bin` — `M * N` = `47 × 768` = **36,096 bytes**, **slice-major
-  layout**: tile i contributes the contiguous byte block at
-  `[i * M * N_PER_TILE .. (i+1) * M * N_PER_TILE)`, which is row-major
-  47×192 within the slice. To reconstruct row-major `y[M, N]`:
-  ```python
-  y_full = np.empty((M, N), dtype=np.int8)
-  for i in range(N_TILES):
-      sl = y_npu[i*M*N_PER_TILE:(i+1)*M*N_PER_TILE].reshape(M, N_PER_TILE)
-      y_full[:, i*N_PER_TILE:(i+1)*N_PER_TILE] = sl
-  ```
+* `y.bin` — `M_PAD * N` = `48 × 768` = **36,864 bytes**,
+  row-major layout. The public API returns `y[:47, :]`.
 
 ### Known issues / followups
 
-1. **Slice-major output requires host post-processing.** The memtile
-   join lays four 47×192 partials end-to-end; the natural row-major
-   reconstruction is a Python-side reshape+stitch. v0.5 should
-   either (a) program the memtile join with strided offsets that
-   produce row-major directly, or (b) move the unscramble into the
-   host runner.
+1. **Closed in v0.4-rc: slice-major output.** The qkvo/ffn group
+   topology now splits M rows instead of N channels, so memtile
+   flat-concat directly produces row-major output.
 
 2. **Per-tile DM at 99.6%.** Adding any new per-tile state (e.g., a
    bias term, dropout mask) will not fit. v0.5 will need to drop one
@@ -260,17 +246,50 @@ Output:
    over time with a 4-tile-fan-out at smaller N, or DDR-streamed
    weight via shim with the memtile only for relay).
 
+## v0.4-rc — ffn1 / ffn2 DDR-streamed weight ABI
+
+✅ **Host dispatch ABI landed.** The Python NpuOps
+`bert_int8_matmul_ffn1` and `bert_int8_matmul_ffn2` are registered and
+share the qkvo-sized group kernel discipline:
+
+* `ffn1`: `M<=47, K=768, N=3072`. Host streams four 768-output groups.
+* `ffn2`: `M<=47, K=3072, N=768`. Host streams one 768-output group
+  across 384 K-chunks.
+
+The group wire format keeps each compute tile at a 12-row slab:
+
+* `xs` is group-major, then K-chunk-major. Each element is
+  `[M x K_CHUNK int8 x slab | 769 fp32 group scales]`.
+* `w` is group-major, then K-chunk-major. Each element is
+  `768 x K_CHUNK int8`, N-major within the group.
+* `y` is row-major with padded M (`M_PAD=48` for M=47). Host dispatch
+  trims padding only.
+
+This is the DDR-streamed weight contract needed for FFN without
+placing the 2.3 MB weight in memtile or tile data memory. Hardware
+artifact builds use:
+
+```
+make NPU2=1 ffn1   # M=47 K=768  N=768 group kernel
+make NPU2=1 ffn2   # M=47 K=3072 N=768 group kernel
+```
+
+`ffn1` consumes the group kernel four times inside the host-side ABI;
+`ffn2` consumes one group with a longer K stream.
+
 ## Next sub-tasks (per design doc)
 
 - **v0.4-alpha**: ✅ done — head shape (47 × 768 × 2), single-tile.
 - **v0.4-beta**: ✅ done — qkvo shape (47 × 768 × 768), 4-tile + K-chunked.
-- **v0.4-rc**: scale to `ffn1` / `ffn2` (47 × 768 × 3072) via DDR
-  weight streaming. Becomes the latency bottleneck of the port.
+- **v0.4-rc**: ✅ host ABI and registered ops landed for `ffn1` /
+  `ffn2` via DDR-streamed weights. Remaining hardware work is to build
+  and ratify the group xclbins under `build/{ffn1,ffn2}/`.
 - **v0.4-final**: wire the silicon dispatch (pyxrt host runner adapter)
   for both bert_int8_matmul_head and bert_int8_matmul_qkvo NpuOps so
   `bionpu score --device npu` runs end-to-end on real silicon (the
   NotImplementedError raised by both NpuOps when artifacts are present
   is the v0.4-final landing surface).
-- **v0.5**: switch from scalar to AIE-API ::aie::vector intrinsics
-  for the inner loop; targeting >10× speedup based on basecalling
-  track precedent.
+- **v0.5**: ✅ source landed — inner dot products use guarded
+  AIE-API `::aie::vector` / `aie::mac` intrinsics with the scalar
+  loop kept as the host-build fallback. Remaining work is Peano build
+  + silicon ratification for the >10× perf target.

@@ -2,12 +2,17 @@
 # bionpu — bert_int8_matmul (DNABERT-Epi AIE2P scorer port, v0.4 alpha).
 #
 # v0 ships the head specialization (M=47, K=768, N=2 — classifier head).
-# Other specializations rebuild this same source with different M/K/N
-# preprocessor flags; see MANIFEST.md.
+# qkvo and ffn specializations rebuild this same source with different
+# M/K/N preprocessor flags; see MANIFEST.md. FFN builds are 768-output
+# group kernels; host dispatch streams the full FFN weight from DDR in
+# row-major groups.
 #
 # Targets:
 #   build/head/final.xclbin    head xclbin (M=47 K=768 N=2)
 #   build/head/insts.bin       head instruction stream
+#   make qkvo                  qkvo group xclbin (M=47 K=768 N=768)
+#   make ffn1                  ffn1 group xclbin (M=47 K=768 N=768)
+#   make ffn2                  ffn2 group xclbin (M=47 K=3072 N=768)
 #   bert_int8_matmul           host C++ runner (one binary; see runner.cpp)
 #
 # Invocation (from this directory):
@@ -43,9 +48,10 @@ M ?= 47
 K ?= 768
 N ?= 2
 V ?= head
-# qkvo K-axis chunk size (only used when V=qkvo). Default 64 hits the
-# per-tile DM budget (~51 KB / 64 KB) for M=47, N=192/tile.
-K_CHUNK ?= 64
+# qkvo/ffn K-axis chunk size. Row-major memtile-join topology keeps
+# all N=768 outputs per tile row slab; K_CHUNK=8 leaves enough tile DM
+# for the full scale vector, accumulator, output slab, and stack.
+K_CHUNK ?= 8
 N_TILES ?= 4
 
 AIE_API_INCLUDE ?= -I${MLIR_AIE_DIR}/install/include -I${MLIR_AIE_DIR}/third_party/aie_api/include
@@ -100,4 +106,13 @@ ${targetname}: ${runner_cc_src} build/$(V)/final.xclbin
 clean:
 	rm -rf build ${targetname}
 
-.PHONY: all clean
+qkvo:
+	$(MAKE) NPU2=$(NPU2) M=47 K=768 N=768 V=qkvo all
+
+ffn1:
+	$(MAKE) NPU2=$(NPU2) M=47 K=768 N=768 V=ffn1 all
+
+ffn2:
+	$(MAKE) NPU2=$(NPU2) M=47 K=3072 N=768 V=ffn2 all
+
+.PHONY: all clean qkvo ffn1 ffn2

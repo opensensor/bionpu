@@ -52,15 +52,16 @@ constexpr size_t HEAD_X_BYTES   = round4(static_cast<size_t>(M) * K);           
 constexpr size_t HEAD_WS_BYTES  = round4(static_cast<size_t>(HEAD_N) * K + static_cast<size_t>(HEAD_N + 1) * 4); //  1 548
 constexpr size_t HEAD_Y_BYTES   = round4(static_cast<size_t>(M) * HEAD_N);                                       //     96
 
-// ─── qkvo variant sizes (N=768, K_CHUNK=64, K_CHUNKS=12) ───
+// ─── qkvo/ffn group variant sizes (N=768, K_CHUNK=8, K_CHUNKS=96) ───
 constexpr int    QKVO_N         = 768;
-constexpr int    QKVO_K_CHUNK   = 64;
-constexpr int    QKVO_K_CHUNKS  = K / QKVO_K_CHUNK;                                                              // 12
-// xs_chunk = M*K_CHUNK + (N+1)*4 = 47*64 + 769*4 = 3008+3076 = 6084 bytes
+constexpr int    QKVO_K_CHUNK   = 8;
+constexpr int    QKVO_K_CHUNKS  = K / QKVO_K_CHUNK;                                                              // 96
+constexpr int    QKVO_M_PAD     = 48;
+// xs_chunk = M*K_CHUNK + (N+1)*4 = 47*8 + 769*4 = 376+3076 = 3452 bytes
 constexpr size_t QKVO_XS_CHUNK  = round4(static_cast<size_t>(M) * QKVO_K_CHUNK + static_cast<size_t>(QKVO_N + 1) * 4);
-constexpr size_t QKVO_XS_BYTES  = round4(static_cast<size_t>(QKVO_K_CHUNKS) * QKVO_XS_CHUNK);                    // 73,008
+constexpr size_t QKVO_XS_BYTES  = round4(static_cast<size_t>(QKVO_K_CHUNKS) * QKVO_XS_CHUNK);                    // 331,392
 constexpr size_t QKVO_W_BYTES   = round4(static_cast<size_t>(QKVO_K_CHUNKS) * QKVO_N * QKVO_K_CHUNK);            // 589,824 (= N*K)
-constexpr size_t QKVO_Y_BYTES   = round4(static_cast<size_t>(M) * QKVO_N);                                       // 36,096
+constexpr size_t QKVO_Y_BYTES   = round4(static_cast<size_t>(QKVO_M_PAD) * QKVO_N);                              // 36,864
 
 template <typename T>
 std::vector<T> read_file(const std::string &path, size_t expected_bytes) {

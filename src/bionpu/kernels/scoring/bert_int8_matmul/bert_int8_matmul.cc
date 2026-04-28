@@ -8,14 +8,14 @@
 // FP32 per-output-channel scale and INT8 saturation. Two specializations:
 //
 // * `bert_int8_matmul_2`           — head v0.4-alpha. Single tile, full K
-//                                     resident, full N=2 output. Single
-//                                     entry point, scalar inner loop.
+//                                     resident, full N=2 output.
 //
 // * `bert_int8_matmul_qkvo_init`   — qkvo v0.4-beta init: zero the static
 //                                     INT32 accumulator on each tile.
 // * `bert_int8_matmul_qkvo_acc`    — qkvo v0.4-beta accumulate: i32 +=
 //                                     i8 × i8 over a single K_CHUNK slice
-//                                     of x and the per-tile w slice.
+//                                     of x and the full output-channel
+//                                     weight slab.
 // * `bert_int8_matmul_qkvo_finalize` — qkvo v0.4-beta finalize: fused
 //                                     FP32 scale + INT8 saturate of the
 //                                     i32 accumulator into the int8
@@ -27,9 +27,15 @@
 #include <cstdint>
 #include <cstring>
 
-// AIE-API would be included here for the v0.5 vectorized variant.
-// v0 stays scalar so the kernel fits in <16 KiB program memory and
-// the correctness path is reviewable without intrinsic knowledge.
+// v0.5 vectorized inner loop. Gate on the Peano-emitted AIE arch macro
+// so host-side source checks and scalar emulation builds do not require
+// AIE API headers.
+#if defined(__AIE_ARCH__) && !defined(BIONPU_FORCE_SCALAR)
+#  define BIONPU_HAS_AIE_API 1
+#  include <aie_api/aie.hpp>
+#else
+#  define BIONPU_HAS_AIE_API 0
+#endif
 
 #ifndef BIONPU_BERT_M
 #define BIONPU_BERT_M 47
@@ -40,13 +46,14 @@
 #ifndef BIONPU_BERT_N
 #define BIONPU_BERT_N 2
 #endif
-// qkvo per-tile slice sizes. With N=768 and N_TILES=4 → N_PER_TILE=192;
-// K_CHUNK=64 → K_CHUNKS=12.
+// qkvo row-slab sizes. With M=47 and N_TILES=4, M pads to 48 and each
+// tile owns 12 rows. K_CHUNK=8 keeps the full N=768 weight slab plus
+// scales inside tile DM.
 #ifndef BIONPU_BERT_N_TILES
 #define BIONPU_BERT_N_TILES 4
 #endif
 #ifndef BIONPU_BERT_K_CHUNK
-#define BIONPU_BERT_K_CHUNK 64
+#define BIONPU_BERT_K_CHUNK 8
 #endif
 
 namespace {
@@ -75,6 +82,66 @@ inline int32_t round_nearest_int32(float v) {
     return v >= 0.0f
         ? static_cast<int32_t>(v + 0.5f)
         : static_cast<int32_t>(v - 0.5f);
+}
+
+inline int32_t dot_i8_scalar(
+    const int8_t * __restrict__ x,
+    const int8_t * __restrict__ w,
+    int k_len
+) {
+    int32_t acc = 0;
+    for (int k = 0; k < k_len; ++k) {
+        acc += static_cast<int32_t>(x[k]) * static_cast<int32_t>(w[k]);
+    }
+    return acc;
+}
+
+// AIE2P v0.5 perf path: reduce the INT8 dot product with AIE-API vector
+// MACs, then horizontally sum the INT32 lanes. The scalar fallback keeps
+// the same source usable for host checks and non-Peano builds.
+inline int32_t dot_i8(
+    const int8_t * __restrict__ x,
+    const int8_t * __restrict__ w,
+    int k_len
+) {
+#if BIONPU_HAS_AIE_API
+    constexpr int VEC_I8 = 16;
+    aie::accum<acc32, VEC_I8> acc;
+    acc.from_vector(aie::broadcast<int32_t, VEC_I8>(0));
+
+    int k = 0;
+    for (; k + VEC_I8 <= k_len; k += VEC_I8) {
+        aie::vector<int8, VEC_I8> x_v = aie::load_v<VEC_I8>(x + k);
+        aie::vector<int8, VEC_I8> w_v = aie::load_v<VEC_I8>(w + k);
+        acc = aie::mac(acc, w_v, x_v);
+    }
+
+    auto lanes = acc.to_vector<int32_t>();
+    int32_t sum = 0;
+    for (int i = 0; i < VEC_I8; ++i) {
+        sum += lanes.get(i);
+    }
+    if (k < k_len) {
+        int8 x_tail[VEC_I8] = {};
+        int8 w_tail[VEC_I8] = {};
+        for (int i = 0; k < k_len; ++i, ++k) {
+            x_tail[i] = x[k];
+            w_tail[i] = w[k];
+        }
+        aie::vector<int8, VEC_I8> x_v = aie::load_v<VEC_I8>(x_tail);
+        aie::vector<int8, VEC_I8> w_v = aie::load_v<VEC_I8>(w_tail);
+        aie::accum<acc32, VEC_I8> tail_acc;
+        tail_acc.from_vector(aie::broadcast<int32_t, VEC_I8>(0));
+        tail_acc = aie::mac(tail_acc, w_v, x_v);
+        auto tail_lanes = tail_acc.to_vector<int32_t>();
+        for (int i = 0; i < VEC_I8; ++i) {
+            sum += tail_lanes.get(i);
+        }
+    }
+    return sum;
+#else
+    return dot_i8_scalar(x, w, k_len);
+#endif
 }
 
 }  // namespace
@@ -114,16 +181,13 @@ void bert_int8_matmul_2(
     const float  *scales = reinterpret_cast<const float *>(ws_buf + N * K);
 
     // For each output cell: i32 accumulator over the K reduction.
-    // Inner loop is scalar; v0.5 swaps in 64-lane ::aie::vector.
+    // On AIE2P this lowers to AIE-API vector MACs; host builds take the
+    // scalar fallback through the same helper.
     for (int m = 0; m < M; ++m) {
         const int8_t *x_row = x + m * K;
         for (int n = 0; n < N; ++n) {
             const int8_t *w_row = w + n * K;
-            int32_t acc = 0;
-            for (int k = 0; k < K; ++k) {
-                acc += static_cast<int32_t>(x_row[k])
-                     * static_cast<int32_t>(w_row[k]);
-            }
+            const int32_t acc = dot_i8(x_row, w_row, K);
             // Fused scale + INT8 saturate. The host's
             // bionpu.scoring.quantize sets `combined[n]` such that
             // y_int8 ≈ round(W_fp · x_fp / output_scale), preserving
@@ -137,8 +201,8 @@ void bert_int8_matmul_2(
 // ──────────────────────────────────────────────────────────────────────────
 // v0.4-beta — qkvo specialization (M=47, K=768, N=768).
 //
-// Each compute tile owns N_PER_TILE = N/N_TILES output channels. The
-// K loop runs in IRON-Python; this kernel's three entry points handle
+// Each compute tile owns M_PER_TILE padded token rows and all output
+// channels. The K loop runs in IRON-Python; this kernel's three entry points handle
 // init / accumulate / finalize:
 //
 //   init()       — zero the static INT32 accumulator
@@ -153,9 +217,12 @@ void bert_int8_matmul_2(
 namespace {
 
 constexpr int QKVO_M           = BIONPU_BERT_M;                          // 47
-constexpr int QKVO_K_CHUNK     = BIONPU_BERT_K_CHUNK;                    // 64
+constexpr int QKVO_M_PAD       =
+    ((BIONPU_BERT_M + BIONPU_BERT_N_TILES - 1) / BIONPU_BERT_N_TILES)
+    * BIONPU_BERT_N_TILES;                                               // 48
+constexpr int QKVO_M_PER_TILE  = QKVO_M_PAD / BIONPU_BERT_N_TILES;       // 12
+constexpr int QKVO_K_CHUNK     = BIONPU_BERT_K_CHUNK;                    // 8
 constexpr int QKVO_N           = BIONPU_BERT_N;                          // 768
-constexpr int QKVO_N_PER_TILE  = BIONPU_BERT_N / BIONPU_BERT_N_TILES;    // 192
 constexpr int QKVO_SCALES_N    = BIONPU_BERT_N + 1;                      // 769
 
 }  // namespace
@@ -163,11 +230,11 @@ constexpr int QKVO_SCALES_N    = BIONPU_BERT_N + 1;                      // 769
 // Zero the i32 accumulator.
 //
 // Inputs:
-//   acc_buf:    M × N_PER_TILE int32 — tile-local IRON Buffer
+//   acc_buf:    M_PER_TILE × N int32 — tile-local IRON Buffer
 void bert_int8_matmul_qkvo_init(
           int32_t * __restrict__ acc_buf
 ) {
-    for (int i = 0; i < QKVO_M * QKVO_N_PER_TILE; ++i) {
+    for (int i = 0; i < QKVO_M_PER_TILE * QKVO_N; ++i) {
         acc_buf[i] = 0;
     }
 }
@@ -180,19 +247,18 @@ void bert_int8_matmul_qkvo_init(
 //                 [M*K_CHUNK  .. M*K_CHUNK + (N+1)*4 - 1]  = scales fp32 (N+1)
 //               The host duplicates the scales prefix on every chunk to
 //               keep ObjectFifo elements uniform-size.
-//   w_chunk:    N_PER_TILE × K_CHUNK int8 row-major (N-major, K_CHUNK-minor)
-//   acc_buf:    M × N_PER_TILE int32 — tile-local IRON Buffer (read/write)
-//   scales_buf: (N_PER_TILE + 1) float32 — tile-local IRON Buffer.
-//               This kernel re-stashes this tile's per-tile slice of the
-//               full scales array every call; only the LAST call's
-//               write matters since finalize reads it after the K loop.
-//   tile_idx:   0..N_TILES-1 — selects which N_PER_TILE slice of the
-//               xs_chunk scales prefix to stash for this tile.
+//   w_chunk:    N × K_CHUNK int8 row-major (N-major, K_CHUNK-minor)
+//   acc_buf:    M_PER_TILE × N int32 — tile-local IRON Buffer (read/write)
+//   scales_buf: (N + 1) float32 — tile-local IRON Buffer.
+//               This kernel re-stashes the full per-output scale vector
+//               every call; only the LAST call's write matters since
+//               finalize reads it after the K loop.
+//   tile_idx:   0..N_TILES-1 — selects which M_PER_TILE row slab this
+//               tile owns.
 //
 // Effect:
-//   acc_buf[m * N_PER_TILE + n] += sum_{k=0..K_CHUNK-1} x_chunk[m, k] * w_chunk[n, k]
-//   scales_buf[0..N_PER_TILE-1] = *(float*)(xs_chunk + M*K_CHUNK + tile_idx*N_PER_TILE*4)
-//   scales_buf[N_PER_TILE]      = *(float*)(xs_chunk + M*K_CHUNK + N*4)  (bias slot)
+//   acc_buf[m_local * N + n] += sum_k x_chunk[m_global, k] * w_chunk[n, k]
+//   scales_buf[0..N] = *(float*)(xs_chunk + M*K_CHUNK)
 void bert_int8_matmul_qkvo_acc(
     const int8_t * __restrict__ xs_chunk,
     const int8_t * __restrict__ w_chunk,
@@ -202,35 +268,32 @@ void bert_int8_matmul_qkvo_acc(
 ) {
     constexpr int M  = QKVO_M;
     constexpr int N  = QKVO_N;
-    constexpr int Np = QKVO_N_PER_TILE;
+    constexpr int Mp = QKVO_M_PER_TILE;
     constexpr int Kc = QKVO_K_CHUNK;
 
-    // Stash this tile's scales slice. Cost: 192*4 = 768 B per K_CHUNK ×
-    // K_CHUNKS = 9 KB redundant fp32 copies per launch. Trivial vs.
-    // 576 KB weight stream.
+    // Stash the full scales vector. Cost: 769*4 per K_CHUNK; acceptable
+    // for this scalar correctness path and keeps finalize local.
     {
         const float *full =
             reinterpret_cast<const float *>(xs_chunk + M * Kc);
-        const float *src = full + tile_idx * Np;
-        for (int i = 0; i < Np; ++i) {
-            scales_buf[i] = src[i];
+        for (int i = 0; i < N + 1; ++i) {
+            scales_buf[i] = full[i];
         }
-        // Trailing bias slot (scale[N]) — same on all tiles.
-        scales_buf[Np] = full[N];
     }
 
     const int8_t *x_chunk = xs_chunk;  // x lives at the head of xs_chunk
 
-    for (int m = 0; m < M; ++m) {
-        const int8_t *xr = x_chunk + m * Kc;
-        int32_t      *ar = acc_buf + m * Np;
-        for (int n = 0; n < Np; ++n) {
+    const int row0 = tile_idx * Mp;
+    for (int ml = 0; ml < Mp; ++ml) {
+        const int mg = row0 + ml;
+        int32_t *ar = acc_buf + ml * N;
+        if (mg >= M) {
+            continue;
+        }
+        const int8_t *xr = x_chunk + mg * Kc;
+        for (int n = 0; n < N; ++n) {
             const int8_t *wr = w_chunk + n * Kc;
-            int32_t a = ar[n];
-            for (int k = 0; k < Kc; ++k) {
-                a += static_cast<int32_t>(xr[k]) * static_cast<int32_t>(wr[k]);
-            }
-            ar[n] = a;
+            ar[n] += dot_i8(xr, wr, Kc);
         }
     }
 }
@@ -238,21 +301,21 @@ void bert_int8_matmul_qkvo_acc(
 // Fused-scale + INT8 saturate of the accumulator into the int8 output.
 //
 // Inputs:
-//   acc_buf:    M × N_PER_TILE int32 — read-only at this stage
-//   scales_buf: N_PER_TILE+1 float32 — this tile's slice (read-only)
-//   y_part:     M × N_PER_TILE int8 row-major (output)
+//   acc_buf:    M_PER_TILE × N int32 — read-only at this stage
+//   scales_buf: N+1 float32 — full scale vector (read-only)
+//   y_part:     M_PER_TILE × N int8 row-major (output)
 void bert_int8_matmul_qkvo_finalize(
     const int32_t * __restrict__ acc_buf,
     const float   * __restrict__ scales_buf,
           int8_t  * __restrict__ y_part
 ) {
-    constexpr int M  = QKVO_M;
-    constexpr int Np = QKVO_N_PER_TILE;
+    constexpr int Mp = QKVO_M_PER_TILE;
+    constexpr int N  = QKVO_N;
 
-    for (int m = 0; m < M; ++m) {
-        const int32_t *ar = acc_buf    + m * Np;
-              int8_t  *yr = y_part     + m * Np;
-        for (int n = 0; n < Np; ++n) {
+    for (int m = 0; m < Mp; ++m) {
+        const int32_t *ar = acc_buf + m * N;
+              int8_t  *yr = y_part  + m * N;
+        for (int n = 0; n < N; ++n) {
             const float fy = static_cast<float>(ar[n]) * scales_buf[n];
             yr[n] = saturate_int8(round_nearest_int32(fy));
         }

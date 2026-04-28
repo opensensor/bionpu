@@ -27,11 +27,12 @@ Tier 1 scope (this module's first cut)
 This is the smallest defensible end-to-end first cut, deliberately
 narrower than PRD §6 Phase 1's full deliverable:
 
-* **Mode A only** — gene symbol -> coordinates. The `_RESOLVE_GENE_TO_LOCUS`
-  table currently knows only ``BRCA1``. Mode B (raw coordinates) and
-  Mode C (`--target-fasta`) are deferred to follow-up agents.
-* **TSV output only.** JSON output, run-metadata block, and the full
-  `off_targets_full` JSON variant are deferred.
+* **Mode A/B/C target inputs** — gene symbol -> coordinates, raw
+  ``chr:start-end`` coordinates, or local ``--target-fasta``. The
+  `_RESOLVE_GENE_TO_LOCUS` table currently knows only ``BRCA1``; full
+  RefSeq/Ensembl lookup is deferred to follow-up agents.
+* **TSV + compact JSON output.** The full `off_targets_full` JSON
+  variant is deferred.
 * **Locus-scope off-target scan.** The off-target scan is run against
   the *target locus itself* (not the full GRCh38 reference). This
   bounds the smoke-test wall-clock to <30 s on CPU. PRD §6 Phase 1
@@ -95,6 +96,7 @@ __all__ = [
     "format_guides_tsv",
     "format_result_json",
     "rank_guides",
+    "resolve_coordinate_target",
     "resolve_target_fasta",
     "resolve_target",
     "select_locus_guides",
@@ -115,15 +117,47 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 TARGET_RESOLVER_TIER1_NOTE: str = (
-    "Tier 1: only BRCA1 is wired in the gene->coords table. "
-    "Other genes raise GeneNotFoundError. PRD §3.1 RefSeq/Ensembl "
-    "integration lands in a follow-up agent."
+    "Tier 1+ (20-gene CRISPOR validation harness): hardcoded 20-gene "
+    "table covering the genes listed in "
+    "tests/fixtures/crispor_reference/genes_pinned.json. Other genes "
+    "raise GeneNotFoundError. PRD §3.1 RefSeq/Ensembl GTF integration "
+    "(pyensembl) is the long-term replacement; the hardcoded table "
+    "was extended additively (BRCA1 pinning unchanged) to unblock the "
+    "20-gene §4.3 hard-gate validation harness."
 )
 
-# 1-based inclusive coordinates on GRCh38. Source: NCBI RefSeq for the
-# gene's longest mRNA span, padded to whole-gene window.
+# 1-based inclusive coordinates on GRCh38. Source: NCBI RefSeq Annotation
+# Release 110 / GRCh38.p14 for each gene's longest mRNA span, padded to
+# whole-gene window. The 20-gene set + stratification rationale lives in
+# `tests/fixtures/crispor_reference/genes_pinned.json`; entries below
+# mirror that fixture verbatim.
+#
+# BRCA1 was the only Tier 1 entry; do NOT remove or alter its coords —
+# the smoke test pins them. The remaining 19 entries are additive.
 _RESOLVE_GENE_TO_LOCUS: dict[str, tuple[str, int, int]] = {
+    # Tier A — canonical CRISPR validation loci (10 genes).
     "BRCA1": ("chr17", 43044295, 43125483),
+    "BRCA2": ("chr13", 32315086, 32400266),
+    "EMX1":  ("chr2",  72950915, 72952010),
+    "FANCF": ("chr11", 22622352, 22647105),
+    "RNF2":  ("chr1",  185179770, 185279091),
+    "VEGFA": ("chr6",  43770209, 43795797),
+    "HBB":   ("chr11", 5225464, 5229395),
+    "TP53":  ("chr17", 7668421, 7687490),
+    "ATM":   ("chr11", 108222484, 108369102),
+    "MYC":   ("chr8",  127736231, 127741434),
+    # Tier C — screen-essential / disease-relevant (8 genes).
+    "CCR5":  ("chr3",  46370154, 46376206),
+    "CD33":  ("chr19", 51225956, 51235170),
+    "CXCR4": ("chr2",  136114349, 136118149),
+    "KRAS":  ("chr12", 25205246, 25250929),
+    "TET2":  ("chr4",  105146876, 105279816),
+    "RUNX1": ("chr21", 34787800, 36054533),
+    "DNMT1": ("chr19", 10133345, 10194977),
+    "HPRT1": ("chrX",  134460164, 134500668),
+    # Tier D — safe-harbor / utility loci (2 genes).
+    "AAVS1": ("chr19", 55115750, 55117600),
+    "CFTR":  ("chr7",  117480025, 117668665),
 }
 
 
@@ -152,14 +186,14 @@ def resolve_target(
     genome: str,
     fasta_path: Path | str,
 ) -> ResolvedTarget:
-    """Resolve a gene symbol (Tier 1: Mode A only) to a chromosome slice.
+    """Resolve a gene symbol or ``chr:start-end`` target to a chromosome slice.
 
     Parameters
     ----------
     target:
-        The gene symbol, e.g. ``"BRCA1"``. Mode A from PRD §3.1.
-        Mode B (chr17:43044295-43125483 coordinate strings) and
-        Mode C (`--target-fasta`) are deferred to follow-up agents.
+        The gene symbol, e.g. ``"BRCA1"`` (Mode A), or a coordinate
+        target like ``"chr17:43044295-43125483"`` (Mode B). Coordinates
+        are interpreted as 1-based inclusive, with commas allowed.
     genome:
         Reference build identifier. Tier 1: only ``"GRCh38"`` is
         accepted; other values raise ValueError.
@@ -177,6 +211,16 @@ def resolve_target(
         raise ValueError(
             f"genome must be 'GRCh38' (Tier 1); got {genome!r}. "
             "Other builds land in a follow-up agent."
+        )
+    coord = _parse_coordinate_target(target)
+    if coord is not None:
+        chrom, one_start, one_end = coord
+        return resolve_coordinate_target(
+            chrom=chrom,
+            one_based_start=one_start,
+            one_based_end=one_end,
+            fasta_path=fasta_path,
+            label=target,
         )
     sym = target.upper()
     if sym not in _RESOLVE_GENE_TO_LOCUS:
@@ -201,6 +245,61 @@ def resolve_target(
         end=zero_end,
         sequence=seq,
     )
+
+
+def resolve_coordinate_target(
+    *,
+    chrom: str,
+    one_based_start: int,
+    one_based_end: int,
+    fasta_path: Path | str,
+    label: str | None = None,
+) -> ResolvedTarget:
+    """Resolve Mode B coordinates to a chromosome slice.
+
+    Coordinates are 1-based inclusive at the user boundary and converted
+    to the internal 0-based half-open convention.
+    """
+    if one_based_start < 1 or one_based_end < one_based_start:
+        raise ValueError(
+            "coordinate target must satisfy 1 <= start <= end; got "
+            f"{chrom}:{one_based_start}-{one_based_end}"
+        )
+    zero_start = one_based_start - 1
+    zero_end = one_based_end
+    seq = slice_chrom_from_fasta(
+        fasta_path=Path(fasta_path),
+        chrom=chrom,
+        start=zero_start,
+        end=zero_end,
+    )
+    return ResolvedTarget(
+        gene=label or f"{chrom}:{one_based_start}-{one_based_end}",
+        chrom=chrom,
+        start=zero_start,
+        end=zero_end,
+        sequence=seq,
+    )
+
+
+def _parse_coordinate_target(target: str) -> tuple[str, int, int] | None:
+    chrom, sep, region = target.partition(":")
+    if not sep:
+        return None
+    start_s, dash, end_s = region.partition("-")
+    if not dash or not chrom or not start_s or not end_s:
+        raise ValueError(
+            "coordinate target must be chr:start-end, e.g. "
+            "chr17:43044295-43125483"
+        )
+    try:
+        start = int(start_s.replace(",", ""))
+        end = int(end_s.replace(",", ""))
+    except ValueError as exc:
+        raise ValueError(
+            f"coordinate target has non-integer bounds: {target!r}"
+        ) from exc
+    return chrom, start, end
 
 
 def resolve_target_fasta(

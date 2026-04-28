@@ -1311,7 +1311,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_c_design = sub_crispr.add_parser(
         "design",
         help=(
-            "Enumerate candidate guides for a target gene, score on/off-"
+            "Enumerate candidate guides for a gene, coordinate range, or FASTA target, score on/off-"
             "target activity, and emit a ranked TSV."
         ),
     )
@@ -1319,9 +1319,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--target",
         required=True,
         help=(
-            "Gene symbol (Mode A; PRD §3.1). Tier 1: BRCA1 is the only "
-            "gene wired into the resolver. With --target-fasta, this is "
-            "only the output label."
+            "Gene symbol (Mode A), 1-based inclusive coordinate range "
+            "(Mode B, e.g. chr17:43044295-43125483), or, with "
+            "--target-fasta, only the output label."
         ),
     )
     p_c_design.add_argument(

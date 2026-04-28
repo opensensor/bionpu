@@ -354,3 +354,61 @@ def test_target_fasta_json_cli_mode(tmp_path, capsys) -> None:
     assert payload["target"]["start"] == 0
     assert payload["ranked"]
     assert payload["ranked"][0]["guide_seq"]
+
+
+def test_coordinate_target_resolves_1_based_inclusive(tmp_path) -> None:
+    """Mode B coordinates use common 1-based inclusive input."""
+    chrom = "coord_chr"
+    prefix = "TTTT"
+    target = "AAGCTGAAACATTCATTAGGTGG" + ("ACGT" * 20)
+    fasta = tmp_path / "coord.fa"
+    fasta.write_text(f">{chrom}\n{prefix}{target}CCCC\n", encoding="ascii")
+
+    resolved = cd.resolve_target(
+        target=f"{chrom}:5-{4 + len(target)}",
+        genome="GRCh38",
+        fasta_path=fasta,
+    )
+
+    assert resolved.gene == f"{chrom}:5-{4 + len(target)}"
+    assert resolved.chrom == chrom
+    assert resolved.start == 4
+    assert resolved.end == 4 + len(target)
+    assert resolved.sequence == target
+
+
+def test_coordinate_target_cli_json_mode(tmp_path, capsys) -> None:
+    """CLI accepts Mode B coordinate targets against a provided FASTA."""
+    from bionpu.cli import main
+
+    chrom = "coord_chr"
+    prefix = "TTTT"
+    target = "AAGCTGAAACATTCATTAGGTGG" + ("ACGT" * 20)
+    fasta = tmp_path / "coord.fa"
+    fasta.write_text(f">{chrom}\n{prefix}{target}CCCC\n", encoding="ascii")
+
+    rc = main(
+        [
+            "crispr",
+            "design",
+            "--target",
+            f"{chrom}:5-{4 + len(target)}",
+            "--genome",
+            "GRCh38",
+            "--fasta",
+            str(fasta),
+            "--top",
+            "3",
+            "--device",
+            "cpu",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["target"]["chrom"] == chrom
+    assert payload["target"]["start"] == 4
+    assert payload["target"]["end"] == 4 + len(target)
+    assert payload["ranked"]

@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0.0",
+  "kernel_name": "bionpu_kmer_count",
+  "target": "aie2p",
+  "compiler": "peano",
+  "build_date": "2026-04-28T08:11:13Z",
+  "host": "matteius-ProArt-P16-H7606WI",
+  "hardware_signature": "x86_64;Ryzen-AI-9-HX-370;npu=AIE2P;6x8",
+  "generated_at_iso8601": "2026-04-28T08:11:13Z",
+  "interface_contract": "state/kmer_count_interface_contract.md",
+  "supported_k": [15, 21, 31],
+  "supported_n_tiles": [1, 2, 4, 8]
+}

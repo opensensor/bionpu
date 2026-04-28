@@ -1,0 +1,14 @@
+# gaps.yaml — toolchain-gap report (k-mer counting kernel).
+# Schema: bionpu/report/gaps.schema.json (v1.0.0).
+# Convention: bionpu/kernels/GAPS-CONVENTION.md.
+# Per state/kmer_count_interface_contract.md (T1) — schema header pinned.
+
+schema_version: "1.0.0"
+task_id: ""
+kernel_name: "bionpu_kmer_count"
+target: "aie2p"
+compiler: "peano"
+build_date: "2026-04-28T00:00:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+
+gaps: []

@@ -55,6 +55,10 @@ from bionpu.genomics.seed_extend.index import (
     load_index,
     save_index,
 )
+from bionpu.genomics.seed_extend.chain import (
+    SeedChain,
+    chain_seed_hits,
+)
 from bionpu.genomics.seed_extend.lookup import (
     SeedHit,
     query_to_seeds,
@@ -64,11 +68,13 @@ from bionpu.genomics.seed_extend.lookup import (
 
 __all__ = [
     "MinimapIndex",
+    "SeedChain",
     "SeedExtractionResult",
     "SeedExtractor",
     "SeedHit",
     "build_minimap2_index",
     "build_minimap2_index_from_packed",
+    "chain_seed_hits",
     "load_index",
     "query_to_seeds",
     "query_to_seeds_from_minimizers",

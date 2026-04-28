@@ -50,6 +50,7 @@ from bionpu.genomics.seed_extend import (
     SeedHit,
     build_minimap2_index,
     build_minimap2_index_from_packed,
+    chain_seed_hits,
     load_index,
     query_to_seeds_from_minimizers,
     save_index,
@@ -199,6 +200,47 @@ def test_seed_extractor_constructor_validation() -> None:
     # No index AND no k/w
     with pytest.raises(ValueError, match="prebuilt index or both k\\+w"):
         SeedExtractor(None)
+
+
+def test_chain_seed_hits_keeps_colinear_anchors() -> None:
+    """Host-side chaining groups increasing seed hits on one diagonal."""
+    seeds = [
+        SeedHit(query_pos=10, ref_pos=100, strand=0, canonical=1),
+        SeedHit(query_pos=30, ref_pos=120, strand=0, canonical=2),
+        SeedHit(query_pos=50, ref_pos=140, strand=0, canonical=3),
+        SeedHit(query_pos=12, ref_pos=900, strand=0, canonical=4),
+    ]
+
+    chains = chain_seed_hits(seeds, max_diag_gap=2, min_chain_score=2)
+
+    assert len(chains) == 1
+    chain = chains[0]
+    assert chain.score == 3
+    assert chain.n_seeds == 3
+    assert chain.query_start == 10
+    assert chain.query_end == 50
+    assert chain.ref_start == 100
+    assert chain.ref_end == 140
+    assert chain.diagonal == 90
+    assert [hit.canonical for hit in chain.seeds] == [1, 2, 3]
+
+
+def test_chain_seed_hits_splits_large_diagonal_jumps() -> None:
+    """Anchors with incompatible diagonals form separate chains."""
+    seeds = [
+        SeedHit(query_pos=0, ref_pos=100, strand=0, canonical=1),
+        SeedHit(query_pos=20, ref_pos=120, strand=0, canonical=2),
+        SeedHit(query_pos=40, ref_pos=500, strand=0, canonical=3),
+        SeedHit(query_pos=60, ref_pos=520, strand=0, canonical=4),
+    ]
+
+    chains = chain_seed_hits(seeds, max_diag_gap=4, min_chain_score=2)
+
+    assert len(chains) == 2
+    assert [(c.query_start, c.ref_start, c.score) for c in chains] == [
+        (0, 100, 2),
+        (40, 500, 2),
+    ]
 
 
 # --------------------------------------------------------------------- #

@@ -122,6 +122,33 @@ ffn1:
 ffn2:
 	$(MAKE) NPU2=$(NPU2) M=47 K=3072 N=768 V=ffn2 all
 
+# ─── BERT-mini hidden=256 variants (PRD-dnabert-epi step 0.3b) ─────
+# qkvo at hidden=256 reuses K_CHUNK=8 (256 / 8 = 32 chunks) and the
+# qkvo IRON Python lowering verbatim — only M/K/N change.
+qkvo_h256:
+	$(MAKE) NPU2=$(NPU2) M=47 K=256 N=256 V=qkvo_h256 all
+
+# ffn1/ffn2 at hidden=256 emit the qkvo-sized 256-output group kernel;
+# host dispatch streams the larger FFN weight matrix in row-major
+# 256-output groups (ffn1 -> 4 groups; ffn2 -> 1 group).
+ffn1_h256:
+	$(MAKE) NPU2=$(NPU2) M=47 K=256 N=256 V=ffn1_h256 all
+
+ffn2_h256:
+	$(MAKE) NPU2=$(NPU2) M=47 K=256 N=256 V=ffn2_h256 all
+
+# ─── Per-head matmul shapes for step 0.3b composition ──────────────
+# Q·Kᵀ per head: (M=47, K=64, N=47). K=64 satisfies K%K_CHUNK==0.
+# scores·V per head: (M=47, K=47, N=64). K=47 violates the qkvo
+# K%K_CHUNK==0 contract — see SCOPE-1 design note (option C K-pad).
+# Both targets currently build only the head-style single-tile entry
+# point so the .o exposes `bert_int8_matmul_47` / `bert_int8_matmul_64`.
+qkt_head:
+	$(MAKE) NPU2=$(NPU2) M=47 K=64 N=47 V=qkt all
+
+sv_head:
+	$(MAKE) NPU2=$(NPU2) M=47 K=47 N=64 V=sv all
+
 # Regenerate qkvo silicon-byte-equal reference fixtures (xs.bin, w.bin,
 # y_qkvo_ref.bin) from the canonical Python packers + emulator. Use after
 # K_CHUNK or shape changes invalidate the on-disk fixtures (cf. commit
@@ -131,4 +158,5 @@ SEED ?= 42
 qkvo-refs:
 	python3 $(srcdir)/regen_qkvo_refs.py --seed $(SEED) --output-dir $(srcdir)
 
-.PHONY: all clean qkvo ffn1 ffn2 qkvo-refs
+.PHONY: all clean qkvo ffn1 ffn2 qkvo-refs \
+        qkvo_h256 ffn1_h256 ffn2_h256 qkt_head sv_head

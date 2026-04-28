@@ -398,9 +398,16 @@ def emit_mlir(
     else:
         raise ValueError(f"unknown device target: {target!r}")
 
+    # Step 0.3b adds BERT-mini hidden=256 variants. They reuse the
+    # qkvo lowering verbatim — only M/K/N differ. The variant suffix
+    # is just an artifact-dir disambiguator and a host-side shape
+    # contract; the emitted MLIR is identical to a pure qkvo at the
+    # same shape. ffn{1,2}_h256 emit the qkvo-sized 256-output group
+    # kernel; host dispatch streams the larger FFN weight matrix in
+    # row-major 256-output groups.
     if variant == "head":
         return emit_mlir_head(M=M, K=K, N=N, dev=dev)
-    elif variant == "qkvo":
+    elif variant in ("qkvo", "qkvo_h256"):
         return emit_mlir_qkvo(M=M, K=K, N=N, K_CHUNK=K_CHUNK, dev=dev)
     elif variant in ("ffn1", "ffn2"):
         if N != 768:
@@ -410,10 +417,19 @@ def emit_mlir(
                 f"got N={N}"
             )
         return emit_mlir_qkvo(M=M, K=K, N=N, K_CHUNK=K_CHUNK, dev=dev)
+    elif variant in ("ffn1_h256", "ffn2_h256"):
+        if N != 256:
+            raise ValueError(
+                f"{variant} lowering emits one DDR-streamed 256-output "
+                f"group per dispatch; pass N=256 for the group kernel, "
+                f"got N={N}"
+            )
+        return emit_mlir_qkvo(M=M, K=K, N=N, K_CHUNK=K_CHUNK, dev=dev)
     else:
         raise ValueError(
             f"unknown variant: {variant!r} "
-            f"(expected 'head', 'qkvo', 'ffn1', or 'ffn2')"
+            f"(expected 'head', 'qkvo', 'ffn1', 'ffn2', "
+            f"'qkvo_h256', 'ffn1_h256', or 'ffn2_h256')"
         )
 
 
@@ -423,7 +439,15 @@ def main():
     p.add_argument("--M", type=int, default=47)
     p.add_argument("--K", type=int, default=768)
     p.add_argument("--N", type=int, default=2)
-    p.add_argument("--variant", choices=["head", "qkvo", "ffn1", "ffn2"], default="head")
+    p.add_argument(
+        "--variant",
+        choices=[
+            "head",
+            "qkvo", "ffn1", "ffn2",
+            "qkvo_h256", "ffn1_h256", "ffn2_h256",
+        ],
+        default="head",
+    )
     p.add_argument("--K-chunk", type=int, default=8,
                    help="K-axis chunk size for qkvo/ffn variants (default 8).")
     args = p.parse_args()

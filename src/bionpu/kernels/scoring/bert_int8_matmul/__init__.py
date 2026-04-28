@@ -148,6 +148,99 @@ def _pad_bytes(payload: bytes, size: int) -> bytes:
     return payload + bytes(size - len(payload))
 
 
+# ─── Activation quantization helpers (step 0.3d) ─────────────────────
+#
+# Step 0.3d (PRD-dnabert-epi v0.1.5 §1.5) host-side fix for the two
+# activations whose per-tensor symmetric INT8 scale collapses their
+# distribution: softmax-output (sparse, one peak per row → per-token
+# scale preserves the soft-attention tail) and GELU-output (long-tailed
+# outliers compress the bulk → 99.9th percentile clip preserves bulk
+# resolution). Both are pure numpy; no kernel changes required because
+# the silicon's i32 accumulator is independent of the input scale and
+# the host re-applies the per-row dequant after the kernel completes.
+
+
+def quantise_per_token_sym_int8(
+    x_fp: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Per-token (per-row) symmetric INT8 quantisation of a 2D activation.
+
+    Each row of ``x_fp`` is quantised against its own max-abs, so a
+    sparse softmax row whose peak is 0.99 and whose tail is ~1e-3 keeps
+    full INT8 resolution on the tail; whereas the per-tensor variant
+    would scale the entire tensor against the global max (~1) and
+    collapse the tail to a single INT8 bin.
+
+    Args:
+        x_fp: ``(M, K)`` float32 activation.
+
+    Returns:
+        Tuple of:
+          * ``x_int8`` — ``(M, K)`` int8, each row independently scaled.
+          * ``scale_x_per_row`` — ``(M,)`` float32, scale_x[m] = max(|x_fp[m]|) / 127.
+          * ``scale_x_unif`` — float, ``max(scale_x_per_row)``. Used as
+            the unified ``scale_x`` for the kernel's ``scales_combined``
+            so the saturation budget is sized for the worst-case row.
+
+    Dequant convention (mirrored in the BertMiniBlock helpers):
+
+      ``y_fp[m, n] = y_int8[m, n] * scale_y * (scale_x_per_row[m] / scale_x_unif)``
+
+    Derivation: the silicon computes
+    ``y_int8[m, n] = sat(round(int_acc[m, n] * sc_comb[n]))``; the host
+    sets ``sc_comb[n] = scale_x_unif * scale_w[n] / scale_y``, so
+    ``int_acc[m, n] ≈ y_int8[m, n] * scale_y / (scale_x_unif * scale_w[n])``.
+    Since the underlying FP product is
+    ``y_fp[m, n] = scale_x_per_row[m] * scale_w[n] * int_acc[m, n]``,
+    substituting gives the formula above. When all rows share the same
+    scale, this degenerates to the per-tensor case
+    (``scale_x_per_row[m] / scale_x_unif == 1``).
+    """
+    x_fp = np.ascontiguousarray(x_fp, dtype=np.float32)
+    if x_fp.ndim != 2:
+        raise ValueError(f"quantise_per_token_sym_int8: expected 2D, got {x_fp.shape}")
+    row_max = np.maximum(np.abs(x_fp).max(axis=1), 1e-12)  # (M,)
+    scale_x_per_row = (row_max / 127.0).astype(np.float32)
+    x_int8 = np.clip(
+        np.round(x_fp / scale_x_per_row[:, None]),
+        -128, 127,
+    ).astype(np.int8)
+    scale_x_unif = float(scale_x_per_row.max())
+    return x_int8, scale_x_per_row, scale_x_unif
+
+
+def quantise_per_tensor_percentile_sym_int8(
+    x_fp: np.ndarray,
+    *,
+    percentile: float = 99.9,
+) -> tuple[np.ndarray, float]:
+    """Per-tensor symmetric INT8 quantisation using a percentile clip.
+
+    Replaces ``max(|x|)`` with ``np.percentile(|x|, percentile)`` so a
+    single GELU outlier doesn't compress the bulk distribution to a
+    handful of INT8 bins. Values beyond the percentile are clipped at
+    ``±127``; we trade tail-clipping (a few bf16-precision-bounded
+    elements) for ~3-10× better resolution on the bulk distribution.
+
+    Args:
+        x_fp: float32 array of any shape.
+        percentile: percentile of |x| used as the upper magnitude.
+            99.9 by default — clamps roughly 0.1% of elements at most.
+
+    Returns:
+        Tuple of (x_int8, scale_x). ``x_int8`` clipped+rounded; values
+        whose absolute value exceeds the percentile are saturated to
+        ``±127`` instead of mapping to overflow values.
+    """
+    x_fp = np.ascontiguousarray(x_fp, dtype=np.float32)
+    abs_x = np.abs(x_fp)
+    clip_mag = float(np.percentile(abs_x, percentile))
+    clip_mag = max(clip_mag, 1e-12)
+    scale = clip_mag / 127.0
+    x_int8 = np.clip(np.round(x_fp / scale), -128, 127).astype(np.int8)
+    return x_int8, float(scale)
+
+
 def _pack_head_ws(w: np.ndarray, scales_combined: np.ndarray) -> bytes:
     size = _round4(_HEAD_N * _K + (_HEAD_N + 1) * 4)
     return _pad_bytes(w.tobytes() + scales_combined.tobytes(), size)

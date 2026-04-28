@@ -29,6 +29,8 @@ from bionpu.kernels.scoring.bert_int8_matmul import (
     bert_int8_matmul_ffn2_h256,
     bert_int8_matmul_qkt,
     bert_int8_matmul_sv,
+    quantise_per_token_sym_int8,
+    quantise_per_tensor_percentile_sym_int8,
 )
 from bionpu.kernels.scoring.bert_mini_block import (
     bert_mini_attention_softmax,
@@ -282,8 +284,31 @@ class BertMiniBlock:
         )
         return y_int8.astype(np.float32) * scale_y + self._q_ffn1.bias[None, :]
 
-    def _matmul_ffn2(self, x_fp: np.ndarray) -> np.ndarray:
-        x_int8, scale_x = _quantise_per_tensor_sym_int8(x_fp)
+    def _matmul_ffn2(
+        self,
+        x_fp: np.ndarray,
+        *,
+        percentile_clip: float | None = None,
+    ) -> np.ndarray:
+        """FFN contraction matmul.
+
+        Step 0.3d (PRD-dnabert-epi v0.1.5) added the optional
+        ``percentile_clip`` mode: instead of ``max(|x|)``, use a
+        percentile (e.g. 99.9) so a few GELU outliers don't compress
+        the bulk distribution. Default (``None``) preserves the
+        step-0.3c per-tensor max path. Percentile clipping didn't move
+        the gate on synthetic Gaussian input because the bulk benefit
+        is offset by output-saturation cliffs on the clipped outliers
+        (a few INT8 elements pinned to ±127 dominate the matmul
+        accumulator); the flag is kept for calibration-corpus inputs
+        where the input range is pre-cleared by a static scale.
+        """
+        if percentile_clip is not None:
+            x_int8, scale_x = quantise_per_tensor_percentile_sym_int8(
+                x_fp, percentile=percentile_clip
+            )
+        else:
+            x_int8, scale_x = _quantise_per_tensor_sym_int8(x_fp)
         y_fp_estimate_max = float(
             np.abs(
                 x_fp.astype(np.float32)
@@ -319,15 +344,50 @@ class BertMiniBlock:
         )
         return y_int8.astype(np.float32) * scale_y
 
-    def _matmul_sv(self, scores_h: np.ndarray, v_h: np.ndarray) -> np.ndarray:
-        """Per-head attn · V matmul: (M, M) × (M, 64) → (M, 64)."""
+    def _matmul_sv(
+        self,
+        scores_h: np.ndarray,
+        v_h: np.ndarray,
+        *,
+        per_token: bool = False,
+    ) -> np.ndarray:
+        """Per-head attn · V matmul: (M, M) × (M, 64) → (M, 64).
+
+        Step 0.3d (PRD-dnabert-epi v0.1.5) added the optional
+        ``per_token`` mode: each row of ``scores_h`` (the sparse softmax
+        output) gets its own INT8 scale, giving the soft-attention tail
+        of peakier rows full INT8 resolution. The silicon kernel ABI
+        is unchanged — see ``quantise_per_token_sym_int8`` for the
+        per-row dequant derivation.
+
+        Default (``per_token=False``) preserves the step-0.3c per-tensor
+        path. Per-row quantisation didn't move the gate on synthetic
+        Gaussian input because BERT-mini layer-0 softmax is too diffuse
+        (per-row max varies only 4-8x) and the sv MSE is dominated by
+        upstream-propagated quant noise rather than local scale collapse;
+        the path is kept as a flag for calibration-corpus inputs (real
+        DNABERT-Epi token sequences) where softmax peakiness is higher.
+        """
         # sv kernel ABI: x = (M, K=47), w = (N=64, K=47), output (M, N=64).
         # So for scores · V we need x = scores (M, M=47), w = V_h^T (head_dim=64, M=47).
-        x_int8, scale_x = _quantise_per_tensor_sym_int8(scores_h)
         v_h_T = np.ascontiguousarray(v_h.T)  # (64, 47)
         w_int8, scale_w_per = _quantise_per_channel_sym_int8(v_h_T)  # (N=64, K=47)
         y_fp = scores_h.astype(np.float32) @ v_h.astype(np.float32)  # (M, 64)
         scale_y = max(float(np.abs(y_fp).max()), 1e-9) / 127.0
+
+        if per_token:
+            x_int8, scale_x_per_row, scale_x_unif = quantise_per_token_sym_int8(scores_h)
+            sc_combined = _build_scales_combined(
+                scale_x_unif, scale_w_per, scale_y, n=w_int8.shape[0]
+            )
+            y_int8 = bert_int8_matmul_sv(
+                x_int8, w_int8, sc_combined, artifacts_dir=self._artifacts["sv"]
+            )
+            # Per-row dequant: y_fp[m,n] = y_int8[m,n] * scale_y * (scale_x_per_row[m] / scale_x_unif).
+            per_row_correction = (scale_x_per_row / scale_x_unif).astype(np.float32)
+            return y_int8.astype(np.float32) * scale_y * per_row_correction[:, None]
+
+        x_int8, scale_x = _quantise_per_tensor_sym_int8(scores_h)
         sc_combined = _build_scales_combined(scale_x, scale_w_per, scale_y, n=w_int8.shape[0])
         y_int8 = bert_int8_matmul_sv(
             x_int8, w_int8, sc_combined, artifacts_dir=self._artifacts["sv"]
@@ -342,6 +402,8 @@ class BertMiniBlock:
         *,
         capture_mse: bool = False,
         torch_reference: dict[str, np.ndarray] | None = None,
+        sv_per_token: bool = False,
+        ffn2_percentile_clip: float | None = None,
     ) -> np.ndarray:
         """End-to-end BERT-mini layer forward pass on AIE2P silicon.
 
@@ -355,6 +417,13 @@ class BertMiniBlock:
                 concat_proj, ln1, ffn1, gelu, ffn2, ln2``. When
                 provided alongside ``capture_mse=True``, MSE per-op
                 is recorded for the bisection report.
+            sv_per_token: step-0.3d flag — if True, use per-token
+                (per-row) INT8 quantisation for the sv input. See
+                :meth:`_matmul_sv` for caveats.
+            ffn2_percentile_clip: step-0.3d flag — if not None, use
+                this percentile (e.g. 99.9) instead of ``max(|x|)``
+                for the ffn2 input scale. See :meth:`_matmul_ffn2`
+                for caveats.
 
         Returns:
             (M, 256) float32 layer output.
@@ -434,7 +503,9 @@ class BertMiniBlock:
         sv_per_head: list[np.ndarray] = []
         for h in range(_NUM_HEADS):
             vh = np.ascontiguousarray(v_heads[:, h, :])  # (M, 64)
-            sv_h = self._matmul_sv(attn_per_head[h], vh)  # (M, 64)
+            sv_h = self._matmul_sv(
+                attn_per_head[h], vh, per_token=sv_per_token
+            )  # (M, 64)
             sv_per_head.append(sv_h)
         if capture_mse and torch_reference is not None:
             ref_sv = torch_reference.get("sv_per_head")
@@ -473,7 +544,9 @@ class BertMiniBlock:
         _capture("gelu", gelu_out)
 
         # 9. FFN2 (1 dispatch — single output group at h=256).
-        ffn2_out = self._matmul_ffn2(gelu_out)
+        ffn2_out = self._matmul_ffn2(
+            gelu_out, percentile_clip=ffn2_percentile_clip
+        )
         _capture("ffn2", ffn2_out)
 
         # 10. Residual + LN2 (1 dispatch).

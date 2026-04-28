@@ -31,7 +31,7 @@ from bionpu.kernels.genomics.primer_scan import (
     TRUSEQ_P5_ADAPTER,
 )
 
-from .trimmer import trim_fastq
+from .trimmer import DEFAULT_BATCH_SIZE, trim_fastq, trim_fastq_batched
 
 __all__ = ["build_parser", "main", "run_cli"]
 
@@ -85,6 +85,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             f"NPU tile fan-out (ignored on --device cpu). Default: 4. "
             f"Allowed: {list(SUPPORTED_N_TILES)}."
+        ),
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=(
+            f"v1 batched-dispatch size: pack N reads into a single NPU "
+            f"dispatch (sentinel-separated stream, Path B). N=1 reproduces "
+            f"v0 per-record dispatch (slow). Default: {DEFAULT_BATCH_SIZE}. "
+            f"Ignored on --device cpu."
         ),
     )
     p.add_argument(
@@ -156,14 +167,34 @@ def run_cli(args: argparse.Namespace) -> int:
 
     progress = _make_progress_callback(args.no_progress or args.quiet)
 
-    try:
-        stats = trim_fastq(
-            args.in_path,
-            args.out_path,
-            adapter=args.adapter,
-            op=op,
-            progress=progress,
+    batch_size = int(getattr(args, "batch_size", DEFAULT_BATCH_SIZE))
+    if batch_size < 1:
+        print(
+            f"bionpu trim: --batch-size must be >= 1; got {batch_size}",
+            file=sys.stderr,
         )
+        return 2
+
+    try:
+        if op is not None and batch_size > 1:
+            stats = trim_fastq_batched(
+                args.in_path,
+                args.out_path,
+                adapter=args.adapter,
+                op=op,
+                batch_size=batch_size,
+                progress=progress,
+            )
+        else:
+            # CPU path or batch_size==1: fall back to the unbatched
+            # iterator (v0 byte-equal).
+            stats = trim_fastq(
+                args.in_path,
+                args.out_path,
+                adapter=args.adapter,
+                op=op,
+                progress=progress,
+            )
     except FileNotFoundError as exc:
         print(f"bionpu trim: {exc}", file=sys.stderr)
         return 2

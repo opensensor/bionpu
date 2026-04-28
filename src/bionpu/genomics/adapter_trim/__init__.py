@@ -43,15 +43,22 @@ RC matches from the silicon kernel are explicitly discarded — cutadapt
 from __future__ import annotations
 
 from .fastq import FastqRecord, open_fastq, parse_fastq, write_fastq
-from .trimmer import TrimStats, trim_fastq
+from .trimmer import (
+    DEFAULT_BATCH_SIZE,
+    TrimStats,
+    trim_fastq,
+    trim_fastq_batched,
+)
 
 __all__ = [
+    "DEFAULT_BATCH_SIZE",
     "FastqRecord",
     "TrimStats",
     "bionpu_trim_main",
     "open_fastq",
     "parse_fastq",
     "trim_fastq",
+    "trim_fastq_batched",
     "write_fastq",
 ]
 

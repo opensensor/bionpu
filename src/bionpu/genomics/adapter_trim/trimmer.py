@@ -51,8 +51,32 @@ from .fastq import FastqRecord, open_fastq, parse_fastq, write_fastq
 __all__ = [
     "TrimStats",
     "trim_fastq",
+    "trim_fastq_batched",
     "trim_records",
+    "trim_records_batched",
 ]
+
+
+# v1 batched-dispatch defaults.
+# Sentinel = run of all-T bases between concatenated reads. The TruSeq P5
+# adapter (and every other pinned 13/20/25-bp Illumina adapter we ship)
+# contains zero T bases, so a 16-base run of T can never form an adapter
+# match. For multi-adapter v2 work, the sentinel must be re-chosen to be
+# disjoint from EVERY pinned adapter.
+_SENTINEL_BASE = "T"
+_SENTINEL_LEN = 16
+_SENTINEL_STR = _SENTINEL_BASE * _SENTINEL_LEN
+
+#: Default reads-per-dispatch for the batched silicon path.
+#
+# Sized to clear the v1 throughput gate (>=5K reads/s on the 10K fixture)
+# given the measured ~102 ms per-dispatch floor. At B=1024:
+#   * 10K-read sweep: ~5.9K reads/s (>= 5K gate; ~600x v0).
+#   * 100-read sweep: 1 dispatch covers the whole input.
+# B=4096 reaches ~11K reads/s but the silicon-time-per-dispatch starts
+# climbing (124 us/dispatch); 1024 sits in the sweet spot. Override via
+# the --batch-size CLI flag when tuning for stretch throughput.
+DEFAULT_BATCH_SIZE: int = 1024
 
 
 # Set used to test "is this read pure ACGT?"
@@ -245,6 +269,295 @@ def trim_fastq(
             parse_fastq(fin),
             adapter=adapter,
             op=op,
+            progress=progress,
+            stats=stats,
+        ):
+            write_fastq(fout, trimmed)
+    stats.wall_s = time.perf_counter() - t0
+    return stats
+
+
+# --------------------------------------------------------------------------- #
+# v1 — batched dispatch (Path B: sentinel-separated stream).
+#
+# Algorithm
+# ---------
+# 1. Buffer up to ``batch_size`` consecutive FASTQ records.
+# 2. Partition the batch into:
+#      * silicon batch: pure-ACGT reads of length >= P
+#      * cpu batch: reads that fail either gate (CPU-oracle path)
+#    Each input record's index is preserved so the output order matches
+#    the input order verbatim.
+# 3. For the silicon batch, build a single concatenated sequence:
+#        read_0 + sentinel + read_1 + sentinel + ... + read_{K-1}
+#    where the sentinel is ``_SENTINEL_STR`` (16 bp of all-T). Pack the
+#    full string with ``pack_dna_2bit`` and dispatch ``op`` ONCE.
+# 4. The kernel returns ``[(global_pos, strand), ...]``. Map each match
+#    back to ``(read_idx, in_read_pos)`` using the per-read base offsets
+#    we recorded in step 3. Drop:
+#        * RC-strand matches (cutadapt -a is forward-only).
+#        * Matches whose ``[global_pos, global_pos + P)`` interval is
+#          NOT fully contained inside a single read body (i.e. they
+#          straddle a sentinel — impossible-by-construction for an all-T
+#          sentinel and a no-T adapter, but cheap to enforce as belt+
+#          suspenders for v2).
+# 5. For each silicon record, take the leftmost surviving match (if any)
+#    as the trim position. CPU-batch reads use the existing oracle path.
+# 6. Emit the trimmed records in original input order.
+#
+# Why Path B over Path A
+# ----------------------
+# Path A (per-read length-prefix header) requires kernel-side iteration
+# over a K-read manifest, which would mean editing the locked
+# primer_scan tile / IRON / runner. Path B is purely host-side: the
+# kernel sees one big input and emits global-position records, which
+# is exactly what it already does today. Zero kernel/IRON changes.
+# --------------------------------------------------------------------------- #
+
+
+def _build_concat_silicon_input(
+    seqs: list[str],
+) -> tuple[np.ndarray, list[int], int]:
+    """Build the concatenated 2-bit-packed input for a silicon batch.
+
+    Args:
+        seqs: list of pure-ACGT sequences. All entries must already be
+            uppercase ACGT.
+
+    Returns:
+        ``(packed, read_base_offsets, total_concat_bases)`` where
+        ``packed`` is the 2-bit MSB-first packed buffer for the
+        concatenated sequence and ``read_base_offsets[i]`` is the global
+        base offset (in the concatenated stream) at which read ``i``
+        starts. ``total_concat_bases`` is the length of the concatenated
+        sequence in bases; the post-last-read sentinel is omitted (the
+        sentinel only sits BETWEEN reads).
+    """
+    parts: list[str] = []
+    offsets: list[int] = []
+    cursor = 0
+    for i, s in enumerate(seqs):
+        if i > 0:
+            parts.append(_SENTINEL_STR)
+            cursor += _SENTINEL_LEN
+        offsets.append(cursor)
+        parts.append(s)
+        cursor += len(s)
+    if not parts:
+        return np.zeros(0, dtype=np.uint8), [], 0
+    concat = "".join(parts)
+    packed = pack_dna_2bit(concat)
+    return packed, offsets, cursor
+
+
+def _silicon_batch_dispatch(
+    seqs: list[str],
+    primer: str,
+    op,  # BionpuPrimerScan
+) -> tuple[list[int | None], float]:
+    """Dispatch ``op`` once on a concatenated silicon batch and return
+    the per-read leftmost forward-strand match position (or ``None``).
+
+    Returns ``(match_positions, dispatch_us)`` where ``match_positions``
+    is a list of length ``len(seqs)``.
+    """
+    if not seqs:
+        return [], 0.0
+    packed, offsets, _ = _build_concat_silicon_input(seqs)
+    t0 = time.perf_counter()
+    matches = op(packed_seq=packed)
+    dispatch_us = (time.perf_counter() - t0) * 1e6
+
+    # Pre-compute per-read [start, end) intervals (inclusive of read body
+    # only; sentinels are between consecutive reads). A match [pos, pos+P)
+    # is valid for read i iff offsets[i] <= pos AND pos + P <= offsets[i] + len(seqs[i]).
+    p = op.p
+    read_starts = offsets
+    read_ends = [offsets[i] + len(seqs[i]) for i in range(len(seqs))]
+
+    # Initialise per-read leftmost match to None.
+    leftmost: list[int | None] = [None] * len(seqs)
+
+    # The kernel's matches are sorted (position asc, strand asc) per the
+    # v0 wire-format pin. We can iterate them in order and binary-search
+    # the read assignment, but linear bookkeeping is simpler and the
+    # records list is bounded by MAX_EMIT_IDX (2046).
+    n = len(seqs)
+    cur_read = 0
+    for pos, strand in matches:
+        if strand != 0:
+            # Forward-strand only (cutadapt -a parity).
+            continue
+        # Advance cur_read until pos falls within or after the cur_read body.
+        while cur_read < n and pos >= read_ends[cur_read]:
+            cur_read += 1
+        if cur_read >= n:
+            break
+        if pos < read_starts[cur_read]:
+            # Match starts inside a sentinel region — by-construction
+            # impossible (sentinel is all-T, adapter has no T), but
+            # filter anyway for v2 safety.
+            continue
+        # Match starts inside read cur_read; verify it ends inside too.
+        if pos + p > read_ends[cur_read]:
+            # Straddles into a sentinel; reject (also impossible for
+            # T-only sentinel + T-free adapter, but kept as belt+brace).
+            continue
+        in_read_pos = pos - read_starts[cur_read]
+        if leftmost[cur_read] is None or in_read_pos < leftmost[cur_read]:
+            leftmost[cur_read] = in_read_pos
+    return leftmost, dispatch_us
+
+
+def trim_records_batched(
+    records: Iterator[FastqRecord],
+    *,
+    adapter: str,
+    op=None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    progress: Callable[[int], None] | None = None,
+    stats: TrimStats | None = None,
+) -> Iterator[FastqRecord]:
+    """Batched-dispatch variant of :func:`trim_records`.
+
+    Buffers ``batch_size`` records at a time, packs them into a single
+    silicon dispatch via the sentinel-separated-stream strategy
+    (Path B), and yields trimmed records in the original input order.
+
+    When ``op is None`` (no NPU available), behaves identically to
+    :func:`trim_records` (per-record CPU-oracle path; ``batch_size``
+    is ignored).
+    """
+    if not adapter:
+        raise ValueError("trim_records_batched: adapter cannot be empty")
+    adapter_upper = adapter.upper()
+    if not _is_pure_acgt(adapter_upper):
+        raise ValueError(
+            f"trim_records_batched: adapter {adapter!r} contains non-ACGT "
+            f"bases; only ACGT is supported in v0."
+        )
+    if batch_size < 1:
+        raise ValueError(
+            f"trim_records_batched: batch_size={batch_size} must be >= 1"
+        )
+
+    if stats is None:
+        stats = TrimStats()
+
+    # If silicon is unavailable, fall straight through to the CPU
+    # iterator (no batching benefit, and avoids double-bookkeeping).
+    if op is None:
+        yield from trim_records(
+            records,
+            adapter=adapter_upper,
+            op=None,
+            progress=progress,
+            stats=stats,
+        )
+        return
+
+    p_len = len(adapter_upper)
+    batch: list[FastqRecord] = []
+
+    def _flush() -> Iterator[FastqRecord]:
+        # Per-batch processing. Two sub-batches (silicon vs cpu) keyed
+        # by index in ``batch`` so we can re-order outputs to match the
+        # input order.
+        n = len(batch)
+        if n == 0:
+            return
+        # Pre-classify and collect silicon inputs.
+        silicon_idxs: list[int] = []
+        silicon_seqs: list[str] = []
+        # Per-record decision:
+        #   match_pos[i] = leftmost forward-strand match position OR None
+        #                  OR -1 sentinel for "pass-through (too short)".
+        # We use Python None for "no match" and store an int otherwise.
+        match_pos: list[int | None] = [None] * n
+        too_short: list[bool] = [False] * n
+        for i, rec in enumerate(batch):
+            seq_upper = rec.seq.upper()
+            if len(seq_upper) < p_len:
+                too_short[i] = True
+                continue
+            if _is_pure_acgt(seq_upper):
+                silicon_idxs.append(i)
+                silicon_seqs.append(seq_upper)
+            else:
+                # CPU-oracle fallback (mirrors v0 per-record fallback).
+                match_pos[i] = _trim_one_read_cpu(seq_upper, adapter_upper)
+                stats.n_cpu_fallback_reads += 1
+
+        # Single silicon dispatch for the whole sub-batch.
+        if silicon_seqs:
+            results, dispatch_us = _silicon_batch_dispatch(
+                silicon_seqs, adapter_upper, op
+            )
+            stats.n_silicon_dispatches += 1
+            stats.silicon_us += dispatch_us
+            for sub_i, idx in enumerate(silicon_idxs):
+                match_pos[idx] = results[sub_i]
+
+        # Emit in input order.
+        for i, rec in enumerate(batch):
+            original_len = len(rec.seq)
+            if too_short[i]:
+                stats.record_trim(original_len, original_len)
+                yield rec
+            elif match_pos[i] is None:
+                stats.record_trim(original_len, original_len)
+                yield rec
+            else:
+                cut = match_pos[i]
+                trimmed_seq = rec.seq[:cut]
+                trimmed_qual = rec.qual[:cut]
+                stats.record_trim(original_len, len(trimmed_seq))
+                yield FastqRecord(
+                    header=rec.header,
+                    seq=trimmed_seq,
+                    qual=trimmed_qual,
+                )
+            if progress is not None and stats.n_reads % 1000 == 0:
+                progress(stats.n_reads)
+
+    for rec in records:
+        batch.append(rec)
+        if len(batch) >= batch_size:
+            yield from _flush()
+            batch = []
+    if batch:
+        yield from _flush()
+
+
+def trim_fastq_batched(
+    in_path: str | os.PathLike[str],
+    out_path: str | os.PathLike[str],
+    *,
+    adapter: str,
+    op=None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    progress: Callable[[int], None] | None = None,
+) -> TrimStats:
+    """Batched-dispatch variant of :func:`trim_fastq`.
+
+    Identical wire-format and trim semantics to :func:`trim_fastq`;
+    differs only in that silicon dispatches process ``batch_size`` reads
+    per ``op`` invocation. The output FASTQ is byte-equal to the
+    unbatched path.
+
+    See :func:`trim_records_batched` for algorithm details.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    stats = TrimStats()
+    t0 = time.perf_counter()
+    with open_fastq(in_path, "r") as fin, open_fastq(out_path, "w") as fout:
+        for trimmed in trim_records_batched(
+            parse_fastq(fin),
+            adapter=adapter,
+            op=op,
+            batch_size=batch_size,
             progress=progress,
             stats=stats,
         ):

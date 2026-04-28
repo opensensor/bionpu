@@ -1286,6 +1286,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="NPU tile fan-out (ignored on --device cpu). Default: 4.",
     )
     p_trim.add_argument(
+        "--batch-size", type=int, default=1024,
+        help=(
+            "v1 batched-dispatch size: pack N reads into a single NPU "
+            "dispatch (Path B sentinel-separated stream). 1 = v0 per-record "
+            "dispatch. Default: 1024 (sized to clear the 5K reads/s gate "
+            "given the ~100ms subprocess-dispatch floor). "
+            "Ignored on --device cpu."
+        ),
+    )
+    p_trim.add_argument(
         "--no-progress", action="store_true",
         help="Suppress periodic progress reports on stderr.",
     )

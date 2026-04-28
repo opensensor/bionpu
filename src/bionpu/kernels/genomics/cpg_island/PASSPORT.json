@@ -1,11 +1,21 @@
 {
+  "schema_version": "1.0.0",
   "kernel_name": "bionpu_cpg_island",
   "version": "v0",
   "target": "aie2p",
-  "algorithm": "Gardiner-Garden CpG island candidate window scan",
+  "compiler": "peano",
+  "algorithm": "Gardiner-Garden & Frommer (1987) sliding-window CpG island detector",
   "window_bases": 200,
   "gc_threshold": "1/2",
   "obs_exp_threshold": "3/5",
   "record_format": "uint32 candidate_window_start",
-  "status": "source-complete; silicon validation pending"
+  "supported_n_tiles": [1, 2, 4, 8],
+  "build_date": "2026-04-28T00:00:00Z",
+  "host": "matteius-ProArt-P16-H7606WI",
+  "hardware_signature": "x86_64;Ryzen-AI-9-HX-370;npu=AIE2P;6x8",
+  "validated_cells": ["bionpu_cpg_island_n4"],
+  "chr22_byte_equal": true,
+  "chr22_n_islands": 1352,
+  "chr22_e2e_wall_s": 3.616,
+  "status": "v0 silicon-validated"
 }

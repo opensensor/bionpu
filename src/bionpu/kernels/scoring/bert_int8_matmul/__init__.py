@@ -438,19 +438,36 @@ def _bert_int8_matmul_ffn(
         group_n=_FFN_GROUP_N,
     )
     w_groups = _pack_grouped_w(np.ascontiguousarray(w), group_n=_FFN_GROUP_N)
-    y_size = _round4(_padded_m(_MAX_M) * expected_n)
-    raw, _, _, _ = default_backend().run_xclbin(
-        xclbin=artifacts_path / "final.xclbin",
-        insts=artifacts_path / "insts.bin",
-        kernel_name="MLIR_AIE",
-        in_buffers=[
-            (xs, _ARG_X),
-            (w_groups, _ARG_WS),
-        ],
-        out_size=y_size,
-        out_arg_index=_ARG_Y,
-    )
-    return _read_row_major(raw, n=expected_n)[: x.shape[0], :].copy()
+
+    # The xclbin's runtime_sequence consumes exactly one _FFN_GROUP_N
+    # output group per launch; iterate host dispatch over groups and
+    # assemble the N-axis output. ffn2 is the degenerate single-group case.
+    n_groups = expected_n // _FFN_GROUP_N
+    m_pad = _padded_m(_MAX_M)
+    y_per_group = _round4(m_pad * _FFN_GROUP_N)
+    xs_bytes_per_group = len(xs) // n_groups
+    w_bytes_per_group = len(w_groups) // n_groups
+
+    y_full = np.zeros((m_pad, expected_n), dtype=np.int8)
+    backend = default_backend()
+    for g in range(n_groups):
+        xs_g = xs[g * xs_bytes_per_group : (g + 1) * xs_bytes_per_group]
+        w_g = w_groups[g * w_bytes_per_group : (g + 1) * w_bytes_per_group]
+        raw, _, _, _ = backend.run_xclbin(
+            xclbin=artifacts_path / "final.xclbin",
+            insts=artifacts_path / "insts.bin",
+            kernel_name="MLIR_AIE",
+            in_buffers=[
+                (xs_g, _ARG_X),
+                (w_g, _ARG_WS),
+            ],
+            out_size=y_per_group,
+            out_arg_index=_ARG_Y,
+        )
+        y_g = _read_row_major(raw, n=_FFN_GROUP_N)
+        y_full[:, g * _FFN_GROUP_N : (g + 1) * _FFN_GROUP_N] = y_g
+
+    return y_full[: x.shape[0], :].copy()
 
 
 def bert_int8_matmul_ffn1(

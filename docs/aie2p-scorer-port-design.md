@@ -168,17 +168,94 @@ an algorithmic correctness problem.
 
 Minimal viable port:
 1. `bionpu.quant` calibration + INT8 weight extraction for the
-   trained DNABERT-Epi (4 hours)
-2. `bert_attn_qkv` + `bert_ffn` IRON Python kernels (2 weeks)
-3. `bert_attn_output` + `bert_attn_softmax_av` IRON Python kernels (1 week)
-4. `bert_embed_lookup` + `bert_pool` IRON Python kernels (1 week)
-5. End-to-end dispatch glue in `bionpu.scoring.dnabert_epi` for
-   `device='npu'` (3 days)
-6. NUMERIC_EPSILON@5e-3 byte-equivalence vs CPU reference (1 day)
-7. Energy + latency benchmarking via `bionpu bench score`
-   (already works; needs `bionpu bench score` CLI extension) (2 days)
+   trained DNABERT-Epi (4 hours) — **DONE 2026-04-28**
+2. `bert_int8_matmul` head specialization (M=47, K=768, N=2),
+   single-tile, scalar — **DONE 2026-04-28**, byte-equivalent on silicon
+3. End-to-end dispatch glue in `bionpu.scoring.dnabert_epi` for
+   `device='npu'` (head only; BERT body still on torch CPU) —
+   **DONE 2026-04-28**, NUMERIC_EPSILON@0.05 EQUAL vs CPU
+4. `bert_int8_matmul` qkvo specialization (N=768) — **NEXT** (multi-tile
+   + K-chunking, see § below)
+5. `bert_int8_matmul` ffn1/ffn2 specializations (N=3072, K=3072) —
+   DDR-streamed weights (~5 days)
+6. `bert_attn_softmax_av` IRON Python kernel (1 week)
+7. `bert_embed_lookup` + `bert_pool` IRON Python kernels (1 week)
+8. Wire all kernels into a single `bionpu score --device npu` end-
+   to-end forward pass (no torch BERT body fallback) (3 days)
+9. NUMERIC_EPSILON@5e-3 byte-equivalence vs CPU reference for the
+   full forward pass (1 day)
+10. Energy + latency benchmarking via `bionpu bench score`
+    (already works; needs `bionpu bench score` CLI extension) (2 days)
 
 Total estimate: ~5-6 weeks of focused work for one engineer.
+
+## v0.4-beta: scaling bert_int8_matmul from N=2 to N=768 (qkvo)
+
+The v0.4-alpha head kernel is single-tile with full-K-resident weight
++ full-K-resident input. That recipe does not scale to qkvo / ffn —
+the weights blow past tile DM (64 KB) and even memtile (512 KB).
+
+**Per-tile DM budget at qkvo shape (M=47, K=768, N=768):**
+
+| variant | per-tile w | per-tile x_chunk | per-tile y_i32 acc | total | fits 64KB? |
+|---|---|---|---|---|---|
+| 1 tile, full K, N=768 | 576 KB | 36 KB | 144 KB | ~756 KB | no — by 11.5× |
+| 4 tiles, full K, N=192/tile | 144 KB | 36 KB | 36 KB | 216 KB | no |
+| 4 tiles, K_chunk=128, N=192/tile | 24 KB | 6 KB | 36 KB | 66 KB | barely no |
+| 4 tiles, K_chunk=64, N=192/tile | 12 KB | 3 KB | 36 KB | 51 KB | **yes** |
+| 4 tiles, K_chunk=64, N=192/tile, m_chunk=24 | 12 KB | 3 KB | 18 KB | 33 KB | yes (margin) |
+
+**v0.4-beta topology:** 4 compute tiles, N-axis fan-out (each tile
+owns 192 of 768 output channels), K-chunked along the reduction
+axis (K_chunk=64 → 12 chunks per launch), int32 partial accumulator
+held resident on each tile across K-chunks; final fused-scale +
+INT8 saturate happens once at the end of the K loop. Memtile holds
+the full per-tile weight slice (192 × 768 = 144 KB int8, fits a
+single 512 KB memtile with margin); DMA streams K-slices from
+memtile to compute tile each chunk.
+
+```
+shim ──x── memtile ──┬─→ compute_0 (N[0..191],   K-chunked)  ──y_p0──┐
+                     ├─→ compute_1 (N[192..383], K-chunked) ──y_p1── memtile (concat) ──y── shim
+                     ├─→ compute_2 (N[384..575], K-chunked) ──y_p2──┤
+                     └─→ compute_3 (N[576..767], K-chunked) ──y_p3──┘
+shim ──w── memtile (resident, 576 KB) ──192 KB slice/tile──→ each compute
+shim ──s── (broadcast, tiny) ──→ all compute tiles
+```
+
+The combined-scale array (768 fp32 = 3 KB) broadcasts to all four
+compute tiles. The output is concatenated by the memtile into a
+single shim-DMA-out blob.
+
+**Implementation notes:**
+- Same `bionpu_int8_matmul.cc` symbol body, parameterised on M / K /
+  N / N_per_tile / K_chunk via Makefile macros.
+- New IRON-Python `--variant qkvo` flag emits the multi-tile
+  topology with the four compute-tile workers.
+- Host runner stays the same shape: file-backed x.bin / ws.bin /
+  y.bin; the host pre-stages w + scales into ws.bin.
+
+**Estimated effort:** 2-3 days for first build attempt + iteration.
+The IRON Python topology is the big lift; the kernel C++ is
+incremental over the v0.4-alpha scalar path.
+
+## v0.4-rc: scaling to N=3072 (ffn1/ffn2)
+
+ffn1: M × 768 → M × 3072 — weight = 768 × 3072 = 2.3 MB int8.
+Single memtile is 512 KB, so the weight no longer fits memtile-
+resident. **DDR-streamed weight** is required: shim DMA fetches
+K_chunk × N_chunk slices from DDR each iteration; memtile becomes
+a 1-deep relay buffer.
+
+ffn2: same shape transposed (M × 3072 → M × 768), same DMA budget.
+
+This is the bandwidth-bound bottleneck of the port. At PCIe Gen4 x4
+(~7 GB/s) and 4.7 MB / layer FFN weight at INT8, every BERT layer
+costs ~0.65 ms of weight-fetch latency, summing to ~8 ms for 12
+layers. That's the floor on per-token inference latency for the
+DNABERT-Epi NPU port.
+
+**Estimated effort:** 4-5 days of focused work.
 
 ## What this PR does NOT do
 

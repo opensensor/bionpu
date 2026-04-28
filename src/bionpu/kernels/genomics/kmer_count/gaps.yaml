@@ -346,11 +346,26 @@ gaps:
       12,420 = 11.6 s. Remainder ≈ 22 s is per-dispatch host overhead
       (memset of out BO + sync_to_device + kernel.run + wait +
       sync_from_device + accumulate).
+      v1.2 (b) (2026-04-28): shipped Path 3a (IRON-side
+      LAUNCH_CHUNKS-style batched dispatch). New env var
+      BIONPU_KMER_COUNT_N_CHUNKS_PER_LAUNCH ∈ {1, 2, 4, 8} bakes the
+      per-tile inner-loop count into the xclbin at IRON-emit time.
+      Built bionpu_kmer_count_k21_n4_np4_b8 (4 xclbins) and
+      bionpu_kmer_count_k21_n4_np16_b8 (16 xclbins). Runner accepts
+      `--n-chunks-per-launch N` and stages N-chunk batches into a
+      larger seq_in BO with per-slot v1.2 (a) headers; tail batch
+      padded with zero-actual-bytes chunks so the kernel always sees
+      exactly N chunk acquires (avoids the v0.5 hang hazard noted in
+      kmer_count.py:191-196).
     failed_with: |
       Surfaces as the residual chr22 end-to-end bottleneck after the
       v1.1 (b) Python-parse fix (which itself was a misdiagnosed
       red herring). End-to-end speedup vs Jellyfish 1T = 0.30× —
       unchanged from v1.0; PRD §3.3 e2e gate still not met.
+      v1.2 (b) chr22 e2e at np=4, b=8: 14.53 s (down from 33.84 s;
+      2.33× speedup). Top-1000 byte-equal preserved 1000/1000.
+      Closed; residual silicon-vs-Jellyfish gap reopens as
+      kmer-pipelined-dispatch-merge (v1.3 scope).
     root_cause: |
       The runner's main loop does ONE silicon kernel.run() per
       (chunk, pass) tuple. At ~1.8 ms wall per dispatch including
@@ -358,23 +373,43 @@ gaps:
       the host overhead is comparable to the compute itself. With
       12,420 dispatches the overhead dominates.
     workaround: |
-      v1.2 candidates:
-        (a) Pyxrt in-process path — drops subprocess fork cost (one-
-            time ~30 ms; not the dominant share but easy to remove)
-            AND lets us pipeline xrt::run::start() + .wait() across
-            multiple dispatches.
-        (b) Multi-launch batch per dispatch: stage M chunks into one
-            larger seq_in BO and have IRON Python iterate over per-
-            chunk slot offsets within a single kernel.run(). Reduces
-            host-side overhead by factor M.
-        (c) Persistent-kernel mode — runner submits N chunks worth
-            of seq_in in one streamed BO and the kernel pulls chunks
-            from a single ObjectFifo without per-chunk re-launch.
+      v1.2 (b) shipped Path 3a (multi-launch batch per dispatch).
+      Implementation:
+        - IRON Python: N_CHUNKS_PER_LAUNCH env var controls the
+          per-tile range_(N) loop count. seq_in_size and
+          sparse_out_size scale by N. Tile DM cap untouched: the
+          per-tile element sizes (seq_chunk_ty=4104B, partial_chunk_ty
+          =32768B at depth 2/1) are unchanged; only the BO sizes grow.
+        - Makefile: n_chunks_per_launch argument; artifact_suffix
+          gains _b{N} for N>1 (legacy N=1 builds keep old name).
+        - Runner: --n-chunks-per-launch N; per-batch seq_in BO sized
+          N × slot_bytes; per-pass partial_out BO sized N × N_TILES
+          × 32 KiB. Tail batch padded with zero-actual-bytes chunks
+          so the kernel sees exactly N chunk acquires.
+        - Op-class: BionpuKmerCount(n_chunks_per_launch=N) routes to
+          new artifact dir bionpu_kmer_count_k{K}_n{T}_np{P}_b{N}/
+          (legacy N=1 path keeps old dir name for back-compat).
+
+      Validation (chr22, k=21, n_tiles=4, n_passes=4, N_BATCH=8):
+        e2e wall: 14.53 s (was 33.84 s at b=1) → 2.33× speedup.
+        silicon avg/min/max: 6070.6 / 2875.0 / 8100.0 µs (per
+        8-chunk batch dispatch); silicon-summed = 6070.6µs ×
+        (3107/8 × 4) ≈ 9.43 s. Host overhead: 14.53 - 9.43 ≈ 5.1 s.
+        Top-1000 byte-equal: 1000/1000.
+
+      Validation (chr22, np=16 b=8): 41.21 s (was 77.74 s at b=1)
+        → 1.89× speedup; top-1000 byte-equal 1000/1000.
+
+      Smoke (k ∈ {15, 21, 31}, n_tiles=4, n_passes=4, default b=1):
+        3/3 byte-equal PASS (legacy non-batched cells unchanged).
     upstream_issue: null
     blocks:
-      - "kmer-prd-3-3-e2e-throughput-gate"
+      - "kmer-pipelined-dispatch-merge"
     severity: "performance"
-    status: "open"
+    status: "closed"
+    history:
+      - "v1.1 (b): observed; root cause per-dispatch host overhead × 12,420 dispatches."
+      - "v1.2 (b) (2026-04-28): shipped Path 3a (LAUNCH_CHUNKS-style batched dispatch); chr22 np=4 b=8 e2e=14.53s (was 33.84s); top-1000 byte-equal preserved. Closed."
 
   - id: "kmer-runner-host-merge-unordered_map"
     category: "performance"
@@ -384,26 +419,109 @@ gaps:
       30.7 M unique canonical buckets via std::unordered_map. Wall
       attributable to the merge step is ~5-10 s of the 22 s host
       overhead (the rest is per-dispatch XRT submit overhead).
+      v1.2 (b) (2026-04-28): shipped sort-then-RLE merge replacing
+      std::unordered_map. Phase 1 (collection): every emit memcpy'd
+      to a flat std::vector<uint64_t> (pre-reserved 64M slots);
+      canonical=0 summary tracked in a separate uint64 to avoid 12M
+      zero-appends on chr22's centromere. Phase 2 (merge): std::sort
+      on the flat vector (O(n log n), ~1-2 s for 42M uint64 due to
+      cache-friendly contiguous layout vs node-allocated buckets);
+      linear sweep RLE-encodes adjacent equal canonicals to
+      (canonical, count) pairs; canonical=0 inserted at sorted
+      position before final (count desc, canonical asc) sort.
     failed_with: |
       Independent of the per-dispatch fix — even with zero dispatch
       overhead, the post-silicon merge of 42 M canonicals through a
       libstdc++ unordered_map is a 5-10 s host CPU bottleneck.
+      v1.2 (b) chr22 e2e at np=4, b=8: 14.53 s (down from 33.84 s).
+      Of that, host post-silicon merge wall is ~1.5-2 s (estimated
+      from total e2e - silicon-summed; not separately profiled).
+      Closed.
     root_cause: |
       libstdc++'s unordered_map has a node-per-bucket allocator
       pattern that's cache-hostile at 30 M entries. Each insert is
       ~150-300 ns due to malloc + chain traversal.
     workaround: |
-      v1.2 candidates:
-        (a) Replace with tsl::robin_map or ankerl::unordered_dense
-            (header-only, drop-in API, 3-5× faster on this workload).
-        (b) Skip the per-emit hash entirely: collect all 42 M
-            canonicals into a flat std::vector, radix-sort by
-            canonical, then run-length encode to (canonical, count)
-            pairs. O(n) sort time; cache-friendly.
-        (c) Per-pass accumulate-then-sort, merging only the
-            top-N per pass before global merge.
+      v1.2 (b) shipped Workaround (b) variant: flat-vector +
+      std::sort + RLE sweep (NOT radix-sort; std::sort was
+      sufficient for the 42M-element scale at 1-2 s wall).
+      Implementation in runner.cpp:
+        - Phase 1: accumulate_pass_blob() bulk-memcpy's per-tile-slot
+          canonicals to all_emits.resize(old + emit_idx) slice.
+          all_a_counter from the slot tail accumulates into a
+          separate uint64 all_a_total.
+        - Phase 2: sort_and_filter() std::sort()s all_emits, then
+          single-pass RLE-encodes adjacent equal values to
+          FinalRecord{canonical, count}. (0, all_a_total) inserted
+          via the sweep when all_emits sorts canonical=0 first
+          (which it always does); fallback append if no kernel-side
+          canonical=0 emits occurred.
+        - Final: re-sort by (count desc, canonical asc); apply
+          --top filter and threshold.
+
+      Validation: chr22 np=4 b=8 e2e = 14.53 s (was 33.84 s);
+      smoke 3/3 PASS; top-1000 byte-equal preserved 1000/1000.
+    upstream_issue: null
+    blocks:
+      - "kmer-pipelined-dispatch-merge"
+    severity: "performance"
+    status: "closed"
+    history:
+      - "v1.1 (b): observed; root cause libstdc++ node-allocator cache-misses on 30M-bucket unordered_map."
+      - "v1.2 (b) (2026-04-28): shipped sort+RLE merge (Workaround b variant); chr22 np=4 b=8 e2e=14.53s; top-1000 byte-equal preserved. Closed."
+
+  - id: "kmer-pipelined-dispatch-merge"
+    category: "performance"
+    op_or_pattern: "host runner per-dispatch sequential silicon submit + drain"
+    attempted: |
+      v1.2 (b) (2026-04-28) closed kmer-runner-per-dispatch-overhead
+      and kmer-runner-host-merge-unordered_map. Resulting chr22 e2e
+      at np=4 b=8: 14.53 s = ~9.4 s silicon + ~5.1 s host (incl. XRT
+      setup, file I/O, residual per-batch dispatch overhead, sort-
+      merge wall).
+    failed_with: |
+      14.53 s vs Jellyfish 1T 9.81 s = 0.67× speedup. Below the
+      original PRD §3.3 ≥2× gate. Hits the v1.2 (b) pragmatic ≤16 s
+      target but doesn't beat Jellyfish in absolute wall.
+    root_cause: |
+      Silicon submit and host post-process are still strictly
+      sequential per dispatch:
+        for each (batch, pass):
+          memset out BO; sync_to_device; kernel.run().wait();
+          sync_from_device; accumulate to all_emits.
+      With ~6070 µs silicon avg per batch dispatch and 4 passes ×
+      388 batches = 1552 dispatches, silicon-summed is ~9.4 s and
+      runs entirely sequential. The host accumulate path could
+      overlap with the next dispatch's silicon compute via
+      double-buffered partial_out BOs + xrt::run::start() async
+      submit; v1.2 (b) leaves this stacked sequential.
+    workaround: |
+      v1.3 candidates:
+        (a) Pipelined dispatch: pre-allocate K (≥2) partial_out BOs
+            and per-batch run handles. Submit batch i+1 with
+            run.start() while host accumulates batch i. Steady-state
+            silicon throughput becomes the bottleneck.
+        (b) Persistent-kernel mode: runner stages all N batches into
+            one larger seq_in BO and the kernel pulls chunks from a
+            single ObjectFifo. One run.wait() at the end. Tradeoff:
+            larger XRT BO (N × per_batch_seq_in_bytes; ~6 MiB at
+            chr22) vs much fewer kernel.run() calls.
+        (c) In-process pyxrt path: drop subprocess fork (~30 ms one-
+            time) and let Python orchestrate run.start() / .wait()
+            across batches. Existing op-class subprocess path could
+            stay as fallback.
+        (d) Compressed memtile-drain: shrink partial_out per slot
+            from 32 KiB to ~8 KiB (track high-water mark of emit_idx
+            empirically; kernel can write a smaller fixed-size slot
+            with a packed uint16 emit_idx prefix). Reduces shim DMA
+            time per batch.
+
+      Estimated v1.3 wall: 7-9 s e2e (silicon overlapped with host;
+      Jellyfish-beating).
     upstream_issue: null
     blocks:
       - "kmer-prd-3-3-e2e-throughput-gate"
     severity: "performance"
     status: "open"
+    history:
+      - "v1.2 (b) (2026-04-28): filed after batched-dispatch + sort-merge fixes hit pragmatic 16s gate but not the Jellyfish 9.81s target."

@@ -318,12 +318,14 @@ class BionpuKmerCount(NpuOp):
     SUPPORTED_K = SUPPORTED_K
     SUPPORTED_N_TILES = SUPPORTED_N_TILES
     SUPPORTED_N_PASSES = SUPPORTED_N_PASSES
+    SUPPORTED_N_CHUNKS_PER_LAUNCH: tuple[int, ...] = (1, 2, 4, 8)
 
     def __init__(
         self,
         k: int = 21,
         n_tiles: int = 4,
         n_passes: int = 4,
+        n_chunks_per_launch: int = 1,
     ) -> None:
         if int(k) not in SUPPORTED_K:
             valid = ", ".join(str(x) for x in SUPPORTED_K)
@@ -340,9 +342,16 @@ class BionpuKmerCount(NpuOp):
             raise ValueError(
                 f"BionpuKmerCount: n_passes={n_passes!r} not in {{{valid}}}."
             )
+        if int(n_chunks_per_launch) not in self.SUPPORTED_N_CHUNKS_PER_LAUNCH:
+            valid = ", ".join(str(x) for x in self.SUPPORTED_N_CHUNKS_PER_LAUNCH)
+            raise ValueError(
+                f"BionpuKmerCount: n_chunks_per_launch="
+                f"{n_chunks_per_launch!r} not in {{{valid}}}."
+            )
         self.k: int = int(k)
         self.n_tiles: int = int(n_tiles)
         self.n_passes: int = int(n_passes)
+        self.n_chunks_per_launch: int = int(n_chunks_per_launch)
         self.name: str = f"bionpu_kmer_count_k{self.k}"
         self.last_run: _RunInfo | None = None
 
@@ -350,10 +359,23 @@ class BionpuKmerCount(NpuOp):
 
     @property
     def artifact_dir(self) -> Path:
-        """Per-(k, n_tiles, n_passes) artifact directory."""
-        return (
+        """Per-(k, n_tiles, n_passes, n_chunks_per_launch) artifact directory.
+
+        For backward compatibility with v1.2 (a) and earlier artifacts,
+        n_chunks_per_launch=1 maps to the legacy directory name without
+        a `_b{N}` suffix. Batched cells (v1.2 (b), N>1) get a `_b{N}`
+        suffix to coexist alongside legacy non-batched builds.
+        """
+        legacy_dir = (
             _ART_ROOT
             / f"bionpu_kmer_count_k{self.k}_n{self.n_tiles}_np{self.n_passes}"
+        )
+        if self.n_chunks_per_launch == 1:
+            return legacy_dir
+        return (
+            _ART_ROOT
+            / f"bionpu_kmer_count_k{self.k}_n{self.n_tiles}"
+            f"_np{self.n_passes}_b{self.n_chunks_per_launch}"
         )
 
     def xclbin_for_pass(self, pass_idx: int) -> Path:
@@ -464,6 +486,7 @@ class BionpuKmerCount(NpuOp):
                 "--threshold", str(int(threshold)),
                 "--launch-chunks", str(self.n_tiles),
                 "--n-passes", str(self.n_passes),
+                "--n-chunks-per-launch", str(self.n_chunks_per_launch),
                 "--iters", str(int(n_iters)),
                 "--warmup", str(int(warmup)),
             ]

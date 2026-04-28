@@ -44,7 +44,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -191,6 +191,10 @@ struct Args {
     int n_passes = 4;
     int iters = 1;
     int warmup = 0;
+    // v1.2 (b): how many chunks one silicon dispatch processes. Must
+    // match the IRON-side BIONPU_KMER_COUNT_N_CHUNKS_PER_LAUNCH baked
+    // into the xclbin. Default 1 = legacy per-chunk dispatch.
+    int n_chunks_per_launch = 1;
 };
 
 void print_usage(std::ostream &os) {
@@ -213,6 +217,11 @@ void print_usage(std::ostream &os) {
 "  --top <N>                   top-N records (default 1000; 0 = all)\n"
 "  --launch-chunks {1,2,4,8}   tile fan-out (default 4)\n"
 "  --n-passes {1,4,16}         hash-slice partition count (default 4)\n"
+"  --n-chunks-per-launch {1,2,4,8}\n"
+"                              chunks processed per silicon dispatch\n"
+"                              (default 1; v1.2 (b) batched-dispatch knob.\n"
+"                              MUST match the value baked into the xclbin\n"
+"                              by IRON Python at build time).\n"
 "  --iters <N>                 timed iterations (default 1)\n"
 "  --warmup <N>                untimed warmup iters (default 0)\n"
 "  --threshold <int>           min count to emit (default 1)\n"
@@ -223,9 +232,9 @@ void print_usage(std::ostream &os) {
 "                              path to skip the Python Jellyfish-FASTA parse.\n"
 "\n"
 "Per state/kmer_count_interface_contract.md v0.5: the runner dispatches\n"
-"N_PASSES xclbins per chunk (one per hash-slice partition), accumulates\n"
-"canonical k-mers into a host-side unordered_map, then sorts + topN +\n"
-"emits Jellyfish-FASTA.\n";
+"N_PASSES xclbins per chunk-batch (one per hash-slice partition),\n"
+"accumulates canonical k-mers via flat-vector + sort-RLE merge\n"
+"(v1.2 (b)), then sorts + topN + emits Jellyfish-FASTA / binary blob.\n";
 }
 
 Args parse(int argc, char **argv) {
@@ -251,6 +260,7 @@ Args parse(int argc, char **argv) {
         else if (key == "--threshold") a.threshold = std::stoi(next());
         else if (key == "--launch-chunks") a.launch_chunks = std::stoi(next());
         else if (key == "--n-passes") a.n_passes = std::stoi(next());
+        else if (key == "--n-chunks-per-launch") a.n_chunks_per_launch = std::stoi(next());
         else if (key == "--iters") a.iters = std::stoi(next());
         else if (key == "--warmup") a.warmup = std::stoi(next());
         else if (key == "--output-format") a.output_format = next();
@@ -268,6 +278,10 @@ Args parse(int argc, char **argv) {
         throw std::runtime_error("--launch-chunks must be one of {1, 2, 4, 8}");
     if (a.n_passes != 1 && a.n_passes != 4 && a.n_passes != 16)
         throw std::runtime_error("--n-passes must be one of {1, 4, 16}");
+    if (a.n_chunks_per_launch != 1 && a.n_chunks_per_launch != 2 &&
+        a.n_chunks_per_launch != 4 && a.n_chunks_per_launch != 8)
+        throw std::runtime_error(
+            "--n-chunks-per-launch must be one of {1, 2, 4, 8}");
     if (a.iters <= 0)
         throw std::runtime_error("--iters must be > 0");
     if (a.warmup < 0)
@@ -380,46 +394,79 @@ std::vector<ChunkPlan> plan_chunks(size_t input_bytes, int overlap_bytes) {
 // non-zero on the pass=0 xclbin; canonical=0 lands in pass=0 by the
 // slice mask). Closes kmer-chr22-canonical0-cap-fire.
 // ---------------------------------------------------------------------
+// v1.2 (b): accumulate emits from one (chunk_or_batch × pass) blob into
+// a flat std::vector<uint64_t> sink. all_a counters are tracked in a
+// separate uint64 (avoids appending millions of zeros to all_emits and
+// keeps Phase 2 sort cheaper). After all dispatches, the host sorts
+// all_emits, run-length encodes adjacent equal values to (canonical,
+// count), and inserts (0, all_a_total) into the records list. Closes
+// kmer-runner-host-merge-unordered_map.
+//
+// Returns the count of canonicals appended (excluding all_a). Out
+// param max_emit_observed_io tracks the kernel-side per-slot emit_idx
+// for the cap-fire warning.
 size_t accumulate_pass_blob(const uint8_t *blob, size_t blob_size,
-                            int n_tiles,
-                            std::unordered_map<uint64_t, uint64_t> &counts,
-                            size_t &out_emit_total) {
+                            int n_tiles, int n_chunks_per_launch,
+                            std::vector<uint64_t> &all_emits,
+                            uint64_t &all_a_total,
+                            size_t &out_emit_total,
+                            uint32_t &max_emit_observed_io) {
     size_t emits = 0;
-    for (int t = 0; t < n_tiles; ++t) {
-        size_t off = static_cast<size_t>(t) *
-                     static_cast<size_t>(PARTIAL_OUT_BYTES_V05_PADDED);
-        if (off + 4 > blob_size) break;
-        uint32_t emit_idx = 0;
-        std::memcpy(&emit_idx, blob + off, 4);
-        if (emit_idx > static_cast<uint32_t>(MAX_EMIT_IDX_V05)) {
-            // Defensive: kernel must cap at MAX_EMIT_IDX_V05; if blob
-            // returned a higher value, treat it as corruption and clamp.
-            emit_idx = static_cast<uint32_t>(MAX_EMIT_IDX_V05);
-        }
-        size_t payload_off = off + 4;
-        size_t payload_max = static_cast<size_t>(emit_idx) * 8u;
-        if (payload_off + payload_max > blob_size) {
-            payload_max = (blob_size > payload_off) ? (blob_size - payload_off) : 0;
-            payload_max = (payload_max / 8u) * 8u;
-        }
-        const uint8_t *p = blob + payload_off;
-        for (size_t i = 0; i < (size_t)emit_idx; ++i) {
-            uint64_t canonical = 0;
-            std::memcpy(&canonical, p + i * 8u, 8);
-            counts[canonical] += 1ULL;
-        }
-        emits += static_cast<size_t>(emit_idx);
+    // The IRON-side memtile.join produces one joined element per
+    // tile-chunk iteration; the runtime sequence drains
+    // n_chunks_per_launch joined elements per dispatch, laid out
+    // contiguously in the BO. Per-iteration block layout:
+    //   N_TILES × PARTIAL_OUT_BYTES_V05_PADDED bytes
+    const size_t per_iter_bytes =
+        static_cast<size_t>(n_tiles) *
+        static_cast<size_t>(PARTIAL_OUT_BYTES_V05_PADDED);
 
-        // v1.2 (a): read trailing all_a_counter and accumulate into
-        // counts[0]. Slot tail offset = off + PARTIAL_OUT_BYTES_V05_PADDED - 4.
-        size_t all_a_off = off +
-                           static_cast<size_t>(PARTIAL_OUT_BYTES_V05_PADDED) - 4u;
-        if (all_a_off + 4 <= blob_size) {
-            uint32_t all_a_counter = 0;
-            std::memcpy(&all_a_counter, blob + all_a_off, 4);
-            if (all_a_counter > 0u) {
-                counts[0ULL] += static_cast<uint64_t>(all_a_counter);
-                emits += static_cast<size_t>(all_a_counter);
+    for (int it = 0; it < n_chunks_per_launch; ++it) {
+        const size_t iter_base = static_cast<size_t>(it) * per_iter_bytes;
+        for (int t = 0; t < n_tiles; ++t) {
+            size_t off = iter_base +
+                         static_cast<size_t>(t) *
+                             static_cast<size_t>(PARTIAL_OUT_BYTES_V05_PADDED);
+            if (off + 4 > blob_size) break;
+            uint32_t emit_idx = 0;
+            std::memcpy(&emit_idx, blob + off, 4);
+            if (emit_idx > max_emit_observed_io) {
+                max_emit_observed_io = emit_idx;
+            }
+            if (emit_idx > static_cast<uint32_t>(MAX_EMIT_IDX_V05)) {
+                // Defensive: kernel must cap at MAX_EMIT_IDX_V05; if blob
+                // returned a higher value, treat it as corruption and clamp.
+                emit_idx = static_cast<uint32_t>(MAX_EMIT_IDX_V05);
+            }
+            size_t payload_off = off + 4;
+            size_t payload_max = static_cast<size_t>(emit_idx) * 8u;
+            if (payload_off + payload_max > blob_size) {
+                payload_max = (blob_size > payload_off) ? (blob_size - payload_off) : 0;
+                payload_max = (payload_max / 8u) * 8u;
+            }
+            // Bulk append: 8-byte canonicals are little-endian uint64
+            // already; one memcpy into a pre-resized vector slice is
+            // cheaper than a per-record memcpy + push_back.
+            const size_t old_size = all_emits.size();
+            const size_t add = static_cast<size_t>(emit_idx);
+            all_emits.resize(old_size + add);
+            if (add > 0) {
+                std::memcpy(all_emits.data() + old_size,
+                            blob + payload_off, add * 8u);
+            }
+            emits += add;
+
+            // v1.2 (a): read trailing all_a_counter. Slot tail offset =
+            // off + PARTIAL_OUT_BYTES_V05_PADDED - 4.
+            size_t all_a_off = off +
+                               static_cast<size_t>(PARTIAL_OUT_BYTES_V05_PADDED) - 4u;
+            if (all_a_off + 4 <= blob_size) {
+                uint32_t all_a_counter = 0;
+                std::memcpy(&all_a_counter, blob + all_a_off, 4);
+                if (all_a_counter > 0u) {
+                    all_a_total += static_cast<uint64_t>(all_a_counter);
+                    emits += static_cast<size_t>(all_a_counter);
+                }
             }
         }
     }
@@ -437,17 +484,59 @@ struct FinalRecord {
     uint64_t count;
 };
 
-// Sort + filter records into a final vector ready for output emit.
-// (Common to both --output-format=fasta and =binary paths.)
+// v1.2 (b): sort-then-RLE merge. Replaces the previous unordered_map
+// accumulate (5-10s on chr22's 42M emits → 30.7M unique canonicals).
+//
+// Phase 1 (collection): caller appended every emit to all_emits +
+// tracked all_a_total separately.
+// Phase 2 (this fn):
+//   1. std::sort the flat vector (O(n log n); ~1-2s for 42M uint64 on
+//      a single core; the implementation is much more cache-friendly
+//      than an unordered_map of node-allocated buckets).
+//   2. Linear sweep adjacent-equal to produce (canonical, count) pairs.
+//   3. Insert (0, all_a_total) at the canonical=0 position (front,
+//      since 0 sorts first).
+//   4. Re-sort by (count desc, canonical asc); apply --top + --threshold.
+//
+// Closes kmer-runner-host-merge-unordered_map.
 std::vector<FinalRecord> sort_and_filter(
-        const std::unordered_map<uint64_t, uint64_t> &merged,
+        std::vector<uint64_t> &all_emits,
+        uint64_t all_a_total,
         int top, int threshold) {
+    // Phase 2.1: sort all_emits.
+    std::sort(all_emits.begin(), all_emits.end());
+
+    // Phase 2.2: RLE sweep. Pre-reserve a generous upper bound (unique
+    // count ≤ all_emits.size() + 1; reserving exact size avoids
+    // reallocations during the sweep).
     std::vector<FinalRecord> v;
-    v.reserve(merged.size());
-    for (const auto &kv : merged) {
-        if (kv.second < static_cast<uint64_t>(threshold)) continue;
-        v.push_back({kv.first, kv.second});
+    v.reserve(all_emits.size() / 2u + 16u);
+    size_t i = 0;
+    const size_t n = all_emits.size();
+    bool inserted_canonical0 = false;
+    while (i < n) {
+        const uint64_t c = all_emits[i];
+        size_t j = i;
+        while (j < n && all_emits[j] == c) ++j;
+        uint64_t cnt = static_cast<uint64_t>(j - i);
+        if (c == 0ULL) {
+            // Merge any kernel-emitted canonical=0 (should never happen
+            // post-v1.2 (a) since the kernel diverts to all_a_counter,
+            // but guard for safety) with the summary counter.
+            cnt += all_a_total;
+            inserted_canonical0 = true;
+        }
+        if (cnt >= static_cast<uint64_t>(threshold)) {
+            v.push_back({c, cnt});
+        }
+        i = j;
     }
+    if (!inserted_canonical0 && all_a_total > 0ULL &&
+        all_a_total >= static_cast<uint64_t>(threshold)) {
+        v.push_back({0ULL, all_a_total});
+    }
+
+    // Phase 2.3: re-sort by (count desc, canonical asc).
     std::sort(v.begin(), v.end(),
               [](const FinalRecord &a, const FinalRecord &b) {
                   if (a.count != b.count) return a.count > b.count;
@@ -519,7 +608,8 @@ int main(int argc, char **argv) {
     trace("k=" + std::to_string(args.k) +
           " overlap_bytes=" + std::to_string(overlap_bytes) +
           " launch_chunks=" + std::to_string(args.launch_chunks) +
-          " n_passes=" + std::to_string(args.n_passes));
+          " n_passes=" + std::to_string(args.n_passes) +
+          " n_chunks_per_launch=" + std::to_string(args.n_chunks_per_launch));
 
     // Load packed-2-bit input from disk.
     auto input_buf = read_packed_input(args.input_path);
@@ -530,14 +620,29 @@ int main(int argc, char **argv) {
     const size_t n_chunks_host = chunks.size();
     trace("planned chunks=" + std::to_string(n_chunks_host));
 
-    // Per-pass output blob size = N_TILES × 32 KiB.
+    // v1.2 (b): per-chunk seq_in slot size = chunk_bytes_base + overlap_bytes.
+    const size_t seq_in_slot_bytes =
+        static_cast<size_t>(SEQ_IN_CHUNK_BYTES_BASE + overlap_bytes);
+
+    // Per-batch BO sizes: each silicon dispatch processes
+    // n_chunks_per_launch chunks. seq_in BO = N_BATCH × slot bytes;
+    // partial_out BO = N_BATCH × (N_TILES × 32 KiB).
+    const int n_batch = args.n_chunks_per_launch;
+    const size_t per_batch_seq_in_bytes =
+        static_cast<size_t>(n_batch) * seq_in_slot_bytes;
     const size_t per_pass_out_bytes =
+        static_cast<size_t>(n_batch) *
         static_cast<size_t>(args.launch_chunks) *
         static_cast<size_t>(PARTIAL_OUT_BYTES_V05_PADDED);
 
-    // Per-chunk seq_in BO size = chunk_bytes_base + overlap_bytes.
-    const size_t seq_in_slot_bytes =
-        static_cast<size_t>(SEQ_IN_CHUNK_BYTES_BASE + overlap_bytes);
+    // Number of batches the host issues (round up; tail batch padded
+    // with zero-actual-bytes chunks so the kernel sees exactly N_BATCH
+    // chunk acquires).
+    const size_t n_batches =
+        (n_chunks_host + static_cast<size_t>(n_batch) - 1u) /
+        static_cast<size_t>(n_batch);
+    trace("planned batches=" + std::to_string(n_batches) +
+          " (n_chunks_per_launch=" + std::to_string(n_batch) + ")");
 
     // ------------------------------------------------------------
     // XRT setup — load N_PASSES xclbins.
@@ -575,8 +680,9 @@ int main(int argc, char **argv) {
     // Allocate seq_in / sparse_out BOs against pass-0's kernel
     // (group_ids should match across passes since the IRON Python
     // graph topology is identical across n_passes_log2/pass_idx values).
+    // v1.2 (b): BOs sized for one BATCH of n_chunks_per_launch chunks.
     const auto &k0 = per_pass[0].kernel;
-    auto bo_seq_in = xrt::bo(device, seq_in_slot_bytes,
+    auto bo_seq_in = xrt::bo(device, per_batch_seq_in_bytes,
                               XRT_BO_FLAGS_HOST_ONLY, k0.group_id(3));
     auto bo_sparse_out = xrt::bo(device, per_pass_out_bytes,
                                   XRT_BO_FLAGS_HOST_ONLY, k0.group_id(4));
@@ -584,9 +690,15 @@ int main(int argc, char **argv) {
     auto *p_seq_in = bo_seq_in.map<uint8_t *>();
     auto *p_sparse_out = bo_sparse_out.map<uint8_t *>();
 
-    // Host-side accumulator. Counts live across all chunks AND all passes.
-    // Each pass increments counts for its slice's canonicals.
-    std::unordered_map<uint64_t, uint64_t> counts;
+    // v1.2 (b): host-side accumulator is now a flat std::vector<uint64_t>
+    // of canonicals (sort-merge replaces unordered_map; closes
+    // kmer-runner-host-merge-unordered_map). all_a counter tracked
+    // separately to avoid 12M zero-appends on chr22 centromere.
+    std::vector<uint64_t> all_emits;
+    // Pre-reserve a generous upper bound for chr22 (42M emits at
+    // n_tiles=4, n_passes=16). Smaller inputs simply use less.
+    all_emits.reserve(64 * 1024 * 1024);
+    uint64_t all_a_total = 0ULL;
 
     const unsigned int opcode = 3;
     float total_us = 0.0f;
@@ -599,39 +711,52 @@ int main(int argc, char **argv) {
     const int total_iters = args.warmup + args.iters;
     for (int it = 0; it < total_iters; ++it) {
         const bool keep = (it >= args.warmup);
-        if (keep) counts.clear();
+        if (keep) {
+            all_emits.clear();
+            all_a_total = 0ULL;
+            total_emits = 0;
+        }
 
-        for (size_t ci = 0; ci < n_chunks_host; ++ci) {
-            const ChunkPlan &c = chunks[ci];
+        // v1.2 (b): batch of N_BATCH chunks per silicon dispatch. The
+        // tail batch (when n_chunks_host % N_BATCH != 0) is padded with
+        // zero-actual-bytes chunks so the kernel sees exactly N_BATCH
+        // chunk acquires (otherwise it blocks per the v1 hazard noted
+        // in kmer_count.py). Padding chunks emit no canonicals because
+        // the kernel's actual_bytes header reads as 0.
+        for (size_t bi = 0; bi < n_batches; ++bi) {
+            const size_t batch_first_chunk = bi * static_cast<size_t>(n_batch);
 
-            // Stage seq_in for this chunk (v1.2 (a) 8-byte header):
-            //   [0..3]: uint32 LE actual_bytes (existing)
-            //   [4..7]: int32  LE owned_start_offset_bases (NEW)
-            //   [8..]:  payload
-            // Then zero-pad remainder.
-            std::memset(p_seq_in, 0, seq_in_slot_bytes);
-            // Length prefix.
-            uint32_t actual_bytes_le = static_cast<uint32_t>(c.bytes);
-            std::memcpy(p_seq_in, &actual_bytes_le, 4);
-            // v1.2 (a) owned_start_offset_bases:
-            //   chunk 0           : 0
-            //   chunk i  (i>0)    : overlap_bases - (k-1)
-            // overlap_bases = overlap_bytes * 4 (each byte carries 4
-            // 2-bit bases). For k=21, overlap_bytes=8 → overlap_bases=32
-            //                  → owned_start_offset_bases = 32 - 20 = 12.
-            // For k=15, overlap_bytes=4 → overlap_bases=16
-            //                  → owned_start_offset_bases = 16 - 14 = 2.
-            // For k=31, overlap_bytes=8 → overlap_bases=32
-            //                  → owned_start_offset_bases = 32 - 30 = 2.
-            int32_t owned_start_offset_bases =
-                (ci == 0)
-                    ? 0
-                    : (overlap_bytes * 4) - (args.k - 1);
-            std::memcpy(p_seq_in + 4, &owned_start_offset_bases, 4);
-            // Payload.
-            std::memcpy(p_seq_in + HEADER_BYTES,
-                        input_buf.data() + c.src_offset,
-                        c.bytes);
+            // Stage seq_in for this batch: N_BATCH consecutive chunk
+            // slots, each with the v1.2 (a) 8-byte header + payload.
+            // Zero-fill the whole BO first so unused tail slots have
+            // actual_bytes=0.
+            std::memset(p_seq_in, 0, per_batch_seq_in_bytes);
+            for (int slot = 0; slot < n_batch; ++slot) {
+                const size_t ci = batch_first_chunk + static_cast<size_t>(slot);
+                uint8_t *slot_base = p_seq_in +
+                                     static_cast<size_t>(slot) * seq_in_slot_bytes;
+                if (ci >= n_chunks_host) {
+                    // Tail-pad slot: header already zeroed → actual_bytes=0.
+                    // Kernel will run its loop body but emit nothing.
+                    continue;
+                }
+                const ChunkPlan &c = chunks[ci];
+                // Length prefix.
+                uint32_t actual_bytes_le = static_cast<uint32_t>(c.bytes);
+                std::memcpy(slot_base, &actual_bytes_le, 4);
+                // v1.2 (a) owned_start_offset_bases:
+                //   chunk 0           : 0
+                //   chunk i  (i>0)    : overlap_bases - (k-1)
+                int32_t owned_start_offset_bases =
+                    (ci == 0)
+                        ? 0
+                        : (overlap_bytes * 4) - (args.k - 1);
+                std::memcpy(slot_base + 4, &owned_start_offset_bases, 4);
+                // Payload.
+                std::memcpy(slot_base + HEADER_BYTES,
+                            input_buf.data() + c.src_offset,
+                            c.bytes);
+            }
             bo_seq_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
             // Per-pass dispatch loop.
@@ -642,37 +767,29 @@ int main(int argc, char **argv) {
                 bo_sparse_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
                 auto t0 = std::chrono::high_resolution_clock::now();
-                // 6th arg is the seq_in_slot CAPACITY (compile-time on
-                // IRON side). Actual payload size is encoded in the
-                // chunk's leading 4-byte uint32 LE prefix; the kernel
-                // unpacks it.
+                // 6th arg is the seq_in BATCH CAPACITY (compile-time on
+                // IRON side). Actual payload size per slot is encoded
+                // in each slot's leading 4-byte uint32 LE prefix.
                 auto run = per_pass[p].kernel(
                     opcode,
                     per_pass[p].bo_instr,
                     static_cast<unsigned>(per_pass[p].instr.size()),
                     bo_seq_in,
                     bo_sparse_out,
-                    static_cast<int>(seq_in_slot_bytes));
+                    static_cast<int>(per_batch_seq_in_bytes));
                 run.wait();
                 auto t1 = std::chrono::high_resolution_clock::now();
 
                 bo_sparse_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
                 if (keep) {
-                    // Track max emit_idx across all per-tile slots.
-                    for (int t = 0; t < args.launch_chunks; ++t) {
-                        size_t off = static_cast<size_t>(t) *
-                                     static_cast<size_t>(PARTIAL_OUT_BYTES_V05_PADDED);
-                        if (off + 4 > per_pass_out_bytes) break;
-                        uint32_t emit_idx = 0;
-                        std::memcpy(&emit_idx, p_sparse_out + off, 4);
-                        if (emit_idx > max_emit_observed) {
-                            max_emit_observed = emit_idx;
-                        }
-                    }
                     accumulate_pass_blob(p_sparse_out, per_pass_out_bytes,
                                          args.launch_chunks,
-                                         counts, total_emits);
+                                         n_batch,
+                                         all_emits,
+                                         all_a_total,
+                                         total_emits,
+                                         max_emit_observed);
                 }
 
                 float us = std::chrono::duration_cast<
@@ -695,9 +812,11 @@ int main(int argc, char **argv) {
               " — kernel dropped k-mers; increase --n-passes");
     }
     trace("total emits across all passes=" + std::to_string(total_emits) +
-          " unique canonicals=" + std::to_string(counts.size()));
+          " all_a_total=" + std::to_string(all_a_total) +
+          " all_emits.size=" + std::to_string(all_emits.size()));
 
-    auto sorted_records = sort_and_filter(counts, args.top, args.threshold);
+    auto sorted_records = sort_and_filter(all_emits, all_a_total,
+                                          args.top, args.threshold);
     if (args.output_format == "binary") {
         emit_binary_blob(args.output_path, sorted_records);
         trace("wrote binary blob (" + std::to_string(sorted_records.size()) +

@@ -55,6 +55,10 @@ experiment ?= production
 K ?= 21
 n_passes ?= 4
 pass_idx ?= 0
+# v1.2 (b): batched-dispatch knob. n_chunks_per_launch ∈ {1, 2, 4, 8}.
+# Default 1 keeps backward-compat smoke artifacts byte-equal. Set to 8
+# for chr22 throughput cells (closes kmer-runner-per-dispatch-overhead).
+n_chunks_per_launch ?= 1
 
 ifeq ($(experiment),production)
   n_tiles = 1
@@ -74,9 +78,15 @@ endif
 
 targetname = bionpu_kmer_count
 
-# Per-(k, n_tiles, n_passes, pass_idx, seq) artifact suffix so all builds
-# coexist under build/ without clobber.
-artifact_suffix = k${K}_n${n_tiles}_np${n_passes}_p${pass_idx}_L${seq}
+# Per-(k, n_tiles, n_passes, pass_idx, n_batch, seq) artifact suffix so
+# all builds coexist under build/ without clobber. Pre-v1.2 (b) builds
+# with n_chunks_per_launch=1 use the legacy suffix without `_b1`; the
+# new batched cell appends `_b{N_BATCH}` for N_BATCH > 1.
+ifeq ($(n_chunks_per_launch),1)
+  artifact_suffix = k${K}_n${n_tiles}_np${n_passes}_p${pass_idx}_L${seq}
+else
+  artifact_suffix = k${K}_n${n_tiles}_np${n_passes}_b${n_chunks_per_launch}_p${pass_idx}_L${seq}
+endif
 
 # K_only suffix used by the per-K tile object (one .o per K).
 k_obj_suffix = k${K}
@@ -125,12 +135,14 @@ build/aie_${artifact_suffix}.mlir: ${aie_py_src}
 	BIONPU_KMER_COUNT_LAUNCH_CHUNKS=${launch_chunks} \
 	  BIONPU_KMER_COUNT_N_PASSES=${n_passes} \
 	  BIONPU_KMER_COUNT_PASS_IDX=${pass_idx} \
+	  BIONPU_KMER_COUNT_N_CHUNKS_PER_LAUNCH=${n_chunks_per_launch} \
 	  ${PYTHON} ${srcdir}/${aie_py_src} \
 	    -d ${devicename} \
 	    --k ${K} \
 	    --launch-chunks ${launch_chunks} \
 	    --n-passes ${n_passes} \
 	    --pass-idx ${pass_idx} \
+	    --n-chunks-per-launch ${n_chunks_per_launch} \
 	    > $@.tmp
 	mv $@.tmp $@
 
@@ -173,11 +185,11 @@ ${targetname}: ${runner_cc_src}
 # insts pair.
 all-passes: ${targetname}
 	@for p in $$(seq 0 $$(( ${n_passes} - 1 ))); do \
-	  echo "==> building pass_idx=$$p"; \
+	  echo "==> building pass_idx=$$p (n_chunks_per_launch=${n_chunks_per_launch})"; \
 	  $(MAKE) -f $(firstword $(MAKEFILE_LIST)) \
 	    NPU2=${NPU2} K=${K} experiment=${experiment} \
 	    n_passes=${n_passes} pass_idx=$$p seq=${seq} \
-	    build/final_k${K}_n${n_tiles}_np${n_passes}_p$${p}_L${seq}.xclbin \
+	    n_chunks_per_launch=${n_chunks_per_launch} \
 	    || exit 1; \
 	done
 

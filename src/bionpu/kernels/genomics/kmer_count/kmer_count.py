@@ -193,7 +193,20 @@ MAX_EMIT_IDX_V05 = 4095
 # needed (e.g. smoke 10 Kbp = 1 chunk total) and the kernel blocked
 # acquiring chunks 2-4. Setting N_CHUNKS_PER_LAUNCH=1 makes each
 # dispatch self-consistent: 1 chunk in, 1 set of N_TILES partials out.
-N_CHUNKS_PER_LAUNCH = 1
+#
+# v1.2 (b): make N_CHUNKS_PER_LAUNCH env-controllable (BIONPU_KMER_COUNT_
+# N_CHUNKS_PER_LAUNCH ∈ {1, 2, 4, 8}). When > 1 the runner MUST pad
+# short tail batches with zero-actual-bytes chunks, otherwise the kernel
+# blocks acquiring undelivered chunks (the v1 hazard above). Closes the
+# kmer-runner-per-dispatch-overhead gap by amortising silicon dispatch
+# cost over N_BATCH chunks. Path 3a in the v1.2 (b) plan.
+N_CHUNKS_PER_LAUNCH = int(_os.environ.get(
+    "BIONPU_KMER_COUNT_N_CHUNKS_PER_LAUNCH", "1"))
+if N_CHUNKS_PER_LAUNCH not in (1, 2, 4, 8):
+    raise ValueError(
+        f"BIONPU_KMER_COUNT_N_CHUNKS_PER_LAUNCH={N_CHUNKS_PER_LAUNCH} "
+        "not in {1, 2, 4, 8}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +358,7 @@ def kmer_count(dev, *, k: int = 21, n_passes: int = 4, pass_idx: int = 0):
 
 
 def main():
-    global LAUNCH_CHUNKS, N_TILES, N_PASSES, PASS_IDX
+    global LAUNCH_CHUNKS, N_TILES, N_PASSES, PASS_IDX, N_CHUNKS_PER_LAUNCH
 
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -379,17 +392,29 @@ def main():
         default=None,
         help=f"Which slice this xclbin handles (0..n_passes-1; default {PASS_IDX}).",
     )
+    p.add_argument(
+        "--n-chunks-per-launch",
+        type=int,
+        choices=(1, 2, 4, 8),
+        default=None,
+        help=(
+            "v1.2 (b): how many chunks one silicon dispatch processes "
+            f"(default {N_CHUNKS_PER_LAUNCH}). When >1, the host runner "
+            "MUST pad short tail batches with zero-actual-bytes chunks "
+            "or the kernel will block."
+        ),
+    )
     opts = p.parse_args(sys.argv[1:])
 
     if opts.launch_chunks is not None:
         LAUNCH_CHUNKS = opts.launch_chunks
         N_TILES = LAUNCH_CHUNKS
-        # N_CHUNKS_PER_LAUNCH stays at module-level default (=1) per
-        # v0.5; host loops dispatches per chunk.
     if opts.n_passes is not None:
         N_PASSES = opts.n_passes
     if opts.pass_idx is not None:
         PASS_IDX = opts.pass_idx
+    if opts.n_chunks_per_launch is not None:
+        N_CHUNKS_PER_LAUNCH = opts.n_chunks_per_launch
     if not (0 <= PASS_IDX < N_PASSES):
         raise ValueError(
             f"--pass-idx={PASS_IDX} must be in [0, --n-passes={N_PASSES})"

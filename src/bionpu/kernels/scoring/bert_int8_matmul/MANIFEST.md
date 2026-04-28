@@ -290,11 +290,12 @@ make NPU2=1 ffn2   # M=47 K=3072 N=768 group kernel
 - **v0.4-rc**: ✅ host ABI and registered ops landed for `ffn1` /
   `ffn2` via DDR-streamed weights. Remaining hardware work is to build
   and ratify the group xclbins under `build/{ffn1,ffn2}/`.
-- **v0.4-final**: wire the silicon dispatch (pyxrt host runner adapter)
-  for both bert_int8_matmul_head and bert_int8_matmul_qkvo NpuOps so
-  `bionpu score --device npu` runs end-to-end on real silicon (the
-  NotImplementedError raised by both NpuOps when artifacts are present
-  is the v0.4-final landing surface).
+- **v0.4-final**: ✅ done — `bert_int8_matmul_head` and
+  `bert_int8_matmul_qkvo` NpuOps now call the in-process pyxrt backend
+  when `final.xclbin` + `insts.bin` artifacts are present, and preserve
+  the host-emulation fallback when artifacts are absent. `bionpu score
+  --device npu` therefore uses the real AIE2P head path as soon as the
+  head artifacts are installed in the default artifact directory.
 - **v0.5**: ✅ source landed — inner dot products use guarded
   AIE-API `::aie::vector` / `aie::mac` intrinsics with the scalar
   loop kept as the host-build fallback. Remaining work is Peano build

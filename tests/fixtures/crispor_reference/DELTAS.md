@@ -46,7 +46,11 @@ ln -s /path/to/hg38.fa genomes/hg38/hg38.fa
 ./bin/Linux-x86_64/twoBitInfo genomes/hg38/hg38.2bit genomes/hg38/hg38.sizes
 # genomeInfo.tab: a 2-col tab-separated file with `name\thg38` and `org\thg38`.
 printf "name\thg38\norg\thg38\n" > genomes/hg38/genomeInfo.tab
-touch genomes/hg38/hg38.segments.bed  # empty is OK; CRISPOR no-ops if absent
+# CRISPOR pipes filtered hits through overlapSelect; an empty segments file
+# drops every off-target row. Whole-chromosome intervals preserve the hit set
+# when gene-annotation BEDs are unavailable.
+awk 'BEGIN{OFS="\t"} {print $1,0,$2,"genome"}' \
+  genomes/hg38/hg38.sizes > genomes/hg38/hg38.segments.bed
 
 # 4. Generate fixtures
 cd /path/to/genetics
@@ -69,8 +73,18 @@ bionpu-public/tools/run_20gene_crispor_fixtures.sh
    `bin/Azimuth-2.0/`. The pickled regressor was trained on Python 3.6 /
    sklearn 0.18 era. On Py3.11 + modern sklearn, the pickle either loads
    with warnings or fails outright. The harness sidesteps this via
-   `--noEffScores` if needed; the per-guide-Doench gate is a SOFT gate
-   per PRD §4.3 v0.2 status note (RS1 ≠ RS2 by construction).
+   `--noEffScores` by default in `tools/run_20gene_crispor_fixtures.sh`;
+   set `CRISPOR_NO_EFF_SCORES=0` only in an old sklearn-compatible
+   CRISPOR venv. The per-guide-Doench gate is a SOFT gate per PRD §4.3
+   v0.2 status note (RS1 ≠ RS2 by construction).
+
+4. **segments BED is not optional for CLI fixture generation**:
+   `hg38.segments.bed` cannot be empty with the pinned CRISPOR CLI path.
+   The filter step runs `overlapSelect <segments> stdin stdout`; an empty
+   BED removes every filtered BWA hit, leaving `{gene}_offtargets.tsv`
+   header-only and all guide specificity columns at `-1`. If no CRISPOR
+   gene-segment BED is available, generate whole-chromosome intervals from
+   `hg38.sizes` as shown above.
 
 4. **Some genes vs CRISPOR's annotation**: `AAVS1` is not a HGNC
    gene symbol (it's a locus name = PPP1R12C intron 1). CRISPOR's gene
@@ -212,7 +226,66 @@ remaining residual gates close.
 
 ## Per-gene deltas
 
-(empty until CRISPOR fixtures are generated.)
+## Generated pilot fixtures — 2026-04-29
+
+Local CRISPOR status:
+
+- Install path: `/home/matteius/crispor-install/crisporWebsite`
+- CRISPOR commit: `ed47b7e856010ad0f9f1660872563ef9f736e76c`
+- Python: `/home/matteius/crispor-install/venv/bin/python` = 3.11.15
+- Reference prep completed locally on 2026-04-29:
+  `hg38.fa.{amb,ann,bwt,pac,sa}`, `hg38.2bit`, `hg38.sizes`,
+  `genomeInfo.tab`, and whole-chromosome `hg38.segments.bed`.
+- `bwa index` wall time: 2963.414 s.
+- Azimuth blocker observed without `--noEffScores`:
+  `ModuleNotFoundError: No module named 'sklearn.ensemble._gb_losses'`.
+
+Pilot fixtures committed:
+
+- `AAVS1.tsv` / `AAVS1_offtargets.tsv`
+- `EMX1.tsv` / `EMX1_offtargets.tsv`
+
+Comparator results from:
+
+```bash
+uv run pytest tests/test_crispr_design_e2e_validation.py -q \
+  -k 'EMX1 or AAVS1 or genes_pinned_loadable'
+```
+
+### AAVS1
+
+- CRISPOR guides: 440
+- CRISPOR off-target rows: 185935
+- Top-20 agreement: **2/20** (hard gate < 18/20; known-XFAIL)
+- Top-50 Spearman ρ: **0.173** (hard gate < 0.85; known-XFAIL)
+- Off-target superset: known-XFAIL. bionpu locus sites = 3; CRISPOR
+  full-genome sites = 181950.
+- Per-site CFD: known-XFAIL. No shared per-site CFD entries because the
+  bionpu fixture is locus-scoped.
+- Doench rank correlation: known-XFAIL. `--noEffScores` leaves CRISPOR
+  Doench columns as `NotEnoughFlankSeq`; Azimuth is blocked by the sklearn
+  pickle import above.
+
+Interpretation: not a fixture-generation blocker and not a regression in
+this lane. This is the expected Tier 1 full-genome-vs-locus-scoped ranking
+gap now measured against a real CRISPOR fixture.
+
+### EMX1
+
+- CRISPOR guides: 260
+- CRISPOR off-target rows: 106864
+- Top-20 agreement: **5/20** (hard gate < 18/20; known-XFAIL)
+- Top-50 Spearman ρ: **-0.139** (hard gate < 0.85; known-XFAIL)
+- Off-target superset: known-XFAIL. bionpu locus sites = 0; CRISPOR
+  full-genome sites = 103741.
+- Per-site CFD: known-XFAIL. No shared per-site CFD entries because the
+  bionpu fixture is locus-scoped.
+- Doench rank correlation: known-XFAIL for the same `--noEffScores` /
+  Azimuth blocker as AAVS1.
+
+Interpretation: same as AAVS1. CRISPOR is installed and usable for fixture
+generation, but the newly generated reference fixtures expose the inherited
+Tier 1 ranking/off-target gap immediately.
 
 For each gene where a CRISPOR fixture is later generated and the
 harness reports a delta, append a section here keyed by gene + gate:

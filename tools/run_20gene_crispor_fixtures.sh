@@ -13,6 +13,9 @@
 #     .bwt/.pac/.sa) + hg38.2bit + hg38.sizes.
 #  3. CRISPOR Python deps (Python 3.11; biopython, twobitreader,
 #     pytabix, pandas, scipy, matplotlib, lmdbm, scikit-learn, xlwt).
+# Optional:
+#   CRISPOR_GENES=AAVS1,EMX1   # generate only selected symbols
+#   CRISPOR_NO_EFF_SCORES=0    # attempt Azimuth/RS2 efficiency scoring
 #
 # UCSC academic license; do NOT vendor CRISPOR source into bionpu-public.
 # Per `restrictive-license-model-policy.md` memory note (2026-04-28).
@@ -22,6 +25,7 @@ set -euo pipefail
 REPO="${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
 CRISPOR_DIR="${CRISPOR_DIR:-/home/$USER/crispor-install/crisporWebsite}"
 CRISPOR_PYTHON="${CRISPOR_PYTHON:-/home/$USER/crispor-install/venv/bin/python}"
+CRISPOR_NO_EFF_SCORES="${CRISPOR_NO_EFF_SCORES:-1}"
 FIXTURES="$REPO/bionpu-public/tests/fixtures/crispor_reference"
 PINNED_JSON="$FIXTURES/genes_pinned.json"
 
@@ -54,9 +58,17 @@ mapfile -t GENES < <("$CRISPOR_PYTHON" -c "
 import json, sys
 with open(sys.argv[1]) as fh:
     meta = json.load(fh)
+selected = {s.strip() for s in sys.argv[2].split(',') if s.strip()}
 for e in meta['genes']:
+    if selected and e['symbol'] not in selected:
+        continue
     print(f\"{e['symbol']}\\t{e['chrom']}\\t{e['start_1b']}\\t{e['end_1b']}\")
-" "$PINNED_JSON")
+" "$PINNED_JSON" "${CRISPOR_GENES:-}")
+
+CRISPOR_FLAGS=()
+if [[ "$CRISPOR_NO_EFF_SCORES" != "0" ]]; then
+  CRISPOR_FLAGS+=(--noEffScores)
+fi
 
 for gene_line in "${GENES[@]}"; do
   IFS=$'\t' read -r sym chrom start1 end1 <<< "$gene_line"
@@ -112,6 +124,7 @@ PY
   pushd "$CRISPOR_DIR" > /dev/null
   set +e
   "$CRISPOR_PYTHON" crispor.py \
+    "${CRISPOR_FLAGS[@]}" \
     --pam=NGG \
     --maxOcc=60000 \
     --mm=4 \

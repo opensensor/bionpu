@@ -1,0 +1,43 @@
+# Toolchain-gap report for pam_filter_iupac v0 (Track A v0).
+#
+# Populated post-build with any aiecc / Peano / IRON gaps observed.
+# Empty list at scaffolding time.
+
+gaps: []
+
+deferred_to_v1:
+  - id: "pyxrt_in_process"
+    description: >
+      In-process pyxrt dispatch path (mirrors primer_scan v2). Subprocess
+      path is the v0 ship boundary; in-process pyxrt amortises away the
+      ~100 ms subprocess fork + xclbin-register cost when the BE design
+      ranker dispatches multiple PAMs sequentially.
+    blocker: "none — direct port of primer_scan v2 path"
+
+  - id: "tile_rc_strand"
+    description: >
+      Reverse-complement on tile. Currently the host pre-flips the
+      buffer for an explicit RC pass (mirrors locked crispr/pam_filter).
+    blocker: "DM budget — RC requires per-base 2-bit complement"
+
+  - id: "off_target_compose"
+    description: >
+      Compose with locked match_multitile_memtile for full off-target
+      CFD scoring at the BE design ranker layer. v0 ranker reports
+      off_target_count=0 / cfd_aggregate=0.0 in synbio mode.
+    blocker: "ranker integration only; locked silicon already validated 1.90×"
+
+deferred_to_phase2:
+  - id: "phase2_cas9_variants"
+    description: >
+      SpRY (NRN), SaCas9-KKH (NNNRRT) entries in the acceptance gate.
+      Silicon kernel already supports both; v0 SCOPE clears wt + NG only.
+    blocker: "ranker tuning + bystander accounting validation"
+
+  - id: "phase3_be_hive_scorer"
+    description: >
+      BE-Hive / DeepBE-class neural per-bystander edit-rate predictor.
+      Per Track D's lessons (bf16 transformers stay on CPU), this
+      remains a CPU-only composition; the silicon kernel layer does
+      not change.
+    blocker: "CPU-side model training / vendoring policy"

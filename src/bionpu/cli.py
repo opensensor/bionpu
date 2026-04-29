@@ -1425,6 +1425,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_c_design.set_defaults(func=_cmd_crispr_design)
 
+    # be — Track A v0 base editor design (PRD-crispr-state-of-the-art-roadmap §3.1).
+    # The two-level shape (`bionpu be design ...`) leaves room for siblings
+    # (`bionpu be score`, `bionpu be batch`, ...) without further reshuffles.
+    p_be = sub.add_parser(
+        "be",
+        help=(
+            "Base editor (ABE/CBE) design. Track A v0: SpCas9 wt + "
+            "SpCas9-NG; BE4max + ABE7.10."
+        ),
+    )
+    sub_be = p_be.add_subparsers(dest="be_kind")
+
+    from .genomics.be_design.cli import add_be_design_subparser
+    add_be_design_subparser(sub_be)
+
     # placeholders — scope for v0.3+
     for name, help_text in (
         ("basecall", "Nanopore basecalling (v0.2+ scope)"),
@@ -1446,6 +1461,7 @@ def main(argv: list[str] | None = None) -> int:
         ("verify", "verify_kind"),
         ("bench", "bench_kind"),
         ("crispr", "crispr_kind"),
+        ("be", "be_kind"),
     ):
         if args.cmd == parent_cmd and getattr(args, kind_attr, None) is None:
             for action in p._subparsers._actions:  # type: ignore[attr-defined]

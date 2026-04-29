@@ -1,0 +1,31 @@
+{
+  "kernel": "bionpu_pam_filter_iupac",
+  "version": "v0",
+  "track": "A — base editor design",
+  "phase": "Phase 1 (v0)",
+  "shape": {
+    "pam_len_max": 8,
+    "supported_n_tiles": [1, 2, 4, 8],
+    "supported_n_chunks_per_launch": [1, 2, 4, 8],
+    "header_bytes": 24,
+    "record_bytes": 16,
+    "max_emit_idx": 2046,
+    "partial_out_bytes_padded": 32768,
+    "seq_in_chunk_bytes_base": 4096,
+    "seq_in_overlap": 8
+  },
+  "depends_on": ["primer_scan v0 (wire format)", "match_multitile_memtile (deferred for off-target in v1+)"],
+  "cross_validates_against": ["crispr/pam_filter (NGG-only locked v0)", "bionpu.data.pam_iupac_oracle (CPU oracle)"],
+  "scope_v0": {
+    "phase1_cas9_variants": ["wt", "NG"],
+    "phase1_be_variants": ["BE4max", "ABE7.10"],
+    "deferred_phase2": ["SpRY", "SaCas9-KKH", "ABE8e"],
+    "deferred_phase3": ["BE-Hive scoring (CPU)"]
+  },
+  "ship_boundary": [
+    "Single xclbin per (n_tiles) cell; no per-PAM rebuild.",
+    "Forward strand on tile; host runs RC pre-flip pass for reverse.",
+    "Off-target scan composition deferred to v1+ via locked match_multitile_memtile.",
+    "BE-Hive / DeepBE neural scorer stays on CPU per Track D's lessons."
+  ]
+}

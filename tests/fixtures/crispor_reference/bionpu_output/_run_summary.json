@@ -62,5 +62,21 @@
     },
     "status": "ok",
     "wall_clock_s": 6.244
+  },
+  "RUNX1": {
+    "guides_returned": 50,
+    "locus_bp": 1266734,
+    "n_candidates_total": 135421,
+    "n_off_target_hits": 1499854,
+    "stage_timings_s": {
+      "off_target_scan": 1705.2351610210026,
+      "off_target_score": 3.8125517670014233,
+      "on_target_score": 2.6116065089991025,
+      "pam_scan": 0.13726339599816129,
+      "rank_emit": 0.8105000169998675,
+      "target_resolve": 1.2419202669989318
+    },
+    "status": "ok",
+    "wall_clock_s": 1714.363
   }
 }

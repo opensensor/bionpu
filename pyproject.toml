@@ -40,6 +40,24 @@ dev = [
     "mypy",
     "build",
 ]
+# Track B (Prime Editor pegRNA design) runtime extras.
+# - viennarna: GPL; ViennaRNA Python bindings for pegRNA folding features (T4)
+# - PRIDICT 2.0 itself is MIT-licensed but NOT on PyPI; users must
+#   `git clone https://github.com/uzh-dqbm-cmi/PRIDICT2` and add it to
+#   PYTHONPATH (or use `pip install -e ./PRIDICT2` if upstream ever ships
+#   a setup.py). T1 probe doc: state/track-b-prereq-probe.md
+# - pandas pin: PRIDICT2 requires pandas <3.0 (pandas 3.x triggers
+#   "['seq_id'] not in index" inside their internal DataFrame indexing)
+pe = [
+    "viennarna>=2.6,<3.0",
+    "biopython>=1.81",
+    "pandas>=2.0,<3.0",
+    "scikit-learn>=1.3",
+    "primer3-py>=2.3",
+    "prettytable>=3.8",
+    "tqdm>=4.65",
+    "torch>=2.0",
+]
 
 [project.scripts]
 bionpu = "bionpu.cli:main"

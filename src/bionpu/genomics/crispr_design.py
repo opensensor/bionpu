@@ -645,6 +645,7 @@ def rank_guides(
     top_n: int,
     gc_min: float,
     gc_max: float,
+    synbio_mode: bool = False,
 ) -> list[RankedGuide]:
     """Build ranked output rows for emission.
 
@@ -691,16 +692,36 @@ def rank_guides(
         pam = on_row.dna[20:23].upper() if len(on_row.dna) >= 23 else ""
         gc = _gc_pct(spacer)
         rs1 = float(on_target_scores.get(gid, 0.0))
-        cfd_agg = float(cfd_aggregate_per_guide.get(gid, 100.0))
-        off_rows = off_target_rows_by_guide.get(gid, [])
-        off_cfd = cfd_per_off_target_by_guide.get(gid, [])
-        composite_crispor = compute_composite_crispor(
-            on_target_score=rs1, cfd_aggregate=cfd_agg
-        )
-        composite_bionpu = compute_composite_bionpu(
-            on_target_score=rs1, cfd_aggregate=cfd_agg
-        )
-        notes = _classify_notes(spacer, gc, gc_min=gc_min, gc_max=gc_max)
+        if synbio_mode:
+            # PRD §7.1 Q3: Mode C / synbio off-target scan is skipped;
+            # emit NaN sentinels and the NO_OFF_TARGET_SCAN flag so
+            # downstream consumers can't silently mistake them for
+            # "scanned, zero hits".
+            cfd_agg = float("nan")
+            off_target_count = -1  # sentinel; rendered as "NaN" in TSV
+            top_off_str = ""
+            # composite formulas treat NaN CFD as "neutral" (skip the
+            # off-target term) so the on-target score still drives ranking.
+            composite_crispor = max(0.0, min(1.0, rs1))
+            composite_bionpu = max(0.0, min(1.0, rs1))
+            note_flags = ["NO_OFF_TARGET_SCAN"]
+            extra = _classify_notes(spacer, gc, gc_min=gc_min, gc_max=gc_max)
+            if extra:
+                note_flags.append(extra)
+            notes = ";".join(note_flags)
+        else:
+            cfd_agg = float(cfd_aggregate_per_guide.get(gid, 100.0))
+            off_rows = off_target_rows_by_guide.get(gid, [])
+            off_cfd = cfd_per_off_target_by_guide.get(gid, [])
+            off_target_count = len(off_rows)
+            top_off_str = _format_top_off_targets(off_rows, off_cfd)
+            composite_crispor = compute_composite_crispor(
+                on_target_score=rs1, cfd_aggregate=cfd_agg
+            )
+            composite_bionpu = compute_composite_bionpu(
+                on_target_score=rs1, cfd_aggregate=cfd_agg
+            )
+            notes = _classify_notes(spacer, gc, gc_min=gc_min, gc_max=gc_max)
         candidates.append(
             RankedGuide(
                 rank=0,  # filled in after sort
@@ -713,8 +734,8 @@ def rank_guides(
                 gc_pct=gc,
                 on_target_score=rs1,
                 cfd_aggregate=cfd_agg,
-                off_target_count=len(off_rows),
-                top_off_targets=_format_top_off_targets(off_rows, off_cfd),
+                off_target_count=off_target_count,
+                top_off_targets=top_off_str,
                 composite_crispor=composite_crispor,
                 composite_bionpu=composite_bionpu,
                 ranked_by=rank_by,
@@ -740,11 +761,32 @@ def rank_guides(
     ]
 
 
+def _fmt_float(x: float, fmt: str = ".6f") -> str:
+    """Format a float, rendering NaN as the string ``"NaN"``.
+
+    Python's f-string default for NaN is ``"nan"`` lowercased; PRD §3.2
+    + the v1 brief specify ``"NaN"`` so a downstream consumer can
+    detect-and-skip with a literal-string compare.
+    """
+    import math
+
+    if math.isnan(x):
+        return "NaN"
+    return format(x, fmt)
+
+
+def _fmt_off_target_count(n: int) -> str:
+    """Format off_target_count: ``-1`` sentinel renders as ``"NaN"`` (synbio)."""
+    return "NaN" if n < 0 else str(n)
+
+
 def format_guides_tsv(rows: Iterable[RankedGuide]) -> bytes:
     """Serialise to the canonical TSV (LF newlines, header included).
 
     Score formatting policy: floats use ``%.6f`` to match
     :mod:`bionpu.scoring.types` (six decimals). Ints are unformatted.
+    Synbio mode (PRD §7.1 Q3): ``cfd_aggregate`` is NaN and
+    ``off_target_count`` is -1 sentinel; both render as ``"NaN"``.
     """
     parts: list[str] = ["\t".join(TSV_HEADER)]
     for g in rows:
@@ -759,12 +801,12 @@ def format_guides_tsv(rows: Iterable[RankedGuide]) -> bytes:
                     g.target_chrom,
                     str(g.target_pos),
                     f"{g.gc_pct:.2f}",
-                    f"{g.on_target_score:.6f}",
-                    f"{g.cfd_aggregate:.6f}",
-                    str(g.off_target_count),
+                    _fmt_float(g.on_target_score),
+                    _fmt_float(g.cfd_aggregate),
+                    _fmt_off_target_count(g.off_target_count),
                     g.top_off_targets,
-                    f"{g.composite_crispor:.6f}",
-                    f"{g.composite_bionpu:.6f}",
+                    _fmt_float(g.composite_crispor),
+                    _fmt_float(g.composite_bionpu),
                     g.ranked_by,
                     g.predicted_indel,
                     g.notes,
@@ -776,13 +818,37 @@ def format_guides_tsv(rows: Iterable[RankedGuide]) -> bytes:
 
 
 def format_result_json(result: "DesignRunResult") -> bytes:
-    """Serialise a design run to stable, machine-readable JSON."""
+    """Serialise a design run to stable, machine-readable JSON.
+
+    NaN values (synbio mode CFD + off_target_count sentinels) render as
+    JSON ``null`` so downstream consumers using strict JSON parsers
+    (PRD §3.2 — synthesis-vendor pipelines) still succeed.
+    """
+    import math
+
+    def _scrub(value):
+        if isinstance(value, float) and math.isnan(value):
+            return None
+        if isinstance(value, dict):
+            return {k: _scrub(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_scrub(v) for v in value]
+        return value
+
+    ranked_dicts = []
+    for g in result.ranked:
+        d = dataclasses.asdict(g)
+        # PRD §3.2: off_target_count -1 sentinel → null in JSON
+        if d.get("off_target_count", 0) < 0:
+            d["off_target_count"] = None
+        ranked_dicts.append(_scrub(d))
+
     payload = {
         "target": dataclasses.asdict(result.target),
         "n_candidates_total": result.n_candidates_total,
         "n_off_target_hits": result.n_off_target_hits,
         "stage_timings_s": result.stage_timings_s,
-        "ranked": [dataclasses.asdict(g) for g in result.ranked],
+        "ranked": ranked_dicts,
     }
     return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
@@ -850,6 +916,11 @@ def design_guides_for_target(
 
     timings: dict[str, float] = {}
 
+    # Mode C / synbio: when --genome none is set, off-target scan is
+    # skipped entirely (PRD §7.1 Q3 + §1.1). Output guides emit NaN
+    # sentinels + the NO_OFF_TARGET_SCAN flag.
+    synbio_mode = (genome == "none")
+
     # Stage 1 — target resolution.
     t0 = time.perf_counter()
     if target_fasta_path is not None:
@@ -878,14 +949,27 @@ def design_guides_for_target(
     # follow-up agent's full-GRCh38 dispatch. Off-targets here include
     # any non-on-target hit (different position or different sequence
     # at <=N mismatches).
+    # Synbio mode: skip Stage 3 entirely; we still need a list of
+    # on-target rows (one per candidate guide) so Stage 5 can emit
+    # them — synthesise via cpu_scan but only resolve the on-target
+    # site (no mismatch search needed).
     t0 = time.perf_counter()
-    all_hits = _scan_locus_for_offtargets(
-        resolved=resolved,
-        candidate_guides=candidate_guides,
-        max_mismatches=max_mismatches,
-        device=device,
-        silicon_lock_label=silicon_lock_label,
-    )
+    if synbio_mode:
+        all_hits = _scan_locus_for_offtargets(
+            resolved=resolved,
+            candidate_guides=candidate_guides,
+            max_mismatches=0,  # only on-target hits
+            device="cpu",  # synbio is small, always CPU
+            silicon_lock_label=silicon_lock_label,
+        )
+    else:
+        all_hits = _scan_locus_for_offtargets(
+            resolved=resolved,
+            candidate_guides=candidate_guides,
+            max_mismatches=max_mismatches,
+            device=device,
+            silicon_lock_label=silicon_lock_label,
+        )
     timings["off_target_scan"] = time.perf_counter() - t0
 
     # Identify on-targets vs off-targets.
@@ -926,9 +1010,12 @@ def design_guides_for_target(
 
     # Stage 4b — off-target CFD aggregation.
     t0 = time.perf_counter()
-    cfd_per_guide_aggregate, cfd_per_off_target_by_guide = (
-        _score_off_target_cfd(off_target_rows_by_guide)
-    )
+    if synbio_mode:
+        cfd_per_guide_aggregate, cfd_per_off_target_by_guide = {}, {}
+    else:
+        cfd_per_guide_aggregate, cfd_per_off_target_by_guide = (
+            _score_off_target_cfd(off_target_rows_by_guide)
+        )
     timings["off_target_score"] = time.perf_counter() - t0
 
     # Stage 5 — rank + emit.
@@ -944,6 +1031,7 @@ def design_guides_for_target(
         top_n=top_n,
         gc_min=gc_min,
         gc_max=gc_max,
+        synbio_mode=synbio_mode,
     )
     tsv_bytes = format_guides_tsv(ranked)
     timings["rank_emit"] = time.perf_counter() - t0

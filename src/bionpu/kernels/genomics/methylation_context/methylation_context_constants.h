@@ -8,7 +8,7 @@
 #include <stdint.h>
 
 static constexpr int32_t MC_SEQ_IN_CHUNK_BYTES_BASE = 4096;
-static constexpr int32_t MC_SEQ_IN_OVERLAP = 1;
+static constexpr int32_t MC_SEQ_IN_OVERLAP = 4;
 static constexpr int32_t MC_HEADER_BYTES = 8;
 static constexpr int32_t MC_PARTIAL_OUT_BYTES_PADDED = 32768;
 static constexpr int32_t MC_RECORD_BYTES = 8;

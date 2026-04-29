@@ -442,6 +442,55 @@ def test_trim_fastq_batched_byte_equal_unbatched_cpu(tmp_path: Path):
     assert out_v0.read_bytes() == out_v1.read_bytes()
 
 
+def test_trim_cli_npu_batch_size_uses_batched_path(monkeypatch, tmp_path: Path):
+    """The production CLI must route NPU batch_size>1 through v1 batching."""
+    from argparse import Namespace
+
+    import bionpu.genomics.adapter_trim.cli as trim_cli
+    import bionpu.kernels.genomics.primer_scan as primer_scan
+
+    calls: list[tuple[str, int | None]] = []
+
+    class _FakePrimerScan:
+        p = len(ADAPTER)
+        n_tiles = 4
+        name = "fake_primer_scan"
+        artifact_dir = tmp_path
+
+        def __init__(self, *, primer: str, n_tiles: int) -> None:
+            self.primer = primer
+            self.n_tiles = n_tiles
+
+        def artifacts_present(self) -> bool:
+            return True
+
+    def _fake_batched(*args, **kwargs):
+        calls.append(("batched", kwargs.get("batch_size")))
+        return TrimStats()
+
+    def _fake_unbatched(*args, **kwargs):
+        calls.append(("unbatched", None))
+        return TrimStats()
+
+    monkeypatch.setattr(primer_scan, "BionpuPrimerScan", _FakePrimerScan)
+    monkeypatch.setattr(trim_cli, "trim_fastq_batched", _fake_batched)
+    monkeypatch.setattr(trim_cli, "trim_fastq", _fake_unbatched)
+
+    args = Namespace(
+        adapter=ADAPTER,
+        in_path=str(tmp_path / "in.fastq"),
+        out_path=str(tmp_path / "out.fastq"),
+        device="npu",
+        n_tiles=4,
+        batch_size=128,
+        no_progress=True,
+        quiet=True,
+    )
+
+    assert trim_cli.run_cli(args) == 0
+    assert calls == [("batched", 128)]
+
+
 def test_trim_records_batched_sentinel_no_false_positives():
     """Sentinel design: a read ending in a partial T-run that
     concatenates with the next read's start cannot create a spurious

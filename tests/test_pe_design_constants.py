@@ -296,12 +296,15 @@ def test_namedtuple_types_have_expected_fields():
         "confidence",
         "notes",
     )
+    # v0.1: ``in_paralog`` appended at the end with default False so
+    # v0 callers that construct via positional args remain wire-compat.
     assert OffTargetSite._fields == (
         "chrom",
         "pos",
         "strand",
         "mismatches",
         "cfd_score",
+        "in_paralog",
     )
 
 

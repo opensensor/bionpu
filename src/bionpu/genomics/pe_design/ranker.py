@@ -85,7 +85,25 @@ __all__ = [
     "rank_candidates",
     "mfe_penalty",
     "compute_composite",
+    "split_cfd_aggregates",
+    "TOPK_CFD_AGGREGATE_BOUND",
 ]
+
+
+# ---------------------------------------------------------------------------
+# v0.1 — Top-K CFD aggregator bound (numerical stability)
+#
+# The v0 CFD aggregator (CRISPOR-style 100 / (100 + Σ_off CFD * 100))
+# is mathematically bounded in [0, 100] regardless of off-target count.
+# In practice the "100" formula already protects against numerical
+# overflow because the denominator monotonically grows. The bound here
+# is the per-spacer cap on how many off-target rows we consider when
+# splitting the aggregate across paralog vs non-paralog buckets — a
+# huge paralog cluster (e.g. HBB cluster's ~200 hits) collapses to its
+# top-K worst contributors so the recomputed split aggregates stay
+# numerically identical to the all-rows aggregate but the per-bucket
+# attribution is bounded.
+TOPK_CFD_AGGREGATE_BOUND = 200
 
 
 # ---------------------------------------------------------------------------
@@ -175,34 +193,25 @@ def _make_pegrna_id(candidate: PegRNACandidate) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _safe_score_pridict(
+def _try_score_once(
     scorer: Any,
     *,
     pegrna_seq: str,
     scaffold_variant: str,
     target_context: str,
     folding_features: PegRNAFoldingFeatures | None,
-    spacer_dna: str | None = None,
-    pbs_dna: str | None = None,
-    rtt_dna: str | None = None,
-) -> tuple[PRIDICTScore | None, bool]:
-    """Score one pegRNA, swallowing any exception.
+    spacer_dna: str | None,
+    pbs_dna: str | None,
+    rtt_dna: str | None,
+) -> PRIDICTScore | None:
+    """Score one pegRNA against the scorer, swallowing exceptions.
 
-    Returns ``(score, failed)`` — ``score`` is ``None`` when ``failed``.
-
-    Component hints (``spacer_dna``/``pbs_dna``/``rtt_dna``) are
-    forwarded to scorers that accept them (canonical
-    :class:`bionpu.scoring.pridict2.PRIDICT2Scorer`); they enable the
-    scaffold-invariant component-triple match against PRIDICT's
-    enumeration cache when T6's assembled pegRNA string differs from
-    PRIDICT's (the standard case — T6 ships the Anzalone-2019
-    canonical scaffold body while PRIDICT's pegRNAfinder bakes in
-    Chen 2013's F+E optimised scaffold). Test stubs that only accept
-    the legacy 4-arg signature still work because the ranker drops
-    the hints on TypeError-fallback.
+    Returns the :class:`PRIDICTScore` (which may itself carry NaN
+    values + failure-flag notes from PRIDICT) or ``None`` when scoring
+    raised.
     """
     try:
-        score = scorer.score(
+        return scorer.score(
             pegrna_seq,
             scaffold_variant=scaffold_variant,
             target_context=target_context,
@@ -216,17 +225,190 @@ def _safe_score_pridict(
         # Fall back to the legacy signature; component-triple lookup
         # is opportunistic, never required.
         try:
-            score = scorer.score(
+            return scorer.score(
                 pegrna_seq,
                 scaffold_variant=scaffold_variant,
                 target_context=target_context,
                 folding_features=folding_features,
             )
         except Exception:  # noqa: BLE001 — explicit policy: NaN-and-flag
-            return None, True
+            return None
     except Exception:  # noqa: BLE001 — explicit policy: NaN-and-flag
-        return None, True
-    return score, False
+        return None
+
+
+def _safe_score_pridict(
+    scorer: Any,
+    *,
+    pegrna_seq: str,
+    scaffold_variant: str,
+    target_context: str,
+    folding_features: PegRNAFoldingFeatures | None,
+    spacer_dna: str | None = None,
+    pbs_dna: str | None = None,
+    rtt_dna: str | None = None,
+) -> tuple[PRIDICTScore | None, bool, list[str]]:
+    """Score one pegRNA, swallowing any exception.
+
+    Returns ``(score, failed, extra_notes)`` — ``score`` is ``None``
+    when ``failed``; ``extra_notes`` carries any v0.1 retry markers
+    the ranker should append to the candidate's notes.
+
+    Component hints (``spacer_dna``/``pbs_dna``/``rtt_dna``) are
+    forwarded to scorers that accept them (canonical
+    :class:`bionpu.scoring.pridict2.PRIDICT2Scorer`); they enable the
+    scaffold-invariant component-triple match against PRIDICT's
+    enumeration cache when T6's assembled pegRNA string differs from
+    PRIDICT's (the standard case — T6 ships the Anzalone-2019
+    canonical scaffold body while PRIDICT's pegRNAfinder bakes in
+    Chen 2013's F+E optimised scaffold). Test stubs that only accept
+    the legacy 4-arg signature still work because the ranker drops
+    the hints on TypeError-fallback.
+
+    v0.1 — G-prefix retry
+    ---------------------
+    PRIDICT 2.0's ``pegRNAfinder`` enforces a 5'-``G`` constraint on
+    every enumerated spacer (U6 promoter transcription convention:
+    Pol-III initiates with ``G``). T6's enumerator emits the genomic
+    spacer verbatim — when the genomic protospacer starts with
+    ``A``/``C``/``T``, no PRIDICT row matches the candidate's
+    component triple and PRIDICT returns ``PEGRNA_NOT_ENUMERATED_BY_
+    PRIDICT``.
+
+    The fix: when the first scoring attempt returns that flag AND the
+    candidate spacer starts with a non-``G`` base, retry once with
+    ``G + spacer[1:]``. The retry's efficiency is the canonical
+    PRIDICT-published value for the U6-transcribed spacer (which is
+    what wet-lab labs would actually use). The ranker tags the
+    candidate with ``PRIDICT_GPREFIX_RETRY`` so the TSV/JSON downstream
+    surfaces the substitution.
+
+    This is the root-cause fix for the Track B v0 HBB NaN regression
+    (``track-b-v0-1-paralog-fix-plan.md``). The HBB top-1 spacer
+    ``ATATCCCCCAGTTTAGTAGT`` doesn't match any PRIDICT row, but
+    ``GTATCCCCCAGTTTAGTAGT`` (G-prefix) returns 153 PRIDICT rows with
+    HEK efficiencies in the 60-65% range.
+    """
+    extra_notes: list[str] = []
+
+    score = _try_score_once(
+        scorer,
+        pegrna_seq=pegrna_seq,
+        scaffold_variant=scaffold_variant,
+        target_context=target_context,
+        folding_features=folding_features,
+        spacer_dna=spacer_dna,
+        pbs_dna=pbs_dna,
+        rtt_dna=rtt_dna,
+    )
+    if score is None:
+        return None, True, extra_notes
+
+    needs_gprefix_retry = (
+        spacer_dna is not None
+        and len(spacer_dna) >= 1
+        and spacer_dna[0].upper() != "G"
+        and "PEGRNA_NOT_ENUMERATED_BY_PRIDICT" in tuple(score.notes)
+    )
+    if not needs_gprefix_retry:
+        return score, False, extra_notes
+
+    gprefix_spacer = "G" + spacer_dna[1:]
+    # Bypass the per-pegRNA score cache: the cache keys on the full
+    # pegrna_seq when supplied, so passing the original pegrna_seq
+    # would just return the cached NaN. Drop pegrna_seq to "" so the
+    # cache key flips to the component-triple form and includes the
+    # G-prefixed spacer in the cache identity.
+    retry = _try_score_once(
+        scorer,
+        pegrna_seq="",
+        scaffold_variant=scaffold_variant,
+        target_context=target_context,
+        folding_features=folding_features,
+        spacer_dna=gprefix_spacer,
+        pbs_dna=pbs_dna,
+        rtt_dna=rtt_dna,
+    )
+    if (
+        retry is not None
+        and "PEGRNA_NOT_ENUMERATED_BY_PRIDICT" not in tuple(retry.notes)
+        and "PRIDICT_FAILED" not in tuple(retry.notes)
+    ):
+        # The retry produced a real efficiency — adopt it and tag
+        # the candidate with the substitution marker.
+        extra_notes.append("PRIDICT_GPREFIX_RETRY")
+        return retry, False, extra_notes
+
+    # Retry didn't recover — return the original (NaN-bearing) score
+    # so the candidate carries PEGRNA_NOT_ENUMERATED_BY_PRIDICT
+    # downstream as before.
+    return score, False, extra_notes
+
+
+def split_cfd_aggregates(
+    sites: Iterable,
+    *,
+    topk_bound: int = TOPK_CFD_AGGREGATE_BOUND,
+) -> tuple[float, float, int, int]:
+    """Split a list of off-target sites into paralog vs non-paralog
+    CRISPOR-style CFD aggregates.
+
+    Returns ``(cfd_non_paralog, cfd_paralog, count_non_paralog,
+    count_paralog)`` where each cfd aggregate is computed via the
+    standard CRISPOR specificity formula::
+
+        cfd = 100 * 100 / (100 + 100 * sum(per_site_cfd))
+
+    Range [0, 100]; 100 means "no hits in this bucket".
+
+    Per-site rows with ``mismatches == 0`` (the on-target itself) are
+    excluded from BOTH buckets so the formula matches
+    :func:`bionpu.scoring.cfd.aggregate_cfd` with
+    ``exclude_on_target=True``.
+
+    v0.1 — Top-K bound (numerical stability)
+    ----------------------------------------
+    When either bucket has more than ``topk_bound`` rows, only the
+    top-K worst-scoring hits contribute to the bucket's aggregate.
+    The CRISPOR formula's denominator is monotonic in the per-site
+    sum so truncating to top-K is conservative (yields the same or
+    smaller aggregate). With the v0.1 default ``TOPK_CFD_AGGREGATE_
+    BOUND = 200``, the HBB paralog cluster (~200 hits across the
+    hemoglobin family) stays fully accounted for; clusters denser
+    than that get a Top-K bound that protects the downstream
+    composite formula from extreme values.
+    """
+    para_scores: list[float] = []
+    non_para_scores: list[float] = []
+    para_count = 0
+    non_para_count = 0
+
+    for site in sites:
+        # OffTargetSite is a NamedTuple — access fields by name.
+        if int(getattr(site, "mismatches", 0)) == 0:
+            continue  # on-target excluded per CRISPOR convention
+        cfd = float(getattr(site, "cfd_score", 0.0))
+        if bool(getattr(site, "in_paralog", False)):
+            para_scores.append(cfd)
+            para_count += 1
+        else:
+            non_para_scores.append(cfd)
+            non_para_count += 1
+
+    def _topk_sum(scores: list[float]) -> float:
+        if len(scores) <= topk_bound:
+            return sum(scores)
+        # Use partial sort: sorted descending, take top K.
+        return sum(sorted(scores, reverse=True)[:topk_bound])
+
+    def _crispor(scores: list[float]) -> float:
+        s = _topk_sum(scores)
+        # 100 / (1 + sum) on the per-site scale, expressed 0-100.
+        return 100.0 * 100.0 / (100.0 + 100.0 * s)
+
+    cfd_non = _crispor(non_para_scores) if non_para_scores else 100.0
+    cfd_par = _crispor(para_scores) if para_scores else 100.0
+    return cfd_non, cfd_par, non_para_count, para_count
 
 
 def _scan_off_targets(
@@ -234,16 +416,52 @@ def _scan_off_targets(
     spacer: str,
     *,
     max_mismatches: int,
-) -> tuple[float, int]:
-    """Run the off-target callable and return ``(cfd_aggregate, count)``.
+) -> tuple[float, float, int, int, float, int]:
+    """Run the off-target callable and return the v0.1 split aggregates.
 
     The callable's full signature in production (T11) returns
-    ``(sites_list, cfd_aggregate, count)``; the ranker only needs the
-    aggregate + count for composite + reporting.
+    ``(sites_list, cfd_aggregate, count)``. v0.1 splits the per-site
+    rows into paralog vs non-paralog buckets; v0 callers (and stubs
+    that don't populate ``OffTargetSite.in_paralog``) collapse to the
+    single-bucket result transparently because ``in_paralog`` defaults
+    to ``False``.
+
+    Returns
+    -------
+    tuple
+        ``(cfd_aggregate_non_paralog, cfd_aggregate_paralog,
+        count_non_paralog, count_paralog, cfd_aggregate_legacy,
+        count_legacy)``. ``legacy`` carries the v0 single-bucket value
+        the off-target adapter computed (preserves byte-equality with
+        the existing test suite when no paralog spans were supplied —
+        which then equals the non-paralog bucket since
+        ``in_paralog`` is always False in that case).
     """
-    sites, cfd_agg, count = off_target_scan_fn(spacer, max_mismatches=max_mismatches)
-    del sites  # T8 doesn't surface per-site rows; T9/T10 may.
-    return float(cfd_agg), int(count)
+    sites, cfd_agg_legacy, count_legacy = off_target_scan_fn(
+        spacer, max_mismatches=max_mismatches
+    )
+    cfd_non, cfd_par, count_non, count_par = split_cfd_aggregates(sites)
+
+    # Backward-compat with v0 callers / test stubs that pass an empty
+    # `sites` list together with a precomputed legacy aggregate (e.g.
+    # the test_pe_design_ranker.py fixtures hand-pick the cfd value).
+    # When the per-site rows are empty AND the legacy aggregate carries
+    # information, treat the legacy value as the non-paralog bucket
+    # (paralog bucket stays at default 100.0 / 0 hits since we can't
+    # know the split without the rows).
+    if not sites and (
+        float(cfd_agg_legacy) != 100.0 or int(count_legacy) != 0
+    ):
+        cfd_non = float(cfd_agg_legacy)
+        count_non = int(count_legacy)
+    return (
+        cfd_non,
+        cfd_par,
+        count_non,
+        count_par,
+        float(cfd_agg_legacy),
+        int(count_legacy),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +531,7 @@ def rank_candidates(
     # full RNA sequence so identical pegRNAs (rare but possible across
     # variants) share work.
     folding_cache: dict[str, PegRNAFoldingFeatures] = {}
-    off_target_cache: dict[str, tuple[float, int]] = {}
+    off_target_cache: dict[str, tuple[float, float, int, int]] = {}
 
     rows: list[RankedPegRNA] = []
 
@@ -352,7 +570,7 @@ def rank_candidates(
         # fall back to a scaffold-invariant component-wise match
         # against PRIDICT's enumeration cache when T6's full
         # assembled pegRNA string differs from PRIDICT's (T10 surface).
-        pridict_score, failed = _safe_score_pridict(
+        pridict_score, failed, gprefix_notes = _safe_score_pridict(
             scorer,
             pegrna_seq=cand.full_pegrna_rna_seq,
             scaffold_variant=cand.scaffold_variant,
@@ -376,30 +594,60 @@ def rank_candidates(
             for note in pridict_score.notes:
                 if note not in notes:
                     notes.append(note)
+        # Propagate the v0.1 G-prefix-retry tag if it fired.
+        for n in gprefix_notes:
+            if n not in notes:
+                notes.append(n)
 
         # ---- Off-target scan (pegRNA spacer) ------------------------ #
+        # v0.1 split aggregates: cfd_pegrna == non-paralog hits (the
+        # safety penalty in the composite); cfd_paralog_pegrna ==
+        # in-paralog hits (informational, NOT in composite).
         if cand.spacer_seq in off_target_cache:
-            cfd_pegrna, count_pegrna = off_target_cache[cand.spacer_seq]
-        else:
-            cfd_pegrna, count_pegrna = _scan_off_targets(
-                off_target_scan_fn,
-                cand.spacer_seq,
-                max_mismatches=max_mismatches,
+            cfd_pegrna, cfd_paralog_pegrna, count_pegrna, count_paralog_pegrna = (
+                off_target_cache[cand.spacer_seq]
             )
-            off_target_cache[cand.spacer_seq] = (cfd_pegrna, count_pegrna)
+        else:
+            cfd_pegrna, cfd_paralog_pegrna, count_pegrna, count_paralog_pegrna, _, _ = (
+                _scan_off_targets(
+                    off_target_scan_fn,
+                    cand.spacer_seq,
+                    max_mismatches=max_mismatches,
+                )
+            )
+            off_target_cache[cand.spacer_seq] = (
+                cfd_pegrna,
+                cfd_paralog_pegrna,
+                count_pegrna,
+                count_paralog_pegrna,
+            )
 
         # ---- Off-target scan (PE3 nicking spacer) ------------------- #
         if is_pe3:
             nick_spacer = cand.nicking_spacer
             if nick_spacer in off_target_cache:
-                cfd_nicking, count_nicking = off_target_cache[nick_spacer]
+                cfd_nicking, _cfd_par_nick, count_nicking, _count_par_nick = (
+                    off_target_cache[nick_spacer]
+                )
             else:
-                cfd_nicking, count_nicking = _scan_off_targets(
+                (
+                    cfd_nicking,
+                    _cfd_par_nick,
+                    count_nicking,
+                    _count_par_nick,
+                    _,
+                    _,
+                ) = _scan_off_targets(
                     off_target_scan_fn,
                     nick_spacer,
                     max_mismatches=max_mismatches,
                 )
-                off_target_cache[nick_spacer] = (cfd_nicking, count_nicking)
+                off_target_cache[nick_spacer] = (
+                    cfd_nicking,
+                    _cfd_par_nick,
+                    count_nicking,
+                    _count_par_nick,
+                )
             cfd_nicking_field: float | None = cfd_nicking
             count_nicking_field: int | None = count_nicking
             nicking_spacer_field: str | None = cand.nicking_spacer
@@ -413,6 +661,8 @@ def rank_candidates(
             nicking_distance_field = None
 
         # ---- Composite score ---------------------------------------- #
+        # v0.1: composite uses ONLY the non-paralog CFD aggregate (the
+        # paralog hits are surfaced separately as informational data).
         composite = compute_composite(
             pridict_efficiency=efficiency,
             cfd_aggregate_pegrna=cfd_pegrna,
@@ -454,6 +704,8 @@ def rank_candidates(
                 composite_pridict=composite,
                 rank=0,  # filled in after sort
                 notes=tuple(notes),
+                paralog_hit_count_pegrna=count_paralog_pegrna,
+                cfd_aggregate_paralog_pegrna=cfd_paralog_pegrna,
             )
         )
 

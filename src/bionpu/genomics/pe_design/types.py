@@ -297,6 +297,16 @@ class OffTargetSite(NamedTuple):
     cfd_score:
         Per-site CFD (cutting frequency determination) score; range
         [0, 1] where 1 = perfect on-target predicted activity.
+    in_paralog:
+        ``True`` when the hit's ``(chrom, pos)`` falls inside a
+        paralog gene span of the on-target gene (per
+        :mod:`bionpu.data.paralog_mapper`). Track B v0.1 split
+        aggregates: in-paralog hits are excluded from the safety-
+        penalty CFD aggregate (the ``cfd_aggregate_pegrna`` term in
+        the composite score) and reported separately as
+        ``cfd_aggregate_paralog_pegrna``. Defaults to ``False`` so
+        callers that don't supply paralog metadata stay on the v0
+        codepath (every hit treated as a true off-target).
     """
 
     chrom: str
@@ -304,6 +314,7 @@ class OffTargetSite(NamedTuple):
     strand: str
     mismatches: int
     cfd_score: float
+    in_paralog: bool = False
 
 
 # ----------------------------------------------------------------------
@@ -370,3 +381,20 @@ class RankedPegRNA:
     composite_pridict: float
     rank: int
     notes: tuple[str, ...] = field(default_factory=tuple)
+
+    # ---- v0.1 paralog-aware off-target split (Track B v0.1) ---------- #
+    # These columns extend the v0 schema at the END so the v0 TSV
+    # column order remains stable for the first 32 columns; v0.1
+    # readers see two new optional columns 33-34.
+    #
+    # paralog_hit_count_pegrna == count of off-target hits whose
+    # OffTargetSite.in_paralog is True (excluded from
+    # cfd_aggregate_pegrna and reported separately here).
+    #
+    # cfd_aggregate_paralog_pegrna == CRISPOR-style specificity computed
+    # over the in-paralog hits ONLY. Range [0, 100]; 100 means "no
+    # in-paralog hits at all". Always emitted when the on-target gene
+    # has a known paralog family; 0.0 default + count 0 when the
+    # paralog map didn't apply (unknown gene OR no in-paralog hits).
+    paralog_hit_count_pegrna: int = 0
+    cfd_aggregate_paralog_pegrna: float = 100.0

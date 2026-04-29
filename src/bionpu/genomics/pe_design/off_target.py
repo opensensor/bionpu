@@ -56,9 +56,10 @@ remains correct: the silicon dispatch will go through
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from bionpu.data.canonical_sites import CasOFFinderRow
+from bionpu.data.paralog_mapper import GeneSpan, is_in_any_paralog
 from bionpu.genomics.pe_design.types import OffTargetSite
 from bionpu.scan import GuideSpec, cpu_scan
 from bionpu.scoring.cfd import CFDScorer, aggregate_cfd
@@ -113,6 +114,7 @@ def off_target_scan_for_spacer(
     genome_path: Path | str,
     *,
     max_mismatches: int = 4,
+    paralog_spans: Sequence[GeneSpan] | None = None,
 ) -> tuple[list[OffTargetSite], float, int]:
     """Run an off-target scan for a single spacer; return adapter shape.
 
@@ -138,6 +140,17 @@ def off_target_scan_for_spacer(
     max_mismatches:
         Maximum allowed mismatches in the 20-nt spacer region.
         Default 4 (matches :data:`bionpu.genomics.crispr_design.DEFAULT_MAX_MISMATCHES`).
+    paralog_spans:
+        Optional list of :class:`bionpu.data.paralog_mapper.GeneSpan`
+        for the on-target gene's paralogs. When supplied, each
+        emitted :class:`OffTargetSite` carries ``in_paralog=True``
+        when its ``(chrom, pos)`` falls inside any paralog span. The
+        T8 ranker uses this flag to split the CFD aggregate into the
+        ``cfd_aggregate_pegrna`` (non-paralog hits, the safety
+        penalty) and ``cfd_aggregate_paralog_pegrna`` (in-paralog
+        hits, informational) terms. v0 callers that don't pass this
+        argument get every hit tagged ``in_paralog=False`` (v0
+        codepath: every hit treated as a true off-target).
 
     Returns
     -------
@@ -209,8 +222,16 @@ def off_target_scan_for_spacer(
     # Build the OffTargetSite list. Iterate in the canonical row order
     # (the order cpu_scan returned) so callers that hash the list get
     # deterministic content for a deterministic input.
+    spans = list(paralog_spans) if paralog_spans else []
     sites: list[OffTargetSite] = []
     for raw, scored in zip(all_rows, scored_rows, strict=True):
+        in_par = (
+            is_in_any_paralog(
+                chrom=raw.chrom, pos_0b=int(raw.start), paralog_spans=spans
+            )
+            if spans
+            else False
+        )
         sites.append(
             OffTargetSite(
                 chrom=raw.chrom,
@@ -218,6 +239,7 @@ def off_target_scan_for_spacer(
                 strand=raw.strand,
                 mismatches=int(raw.mismatches),
                 cfd_score=float(scored.score),
+                in_paralog=in_par,
             )
         )
 

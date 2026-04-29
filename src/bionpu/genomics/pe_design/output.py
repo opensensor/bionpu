@@ -117,14 +117,19 @@ TSV_HEADER: tuple[str, ...] = (
     "composite_pridict",
     "rank",
     "notes",
+    # v0.1 — paralog-aware split aggregate (appended at end so the
+    # first 32 columns remain stable for v0 readers).
+    "paralog_hit_count_pegrna",
+    "cfd_aggregate_paralog_pegrna",
 )
 
 # Plan §T9 prose calls this the "31-column TSV"; the enumerated columns
 # in the same section actually total 32 (note that ``rt_product_seq``
-# was added per the reviewer-gap update). The dataclass field set
+# was added per the reviewer-gap update). v0.1 appends two paralog-aware
+# columns at the end so the count is now 34. The dataclass field set
 # matches; we lock the count here so a future schema drift trips a
 # loud assertion rather than silently emitting the wrong shape.
-assert len(TSV_HEADER) == 32
+assert len(TSV_HEADER) == 34
 
 FLOAT_FORMAT = ".6g"
 
@@ -177,6 +182,9 @@ _FIELD_TYPES: dict[str, str] = {
     "composite_pridict": "float",
     "rank": "int",
     "notes": "notes",
+    # v0.1 paralog-aware split aggregate columns.
+    "paralog_hit_count_pegrna": "int",
+    "cfd_aggregate_paralog_pegrna": "float",
 }
 
 assert set(_FIELD_TYPES.keys()) == set(TSV_HEADER), (
@@ -379,19 +387,37 @@ def read_tsv(path) -> list[RankedPegRNA]:
     if not lines:
         return []
     header = tuple(lines[0].split("\t"))
-    if header != TSV_HEADER:
+    # v0.1 backward-compat: v0 TSVs (32 cols, no paralog columns) read
+    # through the same path; missing paralog cells default to the
+    # v0-equivalent values (0 hits / 100.0 specificity). v1+ readers
+    # MUST emit the full 34-col header to avoid this fallback.
+    n_actual = len(header)
+    n_canonical = len(TSV_HEADER)
+    if header == TSV_HEADER:
+        compat_v0 = False
+    elif header == TSV_HEADER[:32] and n_actual == 32:
+        compat_v0 = True
+    else:
         raise ValueError(
-            f"unexpected TSV header (got {len(header)} cols, expected "
-            f"{len(TSV_HEADER)}); first mismatch column: "
+            f"unexpected TSV header (got {n_actual} cols, expected "
+            f"{n_canonical} or v0-compat 32); first mismatch column: "
             f"{next((a for a, b in zip(header, TSV_HEADER) if a != b), '?')}"
         )
 
     out: list[RankedPegRNA] = []
     for line in lines[1:]:
         cells = line.split("\t")
-        if len(cells) != len(TSV_HEADER):
+        if compat_v0:
+            # Pad missing v0.1 paralog columns with their v0-equivalent
+            # defaults: count=0, specificity=100.0.
+            if len(cells) != 32:
+                raise ValueError(
+                    f"v0-compat row has {len(cells)} cells, expected 32"
+                )
+            cells = cells + ["0", "100"]
+        if len(cells) != n_canonical:
             raise ValueError(
-                f"row has {len(cells)} cells, expected {len(TSV_HEADER)}"
+                f"row has {len(cells)} cells, expected {n_canonical}"
             )
         cell_map = dict(zip(TSV_HEADER, cells, strict=True))
         pe_strategy = cell_map["pe_strategy"]
@@ -448,6 +474,11 @@ def read_json(path) -> list[RankedPegRNA]:
         raise ValueError("expected a JSON list at the document root")
 
     out: list[RankedPegRNA] = []
+    # v0.1 backward-compat: when the JSON payload lacks the new paralog
+    # columns, fall back to the v0-equivalent defaults (count=0,
+    # specificity=100.0). Missing-key sentinel chosen so we can
+    # distinguish "key absent (v0)" from "key present with null".
+    _MISSING = object()
     for d in payload:
         if not isinstance(d, dict):
             raise ValueError("expected each list element to be a JSON object")
@@ -456,7 +487,16 @@ def read_json(path) -> list[RankedPegRNA]:
             raise ValueError("missing required string field `pe_strategy`")
         kwargs: dict = {}
         for col in TSV_HEADER:
-            raw = d.get(col, None) if col != "notes" else d.get("notes", [])
+            if col == "notes":
+                raw = d.get("notes", [])
+            elif col in ("paralog_hit_count_pegrna", "cfd_aggregate_paralog_pegrna"):
+                raw = d.get(col, _MISSING)
+                if raw is _MISSING:
+                    # v0 JSON document — supply v0-equivalent defaults.
+                    kwargs[col] = 0 if col == "paralog_hit_count_pegrna" else 100.0
+                    continue
+            else:
+                raw = d.get(col, None)
             kwargs[col] = _parse_json_value(
                 raw,
                 _FIELD_TYPES[col],

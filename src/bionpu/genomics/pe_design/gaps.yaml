@@ -1,0 +1,70 @@
+# Track B v0 / v0.1 — pe_design pipeline gap surface.
+# Schema: bionpu/report/gaps.schema.json (v1.0.0).
+#
+# Track B v0 (T1-T14): SHIPPED 2026-04-28. Smoke covering BRCA1, TP53,
+# EGFR, HBB, MYC across three modes (gene-symbol fetch, user FASTA
+# window, synbio plasmid) — 5/5 PASS, max per-target wall 92.6 s,
+# determinism BYTE-EQUAL across 3 BRCA1 Mode A repeats.
+#
+# Track B v0.1: SHIPPED 2026-04-28. Closes the HBB top-1 NaN
+# regression surfaced by T13's smoke via PRIDICT G-prefix retry plus
+# paralog-aware split CFD aggregate infrastructure for production v1.
+# All 5 smoke targets now produce non-NaN top-1 composites in all
+# three modes (HBB Mode A: NaN -> 22.49 with PRIDICT_GPREFIX_RETRY).
+#
+# Single open gap below: full HGNC paralog-family coverage is the v1
+# follow-on. v0.1 ships a hardcoded paralog map covering only the
+# five smoke targets + their canonical paralog clusters (HBB family,
+# ERBB family, MYC family, TP63/TP73, BRCA2). See
+# `state/track-b-v0-1-paralog-fix-plan.md` for the detailed
+# rationale + diagnosis + fix narrative.
+
+schema_version: "1.0.0"
+task_id: "track-b-paralog-aware-composite-filter"
+kernel_name: "pe_design"
+target: "cpu"
+compiler: "n/a"
+build_date: "2026-04-28T00:00:00+00:00"
+host: "matteius-ProArt-P16-H7606WI"
+
+gaps:
+  - id: "track-b-paralog-aware-composite-filter"
+    category: "data-coverage"
+    op_or_pattern: "Production HGNC gene-group integration for the paralog mapper"
+    attempted: |
+      Track B v0.1 ships paralog-aware split CFD aggregate
+      infrastructure: `bionpu.data.paralog_mapper.get_paralog_spans`
+      maps a gene symbol to its sibling paralog gene spans, the T11
+      off-target adapter tags each `OffTargetSite.in_paralog`
+      accordingly, and the T8 ranker splits the CFD aggregate into
+      `cfd_aggregate_pegrna` (non-paralog hits, in the composite) and
+      `cfd_aggregate_paralog_pegrna` (in-paralog hits, informational).
+
+      v0.1 ships a HARDCODED paralog map covering only the five v0
+      smoke targets (BRCA1, TP53, EGFR, HBB, MYC) plus their
+      canonical paralog clusters (hemoglobin family on chr11, ERBB
+      family, MYC family, TP63/TP73, BRCA2). Coordinates are
+      GRCh38.p14 per NCBI Gene as of 2026-04-28.
+    failed_with: null
+    root_cause: |
+      Production-quality coverage requires ingesting the full HGNC
+      gene-group TSV (from
+      https://www.genenames.org/cgi-bin/genegroup/download or the
+      paralog file at
+      https://www.genenames.org/download/statistics-and-files/).
+      v0.1 deferred this to keep the bring-up surface minimal; the
+      hardcoded map covers the v0 smoke regression surface but will
+      miss paralogs for any target outside the five smoke genes.
+    workaround: |
+      Production callers of `get_paralog_spans` for genes outside the
+      v0.1 hardcoded coverage receive an empty tuple; the pe_design
+      pipeline transparently falls back to v0 behaviour (every
+      off-target hit treated as a true off-target, as v0 did). For
+      the v0 smoke targets the v0.1 path is fully functional; for
+      arbitrary user targets the worst-case is degradation back to
+      v0 (no false negatives, no NaN regressions).
+    upstream_issue: null
+    blocks:
+      - "track-b-pe-design-v1"
+    severity: "minor"
+    status: "open"

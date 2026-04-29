@@ -194,7 +194,16 @@ The `n4_b8_c1024` host runner can now filter chunk overlaps into strict
 owned intervals and skip global sort/unique once records are monotonic.
 Streaming binary output then avoids materializing and rewriting the full
 18.4 M-record vector, dropping chr22 runner wall from 150.795 s to
-3.675 s while preserving full record equality.
+3.675 s while preserving full record equality. The CPU oracle for the
+same chr22 scan takes 21.538 s, so the streamed NPU path is 5.86x faster
+end-to-end for this record-emitting workload.
+
+Packed/RLE output remains a plausible future improvement, but it is not
+the next investment point. The current binary stream preserves the
+existing ABI and already removes the dominant vector-materialization
+cost. A packed/RLE v2 could reduce artifact size by encoding genomic
+blocks, position deltas, strand bits, and context codes compactly, but
+would require a new parser and compatibility surface.
 
 ## Toolkit Pattern
 

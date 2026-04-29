@@ -1425,6 +1425,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_c_design.set_defaults(func=_cmd_crispr_design)
 
+    # crispr -> pe -> design — Track B v0 prime-editor pegRNA design
+    # (PRD-crispr-state-of-the-art-roadmap §3.2). The 3-level shape
+    # (`bionpu crispr pe design ...`) sits as a sibling of
+    # `bionpu crispr design` so the existing nuclease-design CLI is
+    # preserved unchanged. `pe` is a namespace for prime-editing-only
+    # subcommands; future siblings (`bionpu crispr pe screen`, etc.)
+    # can land here without further nesting churn.
+    p_c_pe = sub_crispr.add_parser(
+        "pe",
+        help=(
+            "Prime editor pegRNA tools (Track B v0). See "
+            "`bionpu crispr pe design --help` for the design subcommand."
+        ),
+    )
+    sub_c_pe = p_c_pe.add_subparsers(dest="pe_kind")
+    from .genomics.pe_design.cli import add_pe_design_subparser
+    add_pe_design_subparser(sub_c_pe)
+
     # be — Track A v0 base editor design (PRD-crispr-state-of-the-art-roadmap §3.1).
     # The two-level shape (`bionpu be design ...`) leaves room for siblings
     # (`bionpu be score`, `bionpu be batch`, ...) without further reshuffles.
@@ -1488,6 +1506,26 @@ def main(argv: list[str] | None = None) -> int:
                             sub_p.print_help()
                             return 0
             return 0
+    # 3-level: `bionpu crispr pe` without a `design` subcommand prints
+    # the pe-level help. The pe_kind attribute is None when the
+    # ``design`` child wasn't supplied.
+    if (
+        args.cmd == "crispr"
+        and getattr(args, "crispr_kind", None) == "pe"
+        and getattr(args, "pe_kind", None) is None
+    ):
+        for action in p._subparsers._actions:  # type: ignore[attr-defined]
+            if isinstance(action, argparse._SubParsersAction):
+                crispr_parser = action.choices.get("crispr")
+                if crispr_parser is None:
+                    continue
+                for sub_action in crispr_parser._subparsers._actions:  # type: ignore[attr-defined]
+                    if isinstance(sub_action, argparse._SubParsersAction):
+                        pe_parser = sub_action.choices.get("pe")
+                        if pe_parser is not None:
+                            pe_parser.print_help()
+                            return 0
+        return 0
     return int(args.func(args))
 
 

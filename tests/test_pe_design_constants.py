@@ -305,14 +305,36 @@ def test_namedtuple_types_have_expected_fields():
     )
 
 
-def test_package_init_exposes_empty_all():
-    """Per plan: T3 ships an ``__init__.py`` skeleton with empty
-    ``__all__`` so later tasks can extend without race."""
+def test_package_init_exposes_public_api():
+    """Per plan: T3 shipped ``__init__.py`` with empty ``__all__``;
+    T10 (CLI subcommand) extends it with the orchestration entry
+    point + key types so external scripts can ``from
+    bionpu.genomics.pe_design import design_prime_editor_guides``.
+
+    This test was originally ``test_package_init_exposes_empty_all``
+    locking the T3 invariant; it was updated in T10 to lock the
+    Wave-8 public surface instead.
+    """
     import bionpu.genomics.pe_design as pkg
 
     assert hasattr(pkg, "__all__")
     assert isinstance(pkg.__all__, list)
-    assert pkg.__all__ == [], (
-        "T3 must ship pe_design/__init__.py with empty __all__; "
-        "downstream tasks (T6/T10/etc.) extend it later."
+    # T10 surface — the items must all be importable from the package.
+    expected = {
+        "design_prime_editor_guides",
+        "off_target_scan_for_spacer",
+        "EditSpec",
+        "OffTargetSite",
+        "PE3PegRNACandidate",
+        "PegRNACandidate",
+        "PegRNAFoldingFeatures",
+        "PRIDICTScore",
+        "RankedPegRNA",
+    }
+    assert set(pkg.__all__) == expected, (
+        f"T10 public surface drift: __all__ contains "
+        f"{sorted(pkg.__all__)} but plan §T10 mandates {sorted(expected)}."
     )
+    # Each name must actually resolve.
+    for name in expected:
+        assert hasattr(pkg, name), f"missing exported name: {name}"

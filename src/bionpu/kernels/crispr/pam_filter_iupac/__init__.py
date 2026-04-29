@@ -46,17 +46,21 @@ from __future__ import annotations
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from bionpu.dispatch._pyxrt_helpers import resolve_dispatch_impl
 from bionpu.dispatch.npu import (
     NpuArtifactsMissingError,
     NpuOp,
     NpuRunFailed,
+    _get_pyxrt,  # noqa: PLC2701 — used by _run_pyxrt
     _xrt_env,  # noqa: PLC2701 — internal helper
+    default_backend,
     register_npu_op,
 )
 
@@ -102,6 +106,12 @@ _KERNEL_NAME: str = "MLIR_AIE"
 #: Maximum supported PAM length (must match constants.h PFI_PAM_LEN_MAX).
 PAM_LEN_MAX: int = 8
 
+#: Per-chunk overlap, must match runner.cpp's PFI_OVERLAP_BYTES.
+PFI_OVERLAP_BYTES: int = 8
+
+#: Header size (bytes), must match runner.cpp's HEADER_BYTES.
+PFI_HEADER_BYTES: int = 24
+
 # --------------------------------------------------------------------------- #
 # Artifact root.
 # --------------------------------------------------------------------------- #
@@ -137,6 +147,56 @@ class _RunInfo:
     n_iters: int
     used_npu: bool
     n_records: int = 0
+
+
+# --------------------------------------------------------------------------- #
+# Per-dispatch profiling (v1 pyxrt path) — mirrors primer_scan v2.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _PyxrtPhaseProfile:
+    """Cumulative per-phase timing for the pyxrt path (debug/profiling)."""
+
+    stage_us: float = 0.0       # build header + memcpy payload + bo.write
+    sync_to_us: float = 0.0     # bo.sync(TO_DEVICE) on seq_in + zero output
+    kernel_run_us: float = 0.0  # kernel(...) launch (non-blocking)
+    wait_us: float = 0.0        # run.wait()
+    sync_from_us: float = 0.0   # bo.sync(FROM_DEVICE) on sparse_out
+    parse_us: float = 0.0       # bo.read + tile-0 parse
+    n_dispatches: int = 0
+
+
+# --------------------------------------------------------------------------- #
+# IUPAC PAM encoder (mirrors runner.cpp::encode_pam_iupac).
+# --------------------------------------------------------------------------- #
+
+
+_IUPAC_NIBBLE: dict[str, int] = {
+    "A": 0x1, "C": 0x2, "G": 0x4, "T": 0x8,
+    "R": 0x5, "Y": 0xA, "S": 0x6, "W": 0x9,
+    "K": 0xC, "M": 0x3, "B": 0xE, "D": 0xD,
+    "H": 0xB, "V": 0x7, "N": 0xF,
+}
+
+
+def _encode_pam_iupac_runtime(pam: str) -> tuple[int, int]:
+    """Return ``(pam_mask_u32, pam_length)`` for an IUPAC PAM string.
+
+    Byte-equal to ``runner.cpp::encode_pam_iupac``.
+    """
+    p = len(pam)
+    if not 1 <= p <= PAM_LEN_MAX:
+        raise ValueError(
+            f"PAM length must be 1..{PAM_LEN_MAX}; got {p}"
+        )
+    mask = 0
+    for i, ch in enumerate(pam):
+        nib = _IUPAC_NIBBLE.get(ch.upper())
+        if nib is None:
+            raise ValueError(f"non-IUPAC PAM base: {ch!r}")
+        mask |= (nib & 0xF) << (4 * i)
+    return mask, p
 
 
 # --------------------------------------------------------------------------- #
@@ -205,6 +265,11 @@ class BionpuPamFilterIupac(NpuOp):
     SUPPORTED_N_TILES = SUPPORTED_N_TILES
     SUPPORTED_N_CHUNKS_PER_LAUNCH = SUPPORTED_N_CHUNKS_PER_LAUNCH
 
+    # Per-instance pyxrt cache slot — populated lazily on first
+    # ``_run_pyxrt`` call. See :meth:`_ensure_pyxrt_state` for the
+    # cache contract; mirrors primer_scan v2's pattern verbatim.
+    _pyxrt_state: dict[str, Any] | None = None
+
     def __init__(
         self,
         pam: str = "NGG",
@@ -245,6 +310,10 @@ class BionpuPamFilterIupac(NpuOp):
         self.n_chunks_per_launch: int = int(n_chunks_per_launch)
         self.name: str = "bionpu_pam_filter_iupac"
         self.last_run: _RunInfo | None = None
+        # Populated on first _run_pyxrt invocation; see _ensure_pyxrt_state.
+        self._pyxrt_state = None
+        # Cumulative per-phase profile (cleared via reset_pyxrt_profile).
+        self._pyxrt_profile: _PyxrtPhaseProfile = _PyxrtPhaseProfile()
 
     # ----- artifact paths ------------------------------------------------- #
 
@@ -354,6 +423,356 @@ class BionpuPamFilterIupac(NpuOp):
         )
         return records, info
 
+    # ----- in-process pyxrt path (v1) ------------------------------------- #
+
+    # Kernel arg slots for pam_filter_iupac runner.cpp:
+    #   arg0=opcode, arg1=bo_instr, arg2=instr_size_uint,
+    #   arg3=bo_seq_in, arg4=bo_sparse_out, arg5=n_input_bytes_int.
+    _ARG_SEQ_IN = 3
+    _ARG_SPARSE_OUT = 4
+
+    def _resolve_dispatch_impl(self, impl: str | None) -> str:
+        return resolve_dispatch_impl(impl, env_var=PAM_FILTER_IUPAC_DISPATCH_ENV)
+
+    def _ensure_pyxrt_state(self) -> dict[str, Any]:
+        """Lazily build + cache the pyxrt device + kernel + BO state.
+
+        Mirrors :class:`bionpu.kernels.genomics.primer_scan.BionpuPrimerScan`
+        v2: opens the device once via :func:`default_backend`, loads +
+        caches the xclbin, allocates bo_instr + a single (bo_seq_in,
+        bo_sparse_out) ring slot. Subsequent calls return the cached
+        dict in O(1).
+        """
+        if self._pyxrt_state is not None:
+            return self._pyxrt_state
+
+        for need in (self.xclbin, self.insts):
+            if not need.exists():
+                raise NpuArtifactsMissingError(
+                    f"NPU artifact missing: {need}"
+                )
+
+        pyxrt = _get_pyxrt()
+        backend = default_backend()
+        loaded = backend.load_xclbin(
+            self.xclbin, self.insts, kernel_name=_KERNEL_NAME
+        )
+        device = backend.device()
+        kernel = loaded.kernel
+        instr_u32 = loaded.instr_u32
+
+        # Per-batch buffer geometry (mirrors runner.cpp).
+        seq_in_slot_bytes = SEQ_IN_CHUNK_BYTES_BASE + PFI_OVERLAP_BYTES
+        n_batch = self.n_chunks_per_launch
+        per_batch_seq_in_bytes = n_batch * seq_in_slot_bytes
+        per_dispatch_out_bytes = (
+            n_batch * self.n_tiles * PARTIAL_OUT_BYTES_PADDED
+        )
+
+        # Upload instruction stream once.
+        bo_instr = pyxrt.bo(
+            device,
+            int(instr_u32.nbytes),
+            pyxrt.bo.cacheable,
+            kernel.group_id(1),
+        )
+        bo_instr.write(instr_u32.tobytes(), 0)
+        bo_instr.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+
+        # Single-slot ring (synchronous dispatch). Per-dispatch silicon
+        # time is sub-millisecond; the ~100 ms subprocess overhead
+        # disappears entirely with one BO ring.
+        bo_seq_in = pyxrt.bo(
+            device,
+            per_batch_seq_in_bytes,
+            pyxrt.bo.host_only,
+            kernel.group_id(self._ARG_SEQ_IN),
+        )
+        bo_sparse_out = pyxrt.bo(
+            device,
+            per_dispatch_out_bytes,
+            pyxrt.bo.host_only,
+            kernel.group_id(self._ARG_SPARSE_OUT),
+        )
+
+        # Pre-encode the PAM mask + length once per op-class lifetime
+        # (the PAM is fixed in the constructor).
+        pam_mask, pam_length = _encode_pam_iupac_runtime(self.pam)
+
+        state: dict[str, Any] = {
+            "pyxrt": pyxrt,
+            "device": device,
+            "kernel": kernel,
+            "bo_instr": bo_instr,
+            "bo_seq_in": bo_seq_in,
+            "bo_sparse_out": bo_sparse_out,
+            "instr_size": int(instr_u32.size),
+            "seq_in_slot_bytes": seq_in_slot_bytes,
+            "per_batch_seq_in_bytes": per_batch_seq_in_bytes,
+            "per_dispatch_out_bytes": per_dispatch_out_bytes,
+            "n_batch": n_batch,
+            "pam_mask": pam_mask,
+            "pam_length": pam_length,
+        }
+        self._pyxrt_state = state
+        return state
+
+    def reset_pyxrt_profile(self) -> None:
+        """Zero the cumulative per-phase profile (used by benchmarks)."""
+        self._pyxrt_profile = _PyxrtPhaseProfile()
+
+    @property
+    def pyxrt_profile(self) -> _PyxrtPhaseProfile:
+        """Cumulative per-phase profile from the last sequence of pyxrt
+        dispatches. Reset via :meth:`reset_pyxrt_profile`.
+        """
+        return self._pyxrt_profile
+
+    def _plan_chunks(self, n_input_bytes: int) -> list[tuple[int, int]]:
+        """Mirror of runner.cpp::plan_chunks.
+
+        Returns ``[(src_offset, payload_bytes), ...]``.
+        """
+        if n_input_bytes == 0:
+            return []
+        total_chunk = SEQ_IN_CHUNK_BYTES_BASE + PFI_OVERLAP_BYTES
+        payload_cap = total_chunk - PFI_HEADER_BYTES
+        advance = payload_cap - PFI_OVERLAP_BYTES
+        plan: list[tuple[int, int]] = []
+        off = 0
+        while off < n_input_bytes:
+            end = min(off + payload_cap, n_input_bytes)
+            plan.append((off, end - off))
+            if end >= n_input_bytes:
+                break
+            off += advance
+        return plan
+
+    @staticmethod
+    def _parse_tile0_blob(
+        blob: np.ndarray, chunk_global_base_bases: int
+    ) -> list[tuple[int, int]]:
+        """Parse one tile-0 32 KiB output slot into ``(global_pos, strand)``.
+
+        Mirrors runner.cpp::parse_chunk_tile0. ``blob`` is a uint8 view
+        of length ``PARTIAL_OUT_BYTES_PADDED``.
+        """
+        emit_count = int(np.frombuffer(blob[:4], dtype=np.uint32)[0])
+        if emit_count > MAX_EMIT_IDX:
+            emit_count = MAX_EMIT_IDX
+        if emit_count == 0:
+            return []
+        rec_dt = np.dtype([
+            ("position", "<u4"),
+            ("strand", "u1"),
+            ("_pad", "u1"),
+            ("_pad2", "<u2"),
+            ("_pad3", "<u8"),
+        ])
+        recs = np.frombuffer(
+            blob[4 : 4 + emit_count * RECORD_BYTES], dtype=rec_dt
+        )
+        return [
+            (int(p) + chunk_global_base_bases, int(s))
+            for p, s in zip(recs["position"], recs["strand"])
+        ]
+
+    def _run_pyxrt(
+        self,
+        *,
+        packed_seq: np.ndarray,
+        top_n: int = 0,
+        timeout_s: float = 60.0,
+    ) -> tuple[list[tuple[int, int]], _RunInfo]:
+        """In-process pyxrt dispatch path (v1).
+
+        Loads xclbin + insts.bin once per op-class lifetime; reuses the
+        device + kernel + bo_instr + bo_seq_in + bo_sparse_out across
+        all subsequent calls. Per-dispatch wall is bounded by BO write
+        + sync + kernel-run + sync, sub-millisecond.
+
+        Per CLAUDE.md: in-process pyxrt path takes only the in-process
+        ``_dispatch_lock`` (a no-op nullcontext); does NOT wrap
+        ``npu_silicon_lock``. Silicon-level multi-use protection
+        handles same-process concurrency.
+
+        Returns:
+            ``([(query_pos, strand), ...], _RunInfo)``.
+        """
+        del timeout_s  # advisory only; driver TDR enforces an upper bound.
+        state = self._ensure_pyxrt_state()
+        pyxrt = state["pyxrt"]
+        kernel = state["kernel"]
+        bo_instr = state["bo_instr"]
+        bo_seq_in = state["bo_seq_in"]
+        bo_sparse_out = state["bo_sparse_out"]
+        instr_size = state["instr_size"]
+        seq_in_slot_bytes = state["seq_in_slot_bytes"]
+        per_batch_seq_in_bytes = state["per_batch_seq_in_bytes"]
+        per_dispatch_out_bytes = state["per_dispatch_out_bytes"]
+        n_batch = state["n_batch"]
+        pam_mask = state["pam_mask"]
+        pam_length = state["pam_length"]
+        n_tiles = self.n_tiles
+
+        zero_out = bytes(per_dispatch_out_bytes)
+
+        # Chunk plan over the entire input.
+        input_buf = np.ascontiguousarray(packed_seq, dtype=np.uint8)
+        chunks = self._plan_chunks(int(input_buf.size))
+
+        prof = self._pyxrt_profile
+        all_records: list[tuple[int, int]] = []
+        timings_us: list[float] = []
+        avg_opcode = 3
+        n_chunks = len(chunks)
+        if n_chunks == 0:
+            info = _RunInfo(0.0, 0.0, 0.0, 0, used_npu=True, n_records=0)
+            return [], info
+
+        n_batches = (n_chunks + n_batch - 1) // n_batch
+
+        # Pre-build header static bytes (pam_mask + pam_length are
+        # constant across all dispatches for this op-class instance).
+        pam_mask_bytes = int(pam_mask).to_bytes(4, "little", signed=False)
+
+        for bi in range(n_batches):
+            batch_first = bi * n_batch
+            # ---------------- stage seq_in ----------------
+            t_stage0 = time.perf_counter()
+            seq_in_buf = bytearray(per_batch_seq_in_bytes)  # zeroed
+            for slot in range(n_batch):
+                ci = batch_first + slot
+                if ci >= n_chunks:
+                    break  # tail-pad: leave zeros
+                src_off, payload = chunks[ci]
+                base = slot * seq_in_slot_bytes
+                # Header layout (24 bytes; mirrors runner.cpp::stage_batch):
+                #   [0..3]   pam_mask  (uint32 LE)
+                #   [4]      pam_length (uint8)
+                #   [5..15]  zero (already memset)
+                #   [16..19] actual_payload_bytes (uint32 LE)
+                #   [20..23] owned_start_offset_bases (int32 LE)
+                seq_in_buf[base + 0 : base + 4] = pam_mask_bytes
+                seq_in_buf[base + 4] = int(pam_length) & 0xFF
+                seq_in_buf[base + 16 : base + 20] = int(payload).to_bytes(
+                    4, "little", signed=False
+                )
+                if ci == 0:
+                    owned = 0
+                else:
+                    owned = (PFI_OVERLAP_BYTES * 4) - (int(pam_length) - 1)
+                seq_in_buf[base + 20 : base + 24] = int(owned).to_bytes(
+                    4, "little", signed=True
+                )
+                # Payload at byte 24.
+                seq_in_buf[
+                    base + PFI_HEADER_BYTES :
+                    base + PFI_HEADER_BYTES + payload
+                ] = input_buf[src_off : src_off + payload].tobytes()
+            bo_seq_in.write(bytes(seq_in_buf), 0)
+            t_stage1 = time.perf_counter()
+            prof.stage_us += 1e6 * (t_stage1 - t_stage0)
+
+            # ---------------- sync to device ----------------
+            bo_seq_in.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            # Zero output BO host-side and push so stale data from prior
+            # dispatch can't leak through.
+            bo_sparse_out.write(zero_out, 0)
+            bo_sparse_out.sync(
+                pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
+            )
+            t_sync_to1 = time.perf_counter()
+            prof.sync_to_us += 1e6 * (t_sync_to1 - t_stage1)
+
+            # ---------------- launch ----------------
+            t_launch0 = time.perf_counter()
+            run = kernel(
+                avg_opcode,
+                bo_instr,
+                int(instr_size),
+                bo_seq_in,
+                bo_sparse_out,
+                int(per_batch_seq_in_bytes),
+            )
+            t_launch1 = time.perf_counter()
+            prof.kernel_run_us += 1e6 * (t_launch1 - t_launch0)
+
+            # ---------------- wait ----------------
+            state_v = run.wait()
+            t_wait1 = time.perf_counter()
+            prof.wait_us += 1e6 * (t_wait1 - t_launch1)
+            try:
+                ok = (
+                    str(state_v).endswith("COMPLETED")
+                    or getattr(state_v, "name", "")
+                    == "ERT_CMD_STATE_COMPLETED"
+                )
+            except Exception:  # noqa: BLE001
+                ok = True
+            if not ok:
+                raise NpuRunFailed(
+                    int(getattr(state_v, "value", -1)),
+                    "",
+                    f"kernel state={state_v!r} (expected COMPLETED) "
+                    f"in pyxrt path on batch {bi}/{n_batches}",
+                )
+
+            # ---------------- sync from + parse ----------------
+            bo_sparse_out.sync(
+                pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
+            )
+            t_sync_from1 = time.perf_counter()
+            prof.sync_from_us += 1e6 * (t_sync_from1 - t_wait1)
+
+            raw = bo_sparse_out.read(int(per_dispatch_out_bytes), 0)
+            raw_np = np.asarray(raw, dtype=np.int8).view(np.uint8)
+
+            per_chunk_block = n_tiles * PARTIAL_OUT_BYTES_PADDED
+            for slot in range(n_batch):
+                ci = batch_first + slot
+                if ci >= n_chunks:
+                    break
+                src_off, _ = chunks[ci]
+                base = slot * per_chunk_block
+                # Tile 0 only (broadcast topology; slots 1..n_tiles-1 are
+                # duplicates, exactly as runner.cpp ignores them).
+                tile0 = raw_np[base : base + PARTIAL_OUT_BYTES_PADDED]
+                global_base_bases = src_off * 4
+                all_records.extend(
+                    self._parse_tile0_blob(tile0, global_base_bases)
+                )
+            t_parse1 = time.perf_counter()
+            prof.parse_us += 1e6 * (t_parse1 - t_sync_from1)
+            prof.n_dispatches += 1
+            timings_us.append(1e6 * (t_parse1 - t_stage0))
+
+        # Sort + dedup (mirrors runner.cpp's std::sort + std::unique by
+        # (position, strand)).
+        all_records.sort()
+        deduped: list[tuple[int, int]] = []
+        prev: tuple[int, int] | None = None
+        for r in all_records:
+            if r != prev:
+                deduped.append(r)
+                prev = r
+
+        if top_n > 0 and len(deduped) > top_n:
+            deduped = deduped[:top_n]
+
+        avg_us = float(sum(timings_us) / max(len(timings_us), 1))
+        min_us = float(min(timings_us)) if timings_us else 0.0
+        max_us = float(max(timings_us)) if timings_us else 0.0
+        info = _RunInfo(
+            avg_us=avg_us,
+            min_us=min_us,
+            max_us=max_us,
+            n_iters=len(timings_us),
+            used_npu=True,
+            n_records=len(deduped),
+        )
+        return deduped, info
+
     # ----- entry point ---------------------------------------------------- #
 
     def __call__(
@@ -366,6 +785,7 @@ class BionpuPamFilterIupac(NpuOp):
         warmup: int = 0,
         timeout_s: float = 600.0,
         force_host: bool = False,
+        _impl: str | None = None,
         **_unused: Any,
     ) -> list[tuple[int, int]]:
         """Run the kernel and return ``[(query_pos, strand), ...]``.
@@ -404,6 +824,35 @@ class BionpuPamFilterIupac(NpuOp):
                 f"packed_seq must be 1-D; got shape {packed_seq.shape}"
             )
 
+        impl = self._resolve_dispatch_impl(_impl)
+        if impl == "pyxrt":
+            # In-process pyxrt path (v1). xclbin + insts are required;
+            # the host_runner subprocess binary is NOT (it's a build-time
+            # artifact consumed by the subprocess path only).
+            for need in (self.xclbin, self.insts):
+                if not need.exists():
+                    raise NpuArtifactsMissingError(
+                        f"NPU artifact missing for {self.name} "
+                        f"(n_tiles={self.n_tiles}): {need}. Build via "
+                        f"`make NPU2=1 experiment="
+                        f"{'production' if self.n_tiles == 1 else f'wide{self.n_tiles}'} "
+                        f"all` in this kernel directory."
+                    )
+            try:
+                records, info = self._run_pyxrt(
+                    packed_seq=packed_seq,
+                    top_n=top_n,
+                    timeout_s=timeout_s,
+                )
+            except ImportError:
+                # pyxrt not available — fall back to subprocess so the
+                # caller still gets a result rather than a hard failure.
+                impl = "subprocess"
+            else:
+                self.last_run = info
+                return records
+
+        # Subprocess path — same as v0.
         if not self.host_runner.exists():
             raise NpuArtifactsMissingError(
                 f"NPU artifact missing for {self.name} "

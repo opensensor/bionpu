@@ -55,6 +55,7 @@ window scoring is deferred.
 from __future__ import annotations
 
 from .bystander import bystander_count, enumerate_bystander_edits
+from .off_target import OffTargetSite, off_target_scan_for_be_guide
 from .pam_variants import (
     BE_VARIANTS,
     CAS9_VARIANTS,
@@ -63,7 +64,7 @@ from .pam_variants import (
     get_be_spec,
     get_cas9_spec,
 )
-from .ranker import BaseEditorGuide, design_base_editor_guides
+from .ranker import BaseEditorGuide, composite_be, design_base_editor_guides
 from .window_score import (
     AC_WINDOW_BOUNDS_0IDX,
     activity_window_slice,
@@ -78,12 +79,15 @@ __all__ = [
     "BaseEditorSpec",
     "CAS9_VARIANTS",
     "Cas9PamSpec",
+    "OffTargetSite",
     "activity_window_slice",
     "activity_window_target_positions",
     "bystander_count",
+    "composite_be",
     "design_base_editor_guides",
     "enumerate_bystander_edits",
     "get_be_spec",
     "get_cas9_spec",
+    "off_target_scan_for_be_guide",
     "target_in_window",
 ]

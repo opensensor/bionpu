@@ -17,6 +17,7 @@ fields suitable for a CRISPOR-grade BE design TSV.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -42,6 +43,7 @@ from .window_score import (
 __all__ = [
     "BaseEditorGuide",
     "design_base_editor_guides",
+    "composite_be",
 ]
 
 
@@ -143,22 +145,44 @@ def _composite_rank_score(
 ) -> float:
     """Compute a simple composite rank score.
 
-    Rules (heuristic; v0 — Phase 2 will replace with BE-Hive scoring):
+    Rules (heuristic; v0/v1 — Phase 2 will replace with BE-Hive scoring):
 
     * ``+1.0`` if target is in the activity window; ``0.0`` otherwise.
     * ``-0.2`` per bystander edit (penalty).
-    * ``-0.5 * cfd_aggregate`` (off-target penalty; cfd already in [0,1]).
+    * ``-0.5 * cfd_aggregate`` (off-target penalty; raw CFD sum from
+      :func:`bionpu.genomics.be_design.off_target.off_target_scan_for_be_guide`).
+
+    NaN handling: ``cfd_aggregate=NaN`` (synbio mode — no scan
+    performed) contributes 0 to the off-target penalty, so guides
+    in synbio mode are ranked purely by edit-window + bystander.
 
     Higher is better. The absolute scale isn't load-bearing — only the
-    rank order is — so the caller can re-rank with a different formula
-    via the ``--rank-by`` future hook.
+    rank order is.
     """
     score = 0.0
     if in_window:
         score += 1.0
     score -= 0.2 * float(bystander_count)
-    score -= 0.5 * float(cfd_aggregate)
+    if not (cfd_aggregate is None or math.isnan(float(cfd_aggregate))):
+        score -= 0.5 * float(cfd_aggregate)
     return score
+
+
+def composite_be(g: "BaseEditorGuide") -> float:
+    """Public composite BE ranker.
+
+    Mirrors :func:`_composite_rank_score` but takes a
+    :class:`BaseEditorGuide` and is the canonical entry point for the
+    Track A v1 ranker. v0's :class:`BaseEditorGuide` exposes
+    ``in_activity_window``, ``bystander_count``, and ``cfd_aggregate``;
+    NaN ``cfd_aggregate`` (synbio mode) is treated as a 0 off-target
+    penalty.
+    """
+    return _composite_rank_score(
+        in_window=g.in_activity_window,
+        bystander_count=g.bystander_count,
+        cfd_aggregate=g.cfd_aggregate,
+    )
 
 
 def design_base_editor_guides(
@@ -231,8 +255,18 @@ def design_base_editor_guides(
         notes_acc.append(f"PHASE2_CAS9={cas9_variant}")
     if be_variant not in PHASE1_BE_VARIANTS:
         notes_acc.append(f"PHASE2_BE={be_variant}")
-    if genome_path is None:
+    synbio_mode = genome_path is None
+    if synbio_mode:
         notes_acc.append("NO_OFF_TARGET_SCAN")
+
+    # Optional pre-load: read the FASTA once and pass the
+    # ``[(chrom, seq), ...]`` to every per-guide call so we avoid
+    # re-reading on every iteration. This dominates the off-target
+    # wall when the genome is multi-MB.
+    genome_records: Optional[list[tuple[str, str]]] = None
+    if not synbio_mode:
+        from .off_target import _read_fasta_records  # noqa: PLC0415
+        genome_records = list(_read_fasta_records(Path(genome_path)))
 
     guides: list[BaseEditorGuide] = []
 
@@ -290,9 +324,36 @@ def design_base_editor_guides(
             byst_count = len(byst_positions_list)
             byst_positions = tuple(byst_positions_list)
 
-        # v0: no off-target scan. PRD-guide-design v0.2 §1.1 synbio mode.
-        off_target_count = 0
-        cfd_aggregate = 0.0
+        # v1: optional off-target scan via the locked
+        # crispr/match_multitile_memtile (silicon) or cpu_scan (CPU
+        # oracle). Synbio mode (`genome_path=None`) yields NaN
+        # `cfd_aggregate` so the ranker downstream treats it as
+        # "unknown" rather than "0 off-targets".
+        if synbio_mode:
+            off_target_count = 0
+            cfd_aggregate = float("nan")
+        else:
+            from .off_target import (  # noqa: PLC0415
+                off_target_scan_for_be_guide,
+            )
+            try:
+                _sites, cfd_aggregate, off_target_count = (
+                    off_target_scan_for_be_guide(
+                        guide_protospacer=protospacer,
+                        pam_seq=pam_concrete,
+                        genome_path=genome_path or "",
+                        max_mismatches=4,
+                        device="cpu",  # v1 default; npu opt-in via config
+                        genome_records=genome_records,
+                    )
+                )
+            except (FileNotFoundError, ValueError) as exc:  # pragma: no cover
+                # Defensive: degrade to NaN if the scan fails for any
+                # reason (missing FASTA, malformed sequence, ...).
+                cfd_aggregate = float("nan")
+                off_target_count = 0
+                if "OFF_TARGET_FAILED" not in notes_acc:
+                    notes_acc.append(f"OFF_TARGET_FAILED={type(exc).__name__}")
 
         rank = _composite_rank_score(
             in_window=in_win,

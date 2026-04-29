@@ -6,8 +6,11 @@ Artifact:
 ## Result
 
 The `b8` artifact preserves full chr22 record equality while reducing
-the number of launches from 12,505 to 1,564. End-to-end wall is nearly
-identical to `b4`, so batching alone is not the next major lever.
+the number of launches from 12,505 to 1,564. The host runner now filters
+chunk-overlap records into strict owned intervals, observes monotonic
+output, and skips the global sort/unique pass. End-to-end wall remains
+nearly identical to `b4`, so the next major lever is output
+materialization/write rather than sorting.
 
 | metric | value |
 | --- | ---: |
@@ -15,8 +18,8 @@ identical to `b4`, so batching alone is not the next major lever.
 | records | 18,406,838 |
 | record-equal | true |
 | record recovery | 100.00% |
-| silicon wall | 150.647 s |
-| avg NPU dispatch | 1,845.39 us |
+| silicon wall | 150.795 s |
+| avg NPU dispatch | 1,778.95 us |
 
 Counts match the CPU oracle exactly for `CG`, `CHG`, `CHH`, `+`, and
 `-`.

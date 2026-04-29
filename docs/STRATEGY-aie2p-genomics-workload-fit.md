@@ -188,10 +188,13 @@ change wall time:
 | --- | ---: | ---: | ---: |
 | `n4_c1024` | 12,505 | 386.744 us | 154.771 s |
 | `n4_b4_c1024` | 3,127 | 1,057.99 us | 150.818 s |
-| `n4_b8_c1024` | 1,564 | 1,845.39 us | 150.647 s |
+| `n4_b8_c1024` | 1,564 | 1,778.95 us | 150.795 s |
 
-The next performance lever is host output handling: parse/sort/write of
-18.4 M dense records dominates after launch count is reduced.
+The `n4_b8_c1024` host runner can now filter chunk overlaps into strict
+owned intervals and skip global sort/unique once records are monotonic.
+That preserved full chr22 record equality but did not materially move
+wall time, localizing the remaining bottleneck to output
+materialization/write of 18.4 M dense records.
 
 ## Toolkit Pattern
 

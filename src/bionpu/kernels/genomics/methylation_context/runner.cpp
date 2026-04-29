@@ -59,6 +59,14 @@ struct Record {
     uint8_t context;
 };
 
+struct ParseStats {
+    uint32_t max_emit_observed = 0;
+    bool monotonic = true;
+};
+
+bool record_less(const Record &a, const Record &b);
+bool record_equal(const Record &a, const Record &b);
+
 void print_usage(std::ostream &os) {
     os <<
 "Usage: methylation_context_runner [options]\n"
@@ -169,12 +177,13 @@ std::vector<ChunkPlan> plan_chunks(size_t input_bytes) {
 
 void parse_chunk_tile0(const uint8_t *blob,
                        size_t chunk_global_base,
+                       size_t chunk_global_end,
                        int n_bases,
                        std::vector<Record> &out,
-                       uint32_t &max_emit_observed) {
+                       ParseStats &stats) {
     uint32_t emit_count = 0;
     std::memcpy(&emit_count, blob, 4);
-    max_emit_observed = std::max(max_emit_observed, emit_count);
+    stats.max_emit_observed = std::max(stats.max_emit_observed, emit_count);
     if (emit_count > static_cast<uint32_t>(MC_MAX_EMIT_IDX)) {
         emit_count = static_cast<uint32_t>(MC_MAX_EMIT_IDX);
     }
@@ -185,10 +194,18 @@ void parse_chunk_tile0(const uint8_t *blob,
         std::memcpy(&local_pos, rec, 4);
         uint32_t global_pos =
             static_cast<uint32_t>(chunk_global_base) + local_pos;
-        if (global_pos >= static_cast<uint32_t>(n_bases)) {
+        if (global_pos >= static_cast<uint32_t>(chunk_global_end) ||
+            global_pos >= static_cast<uint32_t>(n_bases)) {
             continue;
         }
-        out.push_back(Record{global_pos, rec[4], rec[5]});
+        Record r{global_pos, rec[4], rec[5]};
+        if (!out.empty() && record_less(r, out.back())) {
+            stats.monotonic = false;
+        }
+        if (!out.empty() && record_equal(r, out.back())) {
+            continue;
+        }
+        out.push_back(r);
     }
 }
 
@@ -296,7 +313,7 @@ int main(int argc, char **argv) {
     float min_us = 1e30f;
     float max_us = 0.0f;
     int timed_dispatches = 0;
-    uint32_t max_emit_observed = 0;
+    ParseStats parse_stats;
     const unsigned int opcode = 3;
     const int total_iters = args.warmup + args.iters;
 
@@ -304,7 +321,7 @@ int main(int argc, char **argv) {
         const bool keep = it >= args.warmup;
         if (keep) {
             all_records.clear();
-            max_emit_observed = 0;
+            parse_stats = ParseStats{};
         }
         for (size_t bi = 0; bi < n_batches; ++bi) {
             std::memset(p_seq_in, 0, per_batch_seq_in_bytes);
@@ -358,28 +375,39 @@ int main(int argc, char **argv) {
                     const uint8_t *chunk_blob =
                         p_sparse_out +
                         static_cast<size_t>(slot) * per_chunk_block_bytes;
+                    const size_t owned_end =
+                        (ci + 1u < n_chunks_host)
+                            ? chunks[ci + 1u].src_offset * 4u +
+                                  static_cast<size_t>(SEQ_IN_OVERLAP * 4 - 2)
+                            : static_cast<size_t>(args.n_bases);
                     parse_chunk_tile0(
                         chunk_blob,
                         c.src_offset * 4u,
+                        owned_end,
                         args.n_bases,
                         all_records,
-                        max_emit_observed);
+                        parse_stats);
                 }
             }
         }
     }
 
-    if (max_emit_observed >= static_cast<uint32_t>(MC_MAX_EMIT_IDX)) {
+    if (parse_stats.max_emit_observed >= static_cast<uint32_t>(MC_MAX_EMIT_IDX)) {
         trace("WARN: max_emit_observed=" +
-              std::to_string(max_emit_observed) +
+              std::to_string(parse_stats.max_emit_observed) +
               " hit cap MC_MAX_EMIT_IDX=" +
               std::to_string(MC_MAX_EMIT_IDX));
     }
 
-    std::sort(all_records.begin(), all_records.end(), record_less);
-    all_records.erase(
-        std::unique(all_records.begin(), all_records.end(), record_equal),
-        all_records.end());
+    if (parse_stats.monotonic) {
+        trace("records monotonic; skipped global sort/unique");
+    } else {
+        trace("records not monotonic; applying global sort/unique");
+        std::sort(all_records.begin(), all_records.end(), record_less);
+        all_records.erase(
+            std::unique(all_records.begin(), all_records.end(), record_equal),
+            all_records.end());
+    }
     if (args.top > 0 && static_cast<size_t>(args.top) < all_records.size()) {
         all_records.resize(static_cast<size_t>(args.top));
     }

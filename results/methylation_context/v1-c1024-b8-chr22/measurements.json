@@ -3,8 +3,8 @@
   "byte_equal_by_counts": true,
   "first_record_diff": null,
   "fixture": "/home/matteius/genetics/tracks/genomics/fixtures/chr22.2bit.bin",
-  "host_runner_stderr": "[methylation_context_runner] input bytes=12704617 bases=50818468 chunks=12505 batches=1564\n",
-  "host_runner_stdout": "PASS!\nAvg NPU time: 1845.39us.\nMin NPU time: 641us.\nMax NPU time: 3894us.\nRecords: 18406838\n",
+  "host_runner_stderr": "[methylation_context_runner] input bytes=12704617 bases=50818468 chunks=12505 batches=1564\n[methylation_context_runner] records monotonic; skipped global sort/unique\n",
+  "host_runner_stdout": "PASS!\nAvg NPU time: 1778.95us.\nMin NPU time: 242us.\nMax NPU time: 3593us.\nRecords: 18406838\n",
   "n_bases": 50818468,
   "oracle_counts_by_context": {
     "CG": 1269292,
@@ -16,9 +16,9 @@
     "-": 9246186
   },
   "oracle_records": 18406838,
-  "oracle_wall_s": 21.99953191700115,
+  "oracle_wall_s": 22.403542611002194,
   "packed_bytes": 12704617,
-  "record_compare_wall_s": 5.559632771000906,
+  "record_compare_wall_s": 5.791887275998306,
   "record_deficit": 0,
   "record_equal": true,
   "record_recovery": 1.0,
@@ -32,5 +32,5 @@
     "-": 9246186
   },
   "silicon_records": 18406838,
-  "silicon_wall_s": 150.64712903700274
+  "silicon_wall_s": 150.79487625000183
 }

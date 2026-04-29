@@ -9,9 +9,9 @@ Dorado-style basecalling, but it is a strong fit for streaming genomics
 primitives built from byte-level state, local windows, threshold tests,
 and sparse emits.
 
-The evidence is now broader than a single CRISPR scanner. Five
-independent primitives have silicon-validated the same programming
-toolkit across three algorithmic shapes:
+The evidence is now broader than a single CRISPR scanner. Seven
+independent primitives have exercised the same programming toolkit
+across four algorithmic shapes, plus one product-facing composition.
 
 | Primitive | Algorithmic shape | chr22 validation | chr22 e2e |
 | --- | --- | --- | ---: |
@@ -20,6 +20,9 @@ toolkit across three algorithmic shapes:
 | `seed_extend` v0 | host hash lookup over silicon minimizers | 100 Kbp chr22 self-mapping smoke | 0.3 s lookup |
 | `primer_scan` v0 | substring / adapter exact match | smoke 0/0; synthetic 2/2 byte-equal; chr22 path built | 2.05 s |
 | `cpg_island` v0 | windowed multi-counter stats + threshold | 1,352 islands byte-equal; 1,373,708 candidates | 3.80 s |
+| `tandem_repeat` v0 | period detection / autocorrelation | chr22 silicon run; 289,548 records with 3 host-merge edge diffs | 9.4 s |
+| `methylation_context` v0 | local base-context classifier | smoke byte-equal; chr22 cap-fire at 9.84 M / 18.41 M records | 23.28 s |
+| `bionpu trim` v0/v1 | toolkit-to-tool composition | cutadapt byte-equal on 4/4 cross-checks | workload-dependent |
 
 The common shape is:
 
@@ -116,6 +119,55 @@ Full chr22 validation:
 Measurement file:
 `results/cpg/v0-chr22/measurements.json`.
 
+### `tandem_repeat`
+
+`tandem_repeat` validates the fourth algorithmic shape: exact
+periodicity detection. The tile checks short periods and emits STR
+records for host-side sorting/dedup. This is the first primitive in the
+cascade whose core logic is not just canonical math, substring compare,
+or rolling counters.
+
+Full chr22 validation produced 289,548 records in 9.4 s with three
+documented host-merge edge differences. That makes the shape useful as
+research evidence even though v1 should tighten chunk-boundary merge
+semantics before it becomes a production caller.
+
+### `methylation_context`
+
+`methylation_context` validates a local base-context classifier:
+`CG`, `CHG`, and `CHH` contexts are emitted on both strands, with
+minus-strand cytosines represented as forward-reference `G` positions.
+The silicon path is byte-equal to the CPU oracle on mixed synthetic
+smoke tests and all-A negative controls.
+
+Full chr22 validation is a deliberate boundary test:
+
+- fixture: `tracks/genomics/fixtures/chr22.2bit.bin`
+- bases: 50,818,468
+- CPU oracle: 18,406,838 context records in 21.318 s
+- NPU: 9,840,462 context records in 23.277 s wall
+- host-reported dispatch: 813.408 us average over 3,108 chunks
+- record recovery: 53.46%
+- byte-equal: false, due to `MC_MAX_EMIT_IDX=4094` cap-fire
+
+Context counts:
+
+| context | NPU | CPU oracle |
+| --- | ---: | ---: |
+| `CG` | 664,817 | 1,269,292 |
+| `CHG` | 2,291,284 | 4,336,761 |
+| `CHH` | 6,884,361 | 12,800,785 |
+
+Measurement file:
+`results/methylation_context/v0-chr22/measurements.json`.
+
+This is an important correction to the naive "sparse emit" assumption:
+per-base methylation contexts are dense in real DNA. The classifier
+fits AIE2P, but the output contract needs a v1 mode before full-genome
+record emission can be byte-equal. Good v1 options are a wider output
+slot, smaller chunks, context-filtered scans, or count/window aggregate
+mode.
+
 ## Toolkit Pattern
 
 The recurring implementation pattern is now stable:
@@ -136,24 +188,19 @@ composition, dynamic programming, and product I/O.
 
 ## What To Build Next
 
-The easy cascade primitives are useful but not shape-novel:
+The easy cascade primitives are useful but mostly not shape-novel:
 
 - restriction-site finder: `primer_scan` shape;
-- methylation context `CG/CHH/CHG`: local base-context classifier;
 - GC% windowed scanner: `cpg_island` counter subset;
 - N-base detector: trivial threshold / sparse emit.
 
-The most valuable next research primitive is a tandem-repeat caller.
-It would validate a fourth shape: periodicity detection. A conservative
-v0 should avoid FFT and start with exact short tandem repeats:
+The most valuable next work is no longer another trivial primitive. It
+is either:
 
-- motif length 1..6;
-- emit `(start, end, period, repeat_count, motif)`;
-- synthetic disease-style fixtures: `CAG`, `CGG`, `GAA`, `ATTTC`;
-- chr22 scan against the CPU oracle after synthetic byte equality.
-
-This extends the empirical foundation from five primitives / three
-shapes to six primitives / four shapes.
+- fix dense-output primitives (`methylation_context`, `minimizer`) with
+  wider output or alternate aggregate modes;
+- turn `bionpu trim` batching into a production throughput result; or
+- write up the seven-primitive/four-shape empirical foundation.
 
 ## Boundary Conditions
 

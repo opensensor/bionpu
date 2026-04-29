@@ -1,0 +1,33 @@
+{
+  "artifact_dir": "/home/matteius/genetics/bionpu-public/src/bionpu/dispatch/_npu_artifacts/bionpu_methylation_context_n4",
+  "byte_equal_by_counts": false,
+  "fixture": "/home/matteius/genetics/tracks/genomics/fixtures/chr22.2bit.bin",
+  "host_runner_stderr": "[methylation_context_runner] input bytes=12704617 bases=50818468 chunks=3108 batches=3108\n[methylation_context_runner] WARN: max_emit_observed=4094 hit cap MC_MAX_EMIT_IDX=4094\n",
+  "host_runner_stdout": "PASS!\nAvg NPU time: 813.408us.\nMin NPU time: 400us.\nMax NPU time: 2620us.\nRecords: 9840462\n",
+  "n_bases": 50818468,
+  "oracle_counts_by_context": {
+    "CG": 1269292,
+    "CHG": 4336761,
+    "CHH": 12800785
+  },
+  "oracle_counts_by_strand": {
+    "+": 9160652,
+    "-": 9246186
+  },
+  "oracle_records": 18406838,
+  "oracle_wall_s": 21.31762541000353,
+  "packed_bytes": 12704617,
+  "record_deficit": 8566376,
+  "record_recovery": 0.5346090404011813,
+  "silicon_counts_by_context": {
+    "CG": 664817,
+    "CHG": 2291284,
+    "CHH": 6884361
+  },
+  "silicon_counts_by_strand": {
+    "+": 4888833,
+    "-": 4951629
+  },
+  "silicon_records": 9840462,
+  "silicon_wall_s": 23.277077299000666
+}

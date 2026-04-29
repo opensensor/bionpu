@@ -245,6 +245,8 @@ PRIMER_SCAN_DEFAULT_PRIMER: str = "AGATCGGAAGAGC"  # Illumina TruSeq P5, P=13
 PRIMER_SCAN_DEFAULT_N_TILES: int = 4
 CPG_ISLAND_VALID_N_TILES: tuple[int, ...] = (1, 2, 4, 8)
 CPG_ISLAND_DEFAULT_N_TILES: int = 4
+METHYLATION_CONTEXT_VALID_N_TILES: tuple[int, ...] = (1, 2, 4, 8)
+METHYLATION_CONTEXT_DEFAULT_N_TILES: int = 4
 
 
 def _primer_scan_op_name(p: int) -> str:
@@ -334,6 +336,37 @@ def get_cpg_island_op(
 
 
 # --------------------------------------------------------------------------- #
+# Methylation context helper (v0 — single registry entry).
+# --------------------------------------------------------------------------- #
+
+def get_methylation_context_op(
+    n_tiles: int | None = None,
+):
+    """Return the CG/CHG/CHH methylation-context scanner :class:`NpuOp`."""
+    from bionpu.dispatch.npu import NPU_OPS
+    import bionpu.kernels.genomics.methylation_context as _mc  # noqa: F401
+
+    if n_tiles is None:
+        n_tiles = METHYLATION_CONTEXT_DEFAULT_N_TILES
+    if int(n_tiles) not in METHYLATION_CONTEXT_VALID_N_TILES:
+        valid = ", ".join(str(x) for x in METHYLATION_CONTEXT_VALID_N_TILES)
+        raise ValueError(
+            f"get_methylation_context_op: n_tiles={n_tiles!r} "
+            f"not in {{{valid}}}."
+        )
+
+    op_name = "bionpu_methylation_context"
+    if op_name not in NPU_OPS:
+        raise KeyError(
+            "methylation_context op is not registered in NPU_OPS. "
+            "Import bionpu.kernels.genomics.methylation_context first."
+        )
+
+    BionpuMethylationContext = type(NPU_OPS[op_name])
+    return BionpuMethylationContext(n_tiles=int(n_tiles))
+
+
+# --------------------------------------------------------------------------- #
 # Tandem repeat (STR) helper (v0 — single registry entry).
 # --------------------------------------------------------------------------- #
 
@@ -381,6 +414,8 @@ __all__ = [
     "MINIMIZER_LAUNCH_CHUNKS_ENV",
     "MINIMIZER_VALID_KW",
     "MINIMIZER_VALID_N_TILES",
+    "METHYLATION_CONTEXT_DEFAULT_N_TILES",
+    "METHYLATION_CONTEXT_VALID_N_TILES",
     "PRIMER_SCAN_DEFAULT_N_TILES",
     "PRIMER_SCAN_DEFAULT_PRIMER",
     "PRIMER_SCAN_VALID_N_TILES",
@@ -390,6 +425,7 @@ __all__ = [
     "get_kmer_count_op",
     "get_minimizer_op",
     "get_cpg_island_op",
+    "get_methylation_context_op",
     "get_primer_scan_op",
     "get_tandem_repeat_op",
 ]

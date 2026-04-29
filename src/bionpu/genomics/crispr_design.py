@@ -84,6 +84,7 @@ __all__ = [
     "DEFAULT_GC_MAX",
     "DEFAULT_GC_MIN",
     "DEFAULT_MAX_MISMATCHES",
+    "DEFAULT_NPU_AUTO_MIN_COMPARISONS",
     "DEFAULT_TOP_N",
     "GeneNotFoundError",
     "RankedGuide",
@@ -97,6 +98,7 @@ __all__ = [
     "format_result_json",
     "rank_guides",
     "resolve_coordinate_target",
+    "resolve_scan_device",
     "resolve_target_fasta",
     "resolve_target",
     "select_locus_guides",
@@ -468,6 +470,13 @@ DEFAULT_TOP_N: int = 10
 DEFAULT_MAX_MISMATCHES: int = 4
 DEFAULT_GC_MIN: float = 25.0
 DEFAULT_GC_MAX: float = 75.0
+
+# Conservative auto-routing threshold for CRISPR design's off-target scan.
+# Tiny loci lose to XRT/host-runner overhead (AAVS1: CPU off-target scan
+# 24 ms vs NPU 586 ms). Large candidate x locus products are where the
+# AIE2P path amortizes dispatch overhead and attacks the dominant wall time
+# (RUNX1 CPU off-target scan: 1,705 s).
+DEFAULT_NPU_AUTO_MIN_COMPARISONS: int = 50_000_000_000
 
 
 # Composite-scoring weights used by `composite_bionpu` (PRD §7.1 Q5
@@ -912,9 +921,10 @@ def design_guides_for_target(
     top_n, max_mismatches, gc_min, gc_max:
         See PRD §3.1 defaults; Tier 1 overrides ``top_n`` to 10.
     device:
-        ``"cpu"`` (default; numpy-only path) or ``"npu"`` (silicon
-        path). The NPU path requires the precompiled CRISPR xclbins
-        and wraps every dispatch in
+        ``"cpu"`` (default; numpy-only path), ``"npu"`` (silicon path),
+        or ``"auto"`` (route large scans to NPU, tiny scans to CPU).
+        The NPU path requires the precompiled CRISPR xclbins and wraps
+        every dispatch in
         :func:`bionpu.dispatch.npu_silicon_lock.npu_silicon_lock`.
     rank_by:
         ``"crispor"`` (Tier 1 default) or ``"bionpu"``.
@@ -970,6 +980,12 @@ def design_guides_for_target(
     # them — synthesise via cpu_scan but only resolve the on-target
     # site (no mismatch search needed).
     t0 = time.perf_counter()
+    scan_device = resolve_scan_device(
+        requested=device,
+        locus_bp=resolved.length,
+        n_candidate_guides=len(candidate_guides),
+        synbio_mode=synbio_mode,
+    )
     if synbio_mode:
         all_hits = _scan_locus_for_offtargets(
             resolved=resolved,
@@ -983,7 +999,7 @@ def design_guides_for_target(
             resolved=resolved,
             candidate_guides=candidate_guides,
             max_mismatches=max_mismatches,
-            device=device,
+            device=scan_device,
             silicon_lock_label=silicon_lock_label,
         )
     timings["off_target_scan"] = time.perf_counter() - t0
@@ -1060,6 +1076,33 @@ def design_guides_for_target(
         n_off_target_hits=sum(len(v) for v in off_target_rows_by_guide.values()),
         stage_timings_s=timings,
     )
+
+
+def resolve_scan_device(
+    *,
+    requested: str,
+    locus_bp: int,
+    n_candidate_guides: int,
+    synbio_mode: bool = False,
+    min_comparisons_for_npu: int = DEFAULT_NPU_AUTO_MIN_COMPARISONS,
+) -> str:
+    """Resolve ``cpu`` / ``npu`` / ``auto`` to the actual scan device.
+
+    ``auto`` is deliberately conservative: it only chooses NPU when the
+    guide-count x locus-length product is large enough to amortize XRT
+    and host-runner overhead. Explicit ``npu`` still forces silicon for
+    validation and benchmarking.
+    """
+    if requested not in ("cpu", "npu", "auto"):
+        raise ValueError(
+            f"device must be 'cpu', 'npu', or 'auto'; got {requested!r}"
+        )
+    if requested in ("cpu", "npu"):
+        return requested
+    if synbio_mode:
+        return "cpu"
+    comparisons = int(locus_bp) * int(n_candidate_guides)
+    return "npu" if comparisons >= min_comparisons_for_npu else "cpu"
 
 
 # ---------------------------------------------------------------------------

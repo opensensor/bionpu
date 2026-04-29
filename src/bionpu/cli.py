@@ -1394,13 +1394,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_c_design.add_argument(
         "--device",
         default="cpu",
-        choices=["cpu", "npu"],
+        choices=["cpu", "npu", "auto"],
         help=(
             "Compute device for the PAM/off-target scan stages. Default "
-            "'cpu' (numpy reference path) for Tier 1; 'npu' wraps every "
+            "'cpu' (numpy reference path); 'npu' forces silicon; 'auto' "
+            "routes only large candidate x locus scans to NPU so tiny loci "
+            "do not pay XRT dispatch overhead. NPU dispatch wraps every "
             "silicon submission in bionpu.dispatch.npu_silicon_lock per "
-            "CLAUDE.md non-negotiable, and requires the precompiled "
-            "CRISPR xclbins under bionpu/dispatch/_npu_artifacts/."
+            "CLAUDE.md non-negotiable and requires the precompiled CRISPR "
+            "xclbins under bionpu/dispatch/_npu_artifacts/."
         ),
     )
     p_c_design.add_argument(

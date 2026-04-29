@@ -366,6 +366,50 @@ def test_cli_mode_c_default_genome_path_not_required(tmp_path):
     assert rc == 0
 
 
+def test_auto_device_routes_tiny_loci_to_cpu():
+    """Auto mode avoids NPU dispatch overhead on small loci."""
+    assert (
+        cd.resolve_scan_device(
+            requested="auto",
+            locus_bp=1_851,
+            n_candidate_guides=440,
+        )
+        == "cpu"
+    )
+
+
+def test_auto_device_routes_large_loci_to_npu():
+    """Auto mode uses NPU for RUNX1-scale off-target scans."""
+    assert (
+        cd.resolve_scan_device(
+            requested="auto",
+            locus_bp=1_266_734,
+            n_candidate_guides=135_421,
+        )
+        == "npu"
+    )
+
+
+def test_auto_device_explicit_modes_are_preserved():
+    """Explicit CPU/NPU requests are not rewritten by the heuristic."""
+    assert (
+        cd.resolve_scan_device(
+            requested="cpu",
+            locus_bp=1_266_734,
+            n_candidate_guides=135_421,
+        )
+        == "cpu"
+    )
+    assert (
+        cd.resolve_scan_device(
+            requested="npu",
+            locus_bp=1_851,
+            n_candidate_guides=440,
+        )
+        == "npu"
+    )
+
+
 # --------------------------------------------------------------------- #
 # Locked-asset reuse — surface checks (don't run silicon, just import).
 # --------------------------------------------------------------------- #

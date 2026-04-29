@@ -191,11 +191,11 @@ class BionpuMethylationContext(NpuOp):
     @property
     def artifact_dir(self) -> Path:
         base = f"bionpu_methylation_context_n{self.n_tiles}"
+        if self.n_chunks_per_launch != 1:
+            base = f"{base}_b{self.n_chunks_per_launch}"
         if self.seq_chunk_bytes_base != SEQ_IN_CHUNK_BYTES_BASE:
             base = f"{base}_c{self.seq_chunk_bytes_base}"
-        if self.n_chunks_per_launch == 1:
-            return _ART_ROOT / base
-        return _ART_ROOT / f"{base}_b{self.n_chunks_per_launch}"
+        return _ART_ROOT / base
 
     @property
     def xclbin(self) -> Path:

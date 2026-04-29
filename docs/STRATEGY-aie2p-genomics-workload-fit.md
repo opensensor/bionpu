@@ -181,6 +181,18 @@ cap-fired in dense chunks. The c1024 artifact removes cap-fire on chr22:
 Measurement file:
 `results/methylation_context/v1-c1024-chr22/measurements.json`.
 
+Batched c1024 variants preserve record equality but do not materially
+change wall time:
+
+| artifact | batches | avg dispatch | wall |
+| --- | ---: | ---: | ---: |
+| `n4_c1024` | 12,505 | 386.744 us | 154.771 s |
+| `n4_b4_c1024` | 3,127 | 1,057.99 us | 150.818 s |
+| `n4_b8_c1024` | 1,564 | 1,845.39 us | 150.647 s |
+
+The next performance lever is host output handling: parse/sort/write of
+18.4 M dense records dominates after launch count is reduced.
+
 ## Toolkit Pattern
 
 The recurring implementation pattern is now stable:

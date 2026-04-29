@@ -48,3 +48,10 @@ The record-safe chr22 artifact uses smaller chunks:
 ```bash
 make NPU2=1 experiment=wide4 seq_chunk_bytes=1024 all
 ```
+
+Batched record-safe variants:
+
+```bash
+make NPU2=1 experiment=wide4 seq_chunk_bytes=1024 n_chunks_per_launch=4 all
+make NPU2=1 experiment=wide4 seq_chunk_bytes=1024 n_chunks_per_launch=8 all
+```

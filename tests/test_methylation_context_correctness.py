@@ -44,6 +44,13 @@ def test_get_methylation_context_op_returns_requested_tile_count() -> None:
     assert op.seq_chunk_bytes_base == 2048
     assert op.artifact_dir.name == "bionpu_methylation_context_n2_c2048"
 
+    batched = BionpuMethylationContext(
+        n_tiles=4,
+        n_chunks_per_launch=4,
+        seq_chunk_bytes_base=1024,
+    )
+    assert batched.artifact_dir.name == "bionpu_methylation_context_n4_b4_c1024"
+
 
 def test_methylation_context_silicon_byte_equal_mixed_smoke() -> None:
     op = _maybe_skip_if_no_artifacts()

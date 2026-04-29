@@ -1476,6 +1476,13 @@ def _build_parser() -> argparse.ArgumentParser:
     from .genomics.library_design.cli import add_library_design_subparser
     add_library_design_subparser(sub_lib)
 
+    # validate — Track F v0 cross-tool validation harness
+    # (PRDs/PRD-crispr-state-of-the-art-roadmap.md §3.6). Two-level
+    # shape (`bionpu validate <target> ...`) leaves room for
+    # `bionpu validate report` etc. without further reshuffles.
+    from .validation.cli import add_validate_subparser
+    add_validate_subparser(sub)
+
     # placeholders — scope for v0.3+
     for name, help_text in (
         ("basecall", "Nanopore basecalling (v0.2+ scope)"),
@@ -1499,6 +1506,7 @@ def main(argv: list[str] | None = None) -> int:
         ("crispr", "crispr_kind"),
         ("be", "be_kind"),
         ("library", "library_kind"),
+        ("validate", "validate_target"),
     ):
         if args.cmd == parent_cmd and getattr(args, kind_attr, None) is None:
             for action in p._subparsers._actions:  # type: ignore[attr-defined]

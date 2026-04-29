@@ -412,3 +412,26 @@ def test_coordinate_target_cli_json_mode(tmp_path, capsys) -> None:
     assert payload["target"]["start"] == 4
     assert payload["target"]["end"] == 4 + len(target)
     assert payload["ranked"]
+
+
+def test_coordinate_target_start_edge_scores_when_contig_end_is_close(tmp_path) -> None:
+    """Available upstream context is kept even if downstream flank is absent."""
+    chrom = "coord_edge_chr"
+    prefix = "TTTT"
+    target = "AAGCTGAAACATTCATTAGGTGG" + ("ACGT" * 8)
+    fasta = tmp_path / "coord_edge.fa"
+    # No trailing bases after target. Pre-fix, scoring requested end+4,
+    # failed, and discarded the upstream flank too.
+    fasta.write_text(f">{chrom}\n{prefix}{target}\n", encoding="ascii")
+
+    result = cd.design_guides_for_target(
+        target=f"{chrom}:5-{4 + len(target)}",
+        genome="GRCh38",
+        fasta_path=fasta,
+        top_n=3,
+        device="cpu",
+    )
+
+    edge_rows = [g for g in result.ranked if g.target_pos == 4]
+    assert edge_rows
+    assert edge_rows[0].on_target_score > 0.0

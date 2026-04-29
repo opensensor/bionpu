@@ -1198,18 +1198,20 @@ def _load_scoring_context(
         return resolved.chrom, resolved.start, resolved.sequence
     ctx_start = max(0, resolved.start - flank)
     ctx_end = resolved.end + flank
-    try:
-        seq = slice_chrom_from_fasta(
-            fasta_path=fasta_path,
-            chrom=resolved.chrom,
-            start=ctx_start,
-            end=ctx_end,
-        )
-    except ValueError:
-        # Keep the design run usable on truncated developer fixtures.
-        # Rows that still lack true context remain unscored below.
-        return resolved.chrom, resolved.start, resolved.sequence
-    return resolved.chrom, ctx_start, seq
+    for end in (ctx_end, resolved.end):
+        try:
+            seq = slice_chrom_from_fasta(
+                fasta_path=fasta_path,
+                chrom=resolved.chrom,
+                start=ctx_start,
+                end=end,
+            )
+            return resolved.chrom, ctx_start, seq
+        except ValueError:
+            continue
+    # Keep the design run usable on truncated developer fixtures.
+    # Rows that still lack true context remain unscored below.
+    return resolved.chrom, resolved.start, resolved.sequence
 
 
 def _score_on_target(

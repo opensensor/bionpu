@@ -223,13 +223,29 @@ def resolve_target(
             label=target,
         )
     sym = target.upper()
-    if sym not in _RESOLVE_GENE_TO_LOCUS:
-        known = ", ".join(sorted(_RESOLVE_GENE_TO_LOCUS))
-        raise GeneNotFoundError(
-            f"gene {target!r} not in the Tier 1 resolver "
-            f"(known: {known}). {TARGET_RESOLVER_TIER1_NOTE}"
+    if sym in _RESOLVE_GENE_TO_LOCUS:
+        chrom, one_start, one_end = _RESOLVE_GENE_TO_LOCUS[sym]
+    else:
+        # UCSC genome-fetch v1: delegate to the refGene-backed resolver.
+        # The hardcoded dict above stays as a fast in-tree pin so the
+        # 20-gene CRISPOR validation harness and the
+        # `monkeypatch.setitem(cd._RESOLVE_GENE_TO_LOCUS, ...)` test
+        # pattern keep working.
+        from bionpu.data.genome_fetcher import (
+            GeneSymbolNotFound,
+            resolve_gene_symbol,
         )
-    chrom, one_start, one_end = _RESOLVE_GENE_TO_LOCUS[sym]
+
+        try:
+            coord = resolve_gene_symbol(sym, genome="hg38")
+        except (GeneSymbolNotFound, FileNotFoundError) as exc:
+            known = ", ".join(sorted(_RESOLVE_GENE_TO_LOCUS))
+            raise GeneNotFoundError(
+                f"gene {target!r} not found via the Tier 1 hardcoded "
+                f"table (known: {known}) nor the UCSC refGene "
+                f"resolver: {exc}. {TARGET_RESOLVER_TIER1_NOTE}"
+            ) from exc
+        chrom, one_start, one_end = coord.chrom, coord.start, coord.end
     zero_start = one_start - 1
     zero_end = one_end  # inclusive 1-based -> exclusive 0-based: end stays
     seq = slice_chrom_from_fasta(

@@ -1,0 +1,44 @@
+{
+  "version": "v1",
+  "option_chosen": "B (local refGene + FASTA slice; 2bit deferred)",
+  "bundled_subset_path": "bionpu-public/data/refGene_hg38.tsv.gz",
+  "bundled_subset_bytes": 7279,
+  "bundled_subset_decompressed_bytes": 15417,
+  "bundled_gene_count": 349,
+  "lookup_wall_cold_s": {
+    "min": 0.0004106920005142456,
+    "median": 0.0004429239997989498,
+    "max": 0.0006266479995247209,
+    "samples_n": 5
+  },
+  "lookup_wall_warm_s": {
+    "min": 2.0100014808122069e-07,
+    "median": 2.1999949240125716e-07,
+    "max": 1.2220007192809135e-06,
+    "samples_n": 20
+  },
+  "brca1_resolution": {
+    "symbol": "BRCA1",
+    "chrom": "chr17",
+    "start_1b": 43044295,
+    "end_1b": 43125483,
+    "strand": "-",
+    "refseq_id": "NM_007294"
+  },
+  "brca1_sequence_fetch_wall_s": 0.9279374280013144,
+  "brca1_sequence_length_bp": 81189,
+  "brca1_sequence_first_50_bp": "TGGAAGTGTTTGCTACCAAGTTTATTTGCAGTGTTAACAGCACAACATTT",
+  "download_refgene_hg38_url": "http://hgdownload.soe.ucsc.edu/goldenPath/hg38/database/refGene.txt.gz",
+  "download_wall_s": "not invoked (allow_network=False default; bundled subset covers v1 acceptance set)",
+  "acceptance": {
+    "AC1_brca1_resolves": true,
+    "AC2_cache_warm_hit": true,
+    "AC3_fetch_with_flanks": true,
+    "AC4_crispr_design_real_brca1": true,
+    "AC5_be_design_real_brca1": true,
+    "AC6_offline_after_first_use": true,
+    "AC7_clean_GeneSymbolNotFound": true,
+    "AC8_unit_tests_count": 14,
+    "AC9_integration_test_count": 1
+  }
+}

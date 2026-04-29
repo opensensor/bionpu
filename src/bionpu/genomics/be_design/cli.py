@@ -78,15 +78,23 @@ def format_tsv(guides: list[BaseEditorGuide]) -> str:
       target_pos_in_protospacer, in_activity_window, bystander_count,
       bystander_positions (semicolon-separated), off_target_count,
       cfd_aggregate, rank_score, notes
+
+    NaN ``cfd_aggregate`` (synbio mode — no scan performed) renders as
+    ``"NaN"``. Numeric values (incl. 0.0) render as ``"%.6f"``.
     """
+    import math as _math
     lines = [_TSV_HEADER]
     for i, g in enumerate(guides, 1):
         byst = ";".join(str(p) for p in g.bystander_positions)
+        cfd_str = (
+            "NaN" if _math.isnan(float(g.cfd_aggregate))
+            else f"{g.cfd_aggregate:.6f}"
+        )
         lines.append(
             f"{i}\t{g.guide_seq}\t{g.pam_seq}\t{g.target_pos}\t"
             f"{g.target_base}\t{g.target_pos_in_protospacer}\t"
             f"{int(g.in_activity_window)}\t{g.bystander_count}\t{byst}\t"
-            f"{g.off_target_count}\t{g.cfd_aggregate:.6f}\t"
+            f"{g.off_target_count}\t{cfd_str}\t"
             f"{g.rank_score:.6f}\t{g.notes}\n"
         )
     return "".join(lines)
@@ -101,10 +109,43 @@ def add_be_design_subparser(subparsers: argparse._SubParsersAction) -> None:
             "Track A v0: SpCas9 wt + SpCas9-NG; BE4max + ABE7.10."
         ),
     )
+    # UCSC genome-fetch v1: Mode A (gene symbol) + Mode C (target FASTA).
+    # Exactly one of --target / --target-fasta must be supplied.
+    p.add_argument(
+        "--target",
+        default=None,
+        help=(
+            "Gene symbol (e.g. BRCA1). Resolves to GRCh38 coordinates "
+            "via UCSC refGene; the sequence is sliced from --fasta "
+            "(or $BIONPU_GRCH38_FASTA / data_cache/genomes/grch38/"
+            "hg38.fa). Mutually exclusive with --target-fasta."
+        ),
+    )
     p.add_argument(
         "--target-fasta",
-        required=True,
-        help="Path to a target FASTA. Reads the first record.",
+        default=None,
+        help=(
+            "Path to a target FASTA. Reads the first record. "
+            "Mutually exclusive with --target."
+        ),
+    )
+    p.add_argument(
+        "--fasta",
+        default=None,
+        help=(
+            "Reference FASTA for --target gene-symbol resolution. "
+            "Defaults to $BIONPU_GRCH38_FASTA or "
+            "data_cache/genomes/grch38/hg38.fa."
+        ),
+    )
+    p.add_argument(
+        "--flanks",
+        type=int,
+        default=0,
+        help=(
+            "Bases of flanking sequence to fetch on either side of "
+            "the gene span (only with --target). Default 0."
+        ),
     )
     p.add_argument(
         "--be-variant",
@@ -122,9 +163,10 @@ def add_be_design_subparser(subparsers: argparse._SubParsersAction) -> None:
         "--genome",
         default="none",
         help=(
-            "Reference for off-target scan. Currently only 'none' "
-            "(synbio mode; no off-target scan) is supported. v1+ "
-            "wires the locked match_multitile_memtile kernel."
+            "Reference for off-target scan. Either 'none' (synbio mode; "
+            "no off-target scan, v0 default) or a path to a FASTA "
+            "(v1; wires the locked crispr/match_multitile_memtile "
+            "scan + CFD aggregate scoring per guide)."
         ),
     )
     p.add_argument(
@@ -156,28 +198,65 @@ def add_be_design_subparser(subparsers: argparse._SubParsersAction) -> None:
 
 def run_cli(args: argparse.Namespace) -> int:
     """Implementation of ``bionpu be design ...``."""
-    target_fasta = pathlib.Path(args.target_fasta)
-    try:
-        record_name, target_seq = _read_first_fasta_record(target_fasta)
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"bionpu be design: {exc}", file=sys.stderr)
-        return 2
-
-    if args.genome != "none":
+    # UCSC genome-fetch v1: resolve target via either Mode A (gene
+    # symbol) or Mode C (target FASTA). Exactly one must be supplied.
+    target_arg = getattr(args, "target", None)
+    target_fasta_arg = getattr(args, "target_fasta", None)
+    if (target_arg is None) == (target_fasta_arg is None):
         print(
-            "bionpu be design: only --genome none (synbio mode) is "
-            "supported in v0; off-target scan is deferred to v1+. "
-            "Re-run with --genome none.",
+            "bionpu be design: pass exactly one of --target SYMBOL "
+            "or --target-fasta PATH.",
             file=sys.stderr,
         )
         return 2
+
+    if target_arg is not None:
+        # Mode A: gene symbol -> GRCh38 coordinates -> sequence.
+        from .target_resolver import GeneSymbolNotFound, resolve_be_target
+
+        fasta_arg = getattr(args, "fasta", None)
+        flanks_arg = int(getattr(args, "flanks", 0) or 0)
+        try:
+            record_name, target_seq, _coord = resolve_be_target(
+                target_arg,
+                genome="hg38",
+                fasta_path=pathlib.Path(fasta_arg) if fasta_arg else None,
+                flanks=flanks_arg,
+            )
+        except GeneSymbolNotFound as exc:
+            print(f"bionpu be design: {exc}", file=sys.stderr)
+            return 2
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"bionpu be design: {exc}", file=sys.stderr)
+            return 2
+    else:
+        target_fasta = pathlib.Path(target_fasta_arg)
+        try:
+            record_name, target_seq = _read_first_fasta_record(target_fasta)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"bionpu be design: {exc}", file=sys.stderr)
+            return 2
+
+    # v1: --genome is either 'none' (synbio mode) or a path to a FASTA.
+    if args.genome == "none":
+        genome_arg: pathlib.Path | None = None
+    else:
+        genome_arg = pathlib.Path(args.genome)
+        if not genome_arg.is_file():
+            print(
+                f"bionpu be design: --genome {args.genome} is not a "
+                f"FASTA file. Pass 'none' for synbio mode or supply "
+                f"a valid FASTA path.",
+                file=sys.stderr,
+            )
+            return 2
 
     try:
         guides = design_base_editor_guides(
             target_seq,
             be_variant=args.be_variant,
             cas9_variant=args.cas9_variant,
-            genome_path=None,  # v0: synbio mode only
+            genome_path=genome_arg,
             top_n=int(args.top),
             use_silicon=bool(args.use_silicon),
             require_in_window=bool(args.require_in_window),

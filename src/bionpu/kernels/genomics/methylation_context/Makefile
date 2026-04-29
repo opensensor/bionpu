@@ -28,6 +28,11 @@ devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
 seq ?= 10000
 experiment ?= production
 n_chunks_per_launch ?= 1
+seq_chunk_bytes ?= 4096
+
+ifeq ($(filter $(seq_chunk_bytes),1024 2048 4096),)
+  $(error unknown seq_chunk_bytes=$(seq_chunk_bytes); supported: 1024, 2048, 4096)
+endif
 
 ifeq ($(experiment),production)
   n_tiles = 1
@@ -47,10 +52,16 @@ endif
 
 targetname = bionpu_methylation_context
 
-ifeq ($(n_chunks_per_launch),1)
-  artifact_suffix = n${n_tiles}_L${seq}
+ifeq ($(seq_chunk_bytes),4096)
+  chunk_suffix =
 else
-  artifact_suffix = n${n_tiles}_b${n_chunks_per_launch}_L${seq}
+  chunk_suffix = _c${seq_chunk_bytes}
+endif
+
+ifeq ($(n_chunks_per_launch),1)
+  artifact_suffix = n${n_tiles}${chunk_suffix}_L${seq}
+else
+  artifact_suffix = n${n_tiles}${chunk_suffix}_b${n_chunks_per_launch}_L${seq}
 endif
 
 aie_py_src        = methylation_context.py
@@ -70,6 +81,7 @@ ifeq ($(devicename),npu2)
 	cd $(@D) && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} \
 	  -I${mlir_aie_dir}/aie_kernels \
 	  ${AIE_API_INCLUDE} \
+	  -DMC_SEQ_IN_CHUNK_BYTES_BASE=${seq_chunk_bytes} \
 	  -c ${srcdir}/${aie_tile_cc_src} -o ${aie_tile_obj}
 else
 	$(error devicename=$(devicename) not supported; use NPU2=1)
@@ -78,6 +90,7 @@ endif
 build/aie_${artifact_suffix}.mlir: ${aie_py_src}
 	mkdir -p $(@D)
 	BIONPU_METHYLATION_CONTEXT_LAUNCH_CHUNKS=${launch_chunks} \
+	  BIONPU_METHYLATION_CONTEXT_SEQ_CHUNK_BYTES=${seq_chunk_bytes} \
 	  BIONPU_METHYLATION_CONTEXT_N_CHUNKS_PER_LAUNCH=${n_chunks_per_launch} \
 	  ${PYTHON} ${srcdir}/${aie_py_src} \
 	    -d ${devicename} \
@@ -107,6 +120,7 @@ ${targetname}: ${runner_cc_src}
 	fi
 	${HOST_CXX} -std=c++17 -O2 \
 	  -I${XILINX_XRT}/include \
+	  -DMC_SEQ_IN_CHUNK_BYTES_BASE=${seq_chunk_bytes} \
 	  ${runner_cc_src} \
 	  -L${XILINX_XRT}/lib -Wl,-rpath,${XILINX_XRT}/lib \
 	  -lxrt_coreutil -luuid \
@@ -115,4 +129,4 @@ ${targetname}: ${runner_cc_src}
 clean:
 	rm -rf build ${targetname}
 
-.PHONY: all clean
+.PHONY: all clean ${targetname}

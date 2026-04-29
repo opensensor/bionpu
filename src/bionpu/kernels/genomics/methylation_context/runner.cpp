@@ -23,7 +23,10 @@
 
 namespace {
 
-constexpr int32_t SEQ_IN_CHUNK_BYTES_BASE = 4096;
+#ifndef MC_SEQ_IN_CHUNK_BYTES_BASE
+#define MC_SEQ_IN_CHUNK_BYTES_BASE 4096
+#endif
+constexpr int32_t SEQ_IN_CHUNK_BYTES_BASE = MC_SEQ_IN_CHUNK_BYTES_BASE;
 constexpr int32_t SEQ_IN_OVERLAP = 4;
 constexpr int32_t HEADER_BYTES = 8;
 constexpr int32_t PARTIAL_OUT_BYTES_PADDED = 32768;

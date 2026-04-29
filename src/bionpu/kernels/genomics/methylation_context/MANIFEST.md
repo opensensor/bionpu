@@ -42,3 +42,9 @@ export PEANO_INSTALL_DIR=/home/$USER/xdna-bringup/ironenv/lib/python3.14/site-pa
 
 make NPU2=1 experiment=wide4 all
 ```
+
+The record-safe chr22 artifact uses smaller chunks:
+
+```bash
+make NPU2=1 experiment=wide4 seq_chunk_bytes=1024 all
+```

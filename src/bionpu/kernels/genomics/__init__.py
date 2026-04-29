@@ -341,6 +341,7 @@ def get_cpg_island_op(
 
 def get_methylation_context_op(
     n_tiles: int | None = None,
+    seq_chunk_bytes_base: int = 4096,
 ):
     """Return the CG/CHG/CHH methylation-context scanner :class:`NpuOp`."""
     from bionpu.dispatch.npu import NPU_OPS
@@ -363,7 +364,10 @@ def get_methylation_context_op(
         )
 
     BionpuMethylationContext = type(NPU_OPS[op_name])
-    return BionpuMethylationContext(n_tiles=int(n_tiles))
+    return BionpuMethylationContext(
+        n_tiles=int(n_tiles),
+        seq_chunk_bytes_base=int(seq_chunk_bytes_base),
+    )
 
 
 # --------------------------------------------------------------------------- #

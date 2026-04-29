@@ -21,7 +21,7 @@ across four algorithmic shapes, plus one product-facing composition.
 | `primer_scan` v0 | substring / adapter exact match | smoke 0/0; synthetic 2/2 byte-equal; chr22 path built | 2.05 s |
 | `cpg_island` v0 | windowed multi-counter stats + threshold | 1,352 islands byte-equal; 1,373,708 candidates | 3.80 s |
 | `tandem_repeat` v0 | period detection / autocorrelation | chr22 silicon run; 289,548 records with 3 host-merge edge diffs | 9.4 s |
-| `methylation_context` v0 | local base-context classifier | smoke byte-equal; chr22 cap-fire at 9.84 M / 18.41 M records | 23.28 s |
+| `methylation_context` v0/v1 | local base-context classifier | chr22 record-equal with c1024; 18.41 M records | 154.77 s |
 | `bionpu trim` v0/v1 | toolkit-to-tool composition | cutadapt byte-equal on 4/4 cross-checks | workload-dependent |
 
 The common shape is:
@@ -140,12 +140,12 @@ minus-strand cytosines represented as forward-reference `G` positions.
 The silicon path is byte-equal to the CPU oracle on mixed synthetic
 smoke tests and all-A negative controls.
 
-Full chr22 validation is a deliberate boundary test:
+Full chr22 validation first exposed a deliberate boundary test:
 
 - fixture: `tracks/genomics/fixtures/chr22.2bit.bin`
 - bases: 50,818,468
 - CPU oracle: 18,406,838 context records in 21.318 s
-- NPU: 9,840,462 context records in 23.277 s wall
+- NPU c4096: 9,840,462 context records in 23.277 s wall
 - host-reported dispatch: 813.408 us average over 3,108 chunks
 - record recovery: 53.46%
 - byte-equal: false, due to `MC_MAX_EMIT_IDX=4094` cap-fire
@@ -167,6 +167,19 @@ fits AIE2P, but the output contract needs a v1 mode before full-genome
 record emission can be byte-equal. Good v1 options are a wider output
 slot, smaller chunks, context-filtered scans, or count/window aggregate
 mode.
+
+The record-safe fix is smaller chunks, not changed semantics. A c2048
+variant recovered 17,839,396 / 18,406,838 records (96.9%) but still
+cap-fired in dense chunks. The c1024 artifact removes cap-fire on chr22:
+
+- NPU c1024: 18,406,838 context records in 154.771 s wall
+- chunks: 12,505
+- host-reported dispatch: 386.744 us average
+- record recovery: 100.00%
+- byte-equal: true, record-by-record
+
+Measurement file:
+`results/methylation_context/v1-c1024-chr22/measurements.json`.
 
 ## Toolkit Pattern
 

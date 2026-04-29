@@ -51,12 +51,14 @@ __all__ = [
     "PARTIAL_OUT_BYTES_PADDED",
     "RECORD_BYTES",
     "SEQ_IN_CHUNK_BYTES_BASE",
+    "SUPPORTED_SEQ_CHUNK_BYTES_BASE",
     "SUPPORTED_N_CHUNKS_PER_LAUNCH",
     "SUPPORTED_N_TILES",
 ]
 
 SUPPORTED_N_TILES: tuple[int, ...] = (1, 2, 4, 8)
 SUPPORTED_N_CHUNKS_PER_LAUNCH: tuple[int, ...] = (1, 2, 4, 8)
+SUPPORTED_SEQ_CHUNK_BYTES_BASE: tuple[int, ...] = (1024, 2048, 4096)
 SEQ_IN_CHUNK_BYTES_BASE: int = 4096
 PARTIAL_OUT_BYTES_PADDED: int = 32768
 RECORD_BYTES: int = 8
@@ -160,6 +162,7 @@ class BionpuMethylationContext(NpuOp):
         *,
         n_tiles: int = 4,
         n_chunks_per_launch: int = 1,
+        seq_chunk_bytes_base: int = SEQ_IN_CHUNK_BYTES_BASE,
     ) -> None:
         if int(n_tiles) not in SUPPORTED_N_TILES:
             valid = ", ".join(str(x) for x in SUPPORTED_N_TILES)
@@ -173,14 +176,23 @@ class BionpuMethylationContext(NpuOp):
                 "BionpuMethylationContext: n_chunks_per_launch="
                 f"{n_chunks_per_launch!r} not in {{{valid}}}."
             )
+        if int(seq_chunk_bytes_base) not in SUPPORTED_SEQ_CHUNK_BYTES_BASE:
+            valid = ", ".join(str(x) for x in SUPPORTED_SEQ_CHUNK_BYTES_BASE)
+            raise ValueError(
+                "BionpuMethylationContext: seq_chunk_bytes_base="
+                f"{seq_chunk_bytes_base!r} not in {{{valid}}}."
+            )
         self.n_tiles = int(n_tiles)
         self.n_chunks_per_launch = int(n_chunks_per_launch)
+        self.seq_chunk_bytes_base = int(seq_chunk_bytes_base)
         self.name = "bionpu_methylation_context"
         self.last_run: _RunInfo | None = None
 
     @property
     def artifact_dir(self) -> Path:
         base = f"bionpu_methylation_context_n{self.n_tiles}"
+        if self.seq_chunk_bytes_base != SEQ_IN_CHUNK_BYTES_BASE:
+            base = f"{base}_c{self.seq_chunk_bytes_base}"
         if self.n_chunks_per_launch == 1:
             return _ART_ROOT / base
         return _ART_ROOT / f"{base}_b{self.n_chunks_per_launch}"

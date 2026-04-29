@@ -38,9 +38,11 @@ def test_methylation_context_op_validates_input_shape() -> None:
 
 
 def test_get_methylation_context_op_returns_requested_tile_count() -> None:
-    op = get_methylation_context_op(n_tiles=2)
+    op = get_methylation_context_op(n_tiles=2, seq_chunk_bytes_base=2048)
     assert isinstance(op, BionpuMethylationContext)
     assert op.n_tiles == 2
+    assert op.seq_chunk_bytes_base == 2048
+    assert op.artifact_dir.name == "bionpu_methylation_context_n2_c2048"
 
 
 def test_methylation_context_silicon_byte_equal_mixed_smoke() -> None:

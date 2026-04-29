@@ -79,6 +79,7 @@ Synonyms accepted at construction:
 from __future__ import annotations
 
 import importlib
+import importlib.util  # explicit so module-load-time _maybe_inject_pridict2_path works
 import os
 import sys
 import threading
@@ -279,6 +280,17 @@ class PRIDICT2Scorer:
     in-house feature engineering. The wrapper accepts and IGNORES
     ``folding_features`` if supplied (preserving the call signature
     T8 expects).
+
+    Component-triple lookup (T12 surface)
+    -------------------------------------
+    The :meth:`score`, :meth:`score_batch`, and
+    :meth:`score_arbitrary_pegrna` methods accept optional
+    ``(spacer_dna, pbs_dna, rtt_dna)`` hints. When supplied, the
+    cache lookup falls back to a component-wise match against the
+    PRIDICT CSV's ``Spacer-Sequence`` / ``PBSrevcomp`` / ``RTrevcomp``
+    columns when the full assembled-pegRNA string fails to match.
+    This handles the canonical scaffold mismatch between T6 (Anzalone
+    canonical) and PRIDICT's internal F+E variant.
     """
 
     def __init__(
@@ -371,6 +383,9 @@ class PRIDICT2Scorer:
         scaffold_variant: str = _CANONICAL_SCAFFOLD_NAME,
         target_context: str,
         folding_features=None,
+        spacer_dna: str | None = None,
+        pbs_dna: str | None = None,
+        rtt_dna: str | None = None,
     ) -> PRIDICTScore:
         """Score a single pegRNA.
 
@@ -393,6 +408,18 @@ class PRIDICT2Scorer:
             ViennaRNA features from T4. PRIDICT 2.0 does not consume
             external folding features, so this is accepted for API
             consistency with T8 and IGNORED.
+        spacer_dna, pbs_dna, rtt_dna:
+            Optional component-level hints (DNA or RNA letters; both
+            accepted). When supplied, they let the wrapper fall back
+            to a component-wise match against PRIDICT's enumeration
+            cache when the full assembled-pegRNA string fails to
+            match (this is the canonical case when T6's enumerator
+            and PRIDICT's ``pegRNAfinder`` use different scaffold
+            bodies — T6 ships the Anzalone-2019 ``GUUUU...UUUU``
+            scaffold; PRIDICT internally assembles the optimised
+            ``GUUUC...GGUGC`` F+E variant). Per-component triple
+            ``(Spacer-Sequence, PBSrevcomp, RTrevcomp)`` is the
+            invariant identity of a pegRNA across scaffold bodies.
 
         Returns
         -------
@@ -406,7 +433,70 @@ class PRIDICT2Scorer:
         del folding_features  # accepted for T8 API consistency; ignored.
 
         with self._lock:
-            return self._score_one(pegrna_seq, scaffold_variant, target_context)
+            return self._score_one(
+                pegrna_seq,
+                scaffold_variant,
+                target_context,
+                spacer_dna=spacer_dna,
+                pbs_dna=pbs_dna,
+                rtt_dna=rtt_dna,
+            )
+
+    def score_arbitrary_pegrna(
+        self,
+        *,
+        spacer: str,
+        pbs: str,
+        rtt: str,
+        target_context: str,
+        scaffold_variant: str = _CANONICAL_SCAFFOLD_NAME,
+        full_pegrna_seq: str | None = None,
+    ) -> PRIDICTScore:
+        """Score a pegRNA by ``(spacer, PBS, RTT)`` triple.
+
+        Use case: T6's enumerator may emit pegRNAs whose full assembled
+        string differs from PRIDICT's pegRNAfinder output (e.g. T6 ships
+        the Anzalone canonical scaffold with the Pol-III ``UUUU``
+        terminator while PRIDICT's pegRNAfinder bakes in the Chen 2013
+        F+E optimised scaffold). The component triple
+        ``(Spacer-Sequence, PBSrevcomp, RTrevcomp)`` is the
+        scaffold-invariant identity that PRIDICT's enumeration cache
+        keys on under the hood — matching against those columns covers
+        T6 candidates that the assembled-string lookup misses.
+
+        Parameters
+        ----------
+        spacer, pbs, rtt:
+            Component sequences. DNA or RNA letters both accepted;
+            canonicalised internally to DNA-letter case.
+        target_context:
+            PRIDICT 2.0 ``XXX(orig/edit)YYY`` target string. Required
+            so the wrapper's per-target enumeration cache can serve
+            this call.
+        scaffold_variant:
+            Same semantics as :meth:`score` — non-canonical variants
+            tag the result with ``SCAFFOLD_OUT_OF_DISTRIBUTION``.
+        full_pegrna_seq:
+            Optional full-pegRNA string; when supplied it's tried
+            first (fast path) before falling back to the component
+            triple match.
+
+        Returns
+        -------
+        PRIDICTScore
+            Same shape as :meth:`score`. Components that do not match
+            any pegRNA in the upstream enumeration return a NaN score
+            tagged ``PEGRNA_NOT_ENUMERATED_BY_PRIDICT``.
+        """
+        with self._lock:
+            return self._score_one(
+                full_pegrna_seq or "",
+                scaffold_variant,
+                target_context,
+                spacer_dna=spacer,
+                pbs_dna=pbs,
+                rtt_dna=rtt,
+            )
 
     def score_batch(
         self,
@@ -415,6 +505,9 @@ class PRIDICT2Scorer:
         scaffold_variants: list[str] | None = None,
         target_contexts: list[str],
         folding_features_list=None,
+        spacer_dnas: list[str | None] | None = None,
+        pbs_dnas: list[str | None] | None = None,
+        rtt_dnas: list[str | None] | None = None,
     ) -> list[PRIDICTScore]:
         """Score a batch of pegRNAs.
 
@@ -456,13 +549,31 @@ class PRIDICT2Scorer:
                 f"and pegrna_seqs ({len(pegrna_seqs)}) length mismatch"
             )
 
+        n = len(pegrna_seqs)
+        sp_list = spacer_dnas if spacer_dnas is not None else [None] * n
+        pbs_list = pbs_dnas if pbs_dnas is not None else [None] * n
+        rtt_list = rtt_dnas if rtt_dnas is not None else [None] * n
+
         out: list[PRIDICTScore] = []
         with self._lock:
-            for pegrna_seq, scaffold_variant, target_context in zip(
-                pegrna_seqs, scaffold_variants, target_contexts, strict=True
+            for pegrna_seq, scaffold_variant, target_context, sp, pbs_c, rtt_c in zip(
+                pegrna_seqs,
+                scaffold_variants,
+                target_contexts,
+                sp_list,
+                pbs_list,
+                rtt_list,
+                strict=True,
             ):
                 out.append(
-                    self._score_one(pegrna_seq, scaffold_variant, target_context)
+                    self._score_one(
+                        pegrna_seq,
+                        scaffold_variant,
+                        target_context,
+                        spacer_dna=sp,
+                        pbs_dna=pbs_c,
+                        rtt_dna=rtt_c,
+                    )
                 )
         return out
 
@@ -475,12 +586,38 @@ class PRIDICT2Scorer:
         pegrna_seq: str,
         scaffold_variant: str,
         target_context: str,
+        *,
+        spacer_dna: str | None = None,
+        pbs_dna: str | None = None,
+        rtt_dna: str | None = None,
     ) -> PRIDICTScore:
         """Score a single pegRNA, with both target-level and
         per-pegRNA caching.
+
+        Match strategy: try the full assembled-pegRNA canonical string
+        first (fast path; works when T6 + PRIDICT happen to assemble
+        with the same scaffold body). If that fails AND the caller
+        supplied component hints (``spacer_dna`` / ``pbs_dna`` /
+        ``rtt_dna``), fall back to a component-wise match against the
+        PRIDICT CSV's ``Spacer-Sequence`` / ``PBSrevcomp`` /
+        ``RTrevcomp`` columns. The component triple is invariant
+        across scaffold bodies (Anzalone vs F+E) so this lookup
+        succeeds for T6 candidates that the assembled-string check
+        misses (the canonical case observed in the T10 manual smoke).
         """
-        canonical = _canonical_pegrna(pegrna_seq)
-        cache_key = (canonical, scaffold_variant, self.model_variant, target_context)
+        canonical = _canonical_pegrna(pegrna_seq) if pegrna_seq else ""
+        # Cache key includes the component triple when supplied so the
+        # lookup is deterministic across runs even when the assembled
+        # pegRNA string is empty (score_arbitrary_pegrna call path).
+        cache_key = (
+            canonical
+            or f"comp:{_canonical_pegrna(spacer_dna or '')}|"
+               f"{_canonical_pegrna(pbs_dna or '')}|"
+               f"{_canonical_pegrna(rtt_dna or '')}",
+            scaffold_variant,
+            self.model_variant,
+            target_context,
+        )
 
         # Score-level cache hit.
         if cache_key in self._score_cache:
@@ -500,7 +637,7 @@ class PRIDICT2Scorer:
             self._score_cache[cache_key] = score
             return score
 
-        # Match the enumerated row by canonical pegRNA sequence.
+        # Match the enumerated row.
         if "pegRNA" not in df.columns or len(df) == 0:
             score = PRIDICTScore(
                 efficiency=float("nan"),
@@ -511,9 +648,43 @@ class PRIDICT2Scorer:
             self._score_cache[cache_key] = score
             return score
 
-        df_canonical = df["pegRNA"].astype(str).apply(_canonical_pegrna)
-        match = df.loc[df_canonical == canonical]
-        if len(match) == 0:
+        # Fast path: full assembled-pegRNA canonical match.
+        match = None
+        if canonical:
+            df_canonical = df["pegRNA"].astype(str).apply(_canonical_pegrna)
+            full_match = df.loc[df_canonical == canonical]
+            if len(full_match) > 0:
+                match = full_match
+
+        # Component fallback: when full pegRNA string doesn't match
+        # (typically because T6's scaffold body differs from PRIDICT's
+        # internal F+E scaffold), match by the scaffold-invariant
+        # ``(Spacer-Sequence, PBSrevcomp, RTrevcomp)`` triple. PRIDICT
+        # writes RT and PBS in DNA letters; T6 ships them in RNA
+        # letters; ``_canonical_pegrna`` normalises both to DNA case.
+        if match is None and (
+            spacer_dna or pbs_dna or rtt_dna
+        ) and {"Spacer-Sequence", "PBSrevcomp", "RTrevcomp"} <= set(df.columns):
+            sp_c = _canonical_pegrna(spacer_dna) if spacer_dna else None
+            pbs_c = _canonical_pegrna(pbs_dna) if pbs_dna else None
+            # PRIDICT's RTrevcomp may carry a lowercase letter at the
+            # edited base position (per pegRNAfinder convention); we
+            # uppercase before comparing.
+            rtt_c = _canonical_pegrna(rtt_dna) if rtt_dna else None
+
+            df_sp = df["Spacer-Sequence"].astype(str).apply(_canonical_pegrna)
+            df_pbs = df["PBSrevcomp"].astype(str).apply(_canonical_pegrna)
+            df_rtt = df["RTrevcomp"].astype(str).apply(_canonical_pegrna)
+            mask = (
+                (df_sp == sp_c if sp_c is not None else True)
+                & (df_pbs == pbs_c if pbs_c is not None else True)
+                & (df_rtt == rtt_c if rtt_c is not None else True)
+            )
+            comp_match = df.loc[mask]
+            if len(comp_match) > 0:
+                match = comp_match
+
+        if match is None or len(match) == 0:
             score = PRIDICTScore(
                 efficiency=float("nan"),
                 edit_rate=float("nan"),

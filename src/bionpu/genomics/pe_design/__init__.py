@@ -35,11 +35,22 @@ Per the long-arc roadmap (``PRDs/PRD-crispr-state-of-the-art-roadmap.md``
 (per Track D's Phase 0 closure, all bf16 transformer scoring is CPU
 across Tracks A/B/D/E). Silicon work in v0 is limited to off-target
 scan reuse via the locked ``crispr/match_multitile_memtile`` kernel.
+
+Lazy import policy
+------------------
+
+Types and the off_target adapter are imported eagerly because they're
+cheap and cycle-free.  ``design_prime_editor_guides`` is exposed via
+``__getattr__`` so the heavyweight ``cli.py`` (which pulls in the
+PRIDICT 2.0 wrapper) is only loaded on first attribute access.  This
+breaks an otherwise-circular import path: ``bionpu.scoring.pridict2``
+-> ``pe_design.types`` -> ``pe_design.__init__`` -> ``pe_design.cli``
+-> ``bionpu.scoring.pridict2`` (which would still be loading), which
+breaks the integration-test entry path.
 """
 
 from __future__ import annotations
 
-from .cli import design_prime_editor_guides
 from .off_target import off_target_scan_for_spacer
 from .types import (
     EditSpec,
@@ -52,7 +63,7 @@ from .types import (
 )
 
 __all__: list[str] = [
-    # Top-level orchestration
+    # Top-level orchestration (lazy via __getattr__)
     "design_prime_editor_guides",
     # T11 spacer-level adapter (re-exported for script users)
     "off_target_scan_for_spacer",
@@ -65,3 +76,18 @@ __all__: list[str] = [
     "PRIDICTScore",
     "RankedPegRNA",
 ]
+
+
+def __getattr__(name: str):
+    """Lazy attribute resolver for heavyweight imports.
+
+    ``design_prime_editor_guides`` lives in ``cli.py`` which imports
+    :class:`bionpu.scoring.pridict2.PRIDICT2Scorer` — eagerly importing
+    that here introduces a circular import for callers that load
+    :mod:`bionpu.scoring.pridict2` first (e.g.
+    ``test_pe_design_integration.py``).
+    """
+    if name == "design_prime_editor_guides":
+        from .cli import design_prime_editor_guides as _fn
+        return _fn
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

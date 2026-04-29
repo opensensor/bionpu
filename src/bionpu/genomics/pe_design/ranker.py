@@ -182,10 +182,24 @@ def _safe_score_pridict(
     scaffold_variant: str,
     target_context: str,
     folding_features: PegRNAFoldingFeatures | None,
+    spacer_dna: str | None = None,
+    pbs_dna: str | None = None,
+    rtt_dna: str | None = None,
 ) -> tuple[PRIDICTScore | None, bool]:
     """Score one pegRNA, swallowing any exception.
 
     Returns ``(score, failed)`` — ``score`` is ``None`` when ``failed``.
+
+    Component hints (``spacer_dna``/``pbs_dna``/``rtt_dna``) are
+    forwarded to scorers that accept them (canonical
+    :class:`bionpu.scoring.pridict2.PRIDICT2Scorer`); they enable the
+    scaffold-invariant component-triple match against PRIDICT's
+    enumeration cache when T6's assembled pegRNA string differs from
+    PRIDICT's (the standard case — T6 ships the Anzalone-2019
+    canonical scaffold body while PRIDICT's pegRNAfinder bakes in
+    Chen 2013's F+E optimised scaffold). Test stubs that only accept
+    the legacy 4-arg signature still work because the ranker drops
+    the hints on TypeError-fallback.
     """
     try:
         score = scorer.score(
@@ -193,7 +207,23 @@ def _safe_score_pridict(
             scaffold_variant=scaffold_variant,
             target_context=target_context,
             folding_features=folding_features,
+            spacer_dna=spacer_dna,
+            pbs_dna=pbs_dna,
+            rtt_dna=rtt_dna,
         )
+    except TypeError:
+        # Stub scorers (test fixtures) may not accept the hint kwargs.
+        # Fall back to the legacy signature; component-triple lookup
+        # is opportunistic, never required.
+        try:
+            score = scorer.score(
+                pegrna_seq,
+                scaffold_variant=scaffold_variant,
+                target_context=target_context,
+                folding_features=folding_features,
+            )
+        except Exception:  # noqa: BLE001 — explicit policy: NaN-and-flag
+            return None, True
     except Exception:  # noqa: BLE001 — explicit policy: NaN-and-flag
         return None, True
     return score, False
@@ -318,12 +348,19 @@ def rank_candidates(
             folding_cache[folding_key] = folding
 
         # ---- PRIDICT efficiency (T5) -------------------------------- #
+        # Pass component triple as hints so the PRIDICT wrapper can
+        # fall back to a scaffold-invariant component-wise match
+        # against PRIDICT's enumeration cache when T6's full
+        # assembled pegRNA string differs from PRIDICT's (T10 surface).
         pridict_score, failed = _safe_score_pridict(
             scorer,
             pegrna_seq=cand.full_pegrna_rna_seq,
             scaffold_variant=cand.scaffold_variant,
             target_context=target_context,
             folding_features=folding,
+            spacer_dna=cand.spacer_seq,
+            pbs_dna=cand.pbs_seq,
+            rtt_dna=cand.rtt_seq,
         )
         if failed:
             efficiency = float("nan")

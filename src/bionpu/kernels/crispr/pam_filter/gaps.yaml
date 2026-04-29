@@ -66,7 +66,7 @@ gaps:
       fork_branch: "feature/-variable-rate-fifo"
       fork_commit: "02cef1591e4658b93d20d8acb6dcc3db09d0b45e"
       summary: |
-         lands aie.iron.VariableRateFifo (sibling to
+        lands aie.iron.VariableRateFifo (sibling to
         PacketFifo from ). The new IRON primitive resolves the
         single-producer / conditional-forward half of this gap by
         adding a discard(n) API on the producer handle and a
@@ -311,3 +311,51 @@ gaps:
     upstream_issue: null
     blocks: []
     severity: "cosmetic"
+  - id: ""
+    category: "expressibility"
+    op_or_pattern: "Direct N_GUIDES=256 PAM-filter topology with four match partial streams into Tile Z"
+    attempted: |
+      Explored widening the CRISPR PAM-filter guide batch from 128 to
+      256 guides by keeping the existing 64-guide match kernel and
+      instantiating four match tiles. The attempted direct topology was:
+
+        shim -> guides broadcast -> match_0..3
+        shim -> windows_in -> Tile A -> windows_out broadcast -> match_0..3
+        Tile A -> pam_meta -> Tile Z
+        match_0..3 -> partial_0..3 -> Tile Z
+        Tile Z -> sparse_out -> shim
+
+      Host fallback smoke with the widened wrapper shape produced 256
+      hits and guide indices 0..255, so the host-side record format is
+      straightforward. C++ syntax checks also passed for the widened
+      constants.
+    failed_with: |
+      Full NPU build failed during aiecc resource allocation:
+
+        error: 'aie.tile' op number of input DMA channel exceeded!
+
+      Tile Z consumes five logical input streams in the direct design:
+      partial_0, partial_1, partial_2, partial_3, and pam_meta.
+    root_cause: |
+      The direct topology exceeds the compute-tile input DMA channel
+      budget. Tile memory was not the limiting factor: the estimated
+      Tile Z footprint remains below 64 KiB. The blocker is input
+      stream count into one compute tile.
+    workaround: |
+      Keep production artifacts on the validated 128-guide topology.
+      A buildable 256-guide variant needs one of:
+
+      1. memtile fan-in before Tile Z so four match partials are joined
+         or packetized into at most two streams;
+      2. packetized partials carrying the PAM-pass bit, removing the
+         separate pam_meta stream; or
+      3. a two-stage Tile Z reduction where two joiner tiles consume
+         two partial streams each before a final emit tile.
+
+      The dedicated exploratory note lives at
+      src/bionpu/kernels/crispr/pam_filter/DESIGN_N_GUIDES_256.md.
+      Do not switch the default Makefile or production wrapper to 256
+      until one of these buildable topologies passes silicon smoke.
+    upstream_issue: null
+    blocks: []
+    severity: "workaround"

@@ -1440,6 +1440,22 @@ def _build_parser() -> argparse.ArgumentParser:
     from .genomics.be_design.cli import add_be_design_subparser
     add_be_design_subparser(sub_be)
 
+    # library — Track C v0 pooled CRISPR library design
+    # (PRD-crispr-state-of-the-art-roadmap §3.3). Two-level shape
+    # (`bionpu library design ...`) leaves room for `bionpu library
+    # validate`, `bionpu library balance`, etc.
+    p_lib = sub.add_parser(
+        "library",
+        help=(
+            "Genome-scale pooled CRISPR library design. Track C v0: "
+            "knockout libraries (NGG SpCas9); per-gene-list scope; "
+            "non-targeting + safe-harbor + essential-gene controls."
+        ),
+    )
+    sub_lib = p_lib.add_subparsers(dest="library_kind")
+    from .genomics.library_design.cli import add_library_design_subparser
+    add_library_design_subparser(sub_lib)
+
     # placeholders — scope for v0.3+
     for name, help_text in (
         ("basecall", "Nanopore basecalling (v0.2+ scope)"),
@@ -1462,6 +1478,7 @@ def main(argv: list[str] | None = None) -> int:
         ("bench", "bench_kind"),
         ("crispr", "crispr_kind"),
         ("be", "be_kind"),
+        ("library", "library_kind"),
     ):
         if args.cmd == parent_cmd and getattr(args, kind_attr, None) is None:
             for action in p._subparsers._actions:  # type: ignore[attr-defined]

@@ -21,7 +21,7 @@ across four algorithmic shapes, plus one product-facing composition.
 | `primer_scan` v0 | substring / adapter exact match | smoke 0/0; synthetic 2/2 byte-equal; chr22 path built | 2.05 s |
 | `cpg_island` v0 | windowed multi-counter stats + threshold | 1,352 islands byte-equal; 1,373,708 candidates | 3.80 s |
 | `tandem_repeat` v0 | period detection / autocorrelation | chr22 silicon run; 289,548 records with 3 host-merge edge diffs | 9.4 s |
-| `methylation_context` v0/v1 | local base-context classifier | chr22 record-equal with c1024; 18.41 M records | 154.77 s |
+| `methylation_context` v0/v1 | local base-context classifier | chr22 record-equal with c1024/b8 streaming; 18.41 M records | 3.675 s |
 | `bionpu trim` v0/v1 | toolkit-to-tool composition | cutadapt byte-equal on 4/4 cross-checks | workload-dependent |
 
 The common shape is:
@@ -168,7 +168,7 @@ record emission can be byte-equal. Good v1 options are a wider output
 slot, smaller chunks, context-filtered scans, or count/window aggregate
 mode.
 
-The record-safe fix is smaller chunks, not changed semantics. A c2048
+The record-safe fix was smaller chunks, not changed semantics. A c2048
 variant recovered 17,839,396 / 18,406,838 records (96.9%) but still
 cap-fired in dense chunks. The c1024 artifact removes cap-fire on chr22:
 
@@ -188,13 +188,13 @@ change wall time:
 | --- | ---: | ---: | ---: |
 | `n4_c1024` | 12,505 | 386.744 us | 154.771 s |
 | `n4_b4_c1024` | 3,127 | 1,057.99 us | 150.818 s |
-| `n4_b8_c1024` | 1,564 | 1,778.95 us | 150.795 s |
+| `n4_b8_c1024` | 1,564 | 1,545.51 us | 3.675 s |
 
 The `n4_b8_c1024` host runner can now filter chunk overlaps into strict
 owned intervals and skip global sort/unique once records are monotonic.
-That preserved full chr22 record equality but did not materially move
-wall time, localizing the remaining bottleneck to output
-materialization/write of 18.4 M dense records.
+Streaming binary output then avoids materializing and rewriting the full
+18.4 M-record vector, dropping chr22 runner wall from 150.795 s to
+3.675 s while preserving full record equality.
 
 ## Toolkit Pattern
 

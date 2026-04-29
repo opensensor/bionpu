@@ -7,7 +7,7 @@ Batched record-safe artifacts for the v0 methylation-context scanner at
 | --- | ---: | --- |
 | `final.xclbin` | 18409 | `dd97a26db968ef63b4fa189a6afad85bcd718bbbe58ec1684998a7fb4912b70e` |
 | `insts.bin` | 300 | `ccab0805719126447ed21df6477043021aa246d145e324f26f23bb0342532e52` |
-| `host_runner` | 57144 | `e4795e319516de15fb5f5029af735558cef69a6d6305803de8dd50b0cfd18085` |
+| `host_runner` | 57584 | `88f5b2628259ede7b19af603c95bae52d5c946c76d7b39bcd6bbb42f1b49adf7` |
 
 * `build_date`: 2026-04-29
 * `target`: AIE2P (NPU2)
@@ -17,3 +17,5 @@ Batched record-safe artifacts for the v0 methylation-context scanner at
   (`18,406,838` records, no cap-fire).
 * Host runner skips global sort/unique when chunk-owned records are
   already monotonic.
+* Binary output streams records directly after parse when `--top 0`,
+  then patches the final record count into the header.

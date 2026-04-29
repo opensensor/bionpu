@@ -62,10 +62,14 @@ struct Record {
 struct ParseStats {
     uint32_t max_emit_observed = 0;
     bool monotonic = true;
+    bool has_last = false;
+    Record last{};
+    uint64_t records = 0;
 };
 
 bool record_less(const Record &a, const Record &b);
 bool record_equal(const Record &a, const Record &b);
+void write_binary_record(std::ofstream &f, const Record &r);
 
 void print_usage(std::ostream &os) {
     os <<
@@ -180,6 +184,7 @@ void parse_chunk_tile0(const uint8_t *blob,
                        size_t chunk_global_end,
                        int n_bases,
                        std::vector<Record> &out,
+                       std::ofstream *binary_stream,
                        ParseStats &stats) {
     uint32_t emit_count = 0;
     std::memcpy(&emit_count, blob, 4);
@@ -199,13 +204,20 @@ void parse_chunk_tile0(const uint8_t *blob,
             continue;
         }
         Record r{global_pos, rec[4], rec[5]};
-        if (!out.empty() && record_less(r, out.back())) {
+        if (stats.has_last && record_less(r, stats.last)) {
             stats.monotonic = false;
         }
-        if (!out.empty() && record_equal(r, out.back())) {
+        if (stats.has_last && record_equal(r, stats.last)) {
             continue;
         }
-        out.push_back(r);
+        if (binary_stream != nullptr) {
+            write_binary_record(*binary_stream, r);
+        } else {
+            out.push_back(r);
+        }
+        stats.last = r;
+        stats.has_last = true;
+        stats.records += 1u;
     }
 }
 
@@ -233,12 +245,16 @@ void emit_binary(const std::string &path, const std::vector<Record> &v) {
     uint64_t n = static_cast<uint64_t>(v.size());
     f.write(reinterpret_cast<const char *>(&n), 8);
     for (const Record &r : v) {
-        f.write(reinterpret_cast<const char *>(&r.pos), 4);
-        f.write(reinterpret_cast<const char *>(&r.strand), 1);
-        f.write(reinterpret_cast<const char *>(&r.context), 1);
-        uint16_t pad = 0;
-        f.write(reinterpret_cast<const char *>(&pad), 2);
+        write_binary_record(f, r);
     }
+}
+
+void write_binary_record(std::ofstream &f, const Record &r) {
+    f.write(reinterpret_cast<const char *>(&r.pos), 4);
+    f.write(reinterpret_cast<const char *>(&r.strand), 1);
+    f.write(reinterpret_cast<const char *>(&r.context), 1);
+    uint16_t pad = 0;
+    f.write(reinterpret_cast<const char *>(&pad), 2);
 }
 
 void trace(const std::string &msg) {
@@ -308,6 +324,8 @@ int main(int argc, char **argv) {
     auto *p_seq_in = bo_seq_in.map<uint8_t *>();
     auto *p_sparse_out = bo_sparse_out.map<uint8_t *>();
 
+    const bool stream_binary = args.output_format == "binary" && args.top == 0;
+    std::ofstream binary_stream;
     std::vector<Record> all_records;
     float total_us = 0.0f;
     float min_us = 1e30f;
@@ -322,6 +340,19 @@ int main(int argc, char **argv) {
         if (keep) {
             all_records.clear();
             parse_stats = ParseStats{};
+            if (stream_binary) {
+                binary_stream.close();
+                binary_stream.open(args.output_path,
+                                   std::ios::binary | std::ios::trunc);
+                if (!binary_stream) {
+                    std::cerr << "ERROR: cannot open output: "
+                              << args.output_path << "\n";
+                    return 2;
+                }
+                uint64_t placeholder_count = 0;
+                binary_stream.write(
+                    reinterpret_cast<const char *>(&placeholder_count), 8);
+            }
         }
         for (size_t bi = 0; bi < n_batches; ++bi) {
             std::memset(p_seq_in, 0, per_batch_seq_in_bytes);
@@ -386,6 +417,7 @@ int main(int argc, char **argv) {
                         owned_end,
                         args.n_bases,
                         all_records,
+                        stream_binary ? &binary_stream : nullptr,
                         parse_stats);
                 }
             }
@@ -402,18 +434,34 @@ int main(int argc, char **argv) {
     if (parse_stats.monotonic) {
         trace("records monotonic; skipped global sort/unique");
     } else {
+        if (stream_binary) {
+            std::cerr << "ERROR: streamed records are not monotonic; "
+                      << "rerun without binary streaming\n";
+            return 3;
+        }
         trace("records not monotonic; applying global sort/unique");
         std::sort(all_records.begin(), all_records.end(), record_less);
         all_records.erase(
             std::unique(all_records.begin(), all_records.end(), record_equal),
             all_records.end());
+        parse_stats.records = static_cast<uint64_t>(all_records.size());
     }
     if (args.top > 0 && static_cast<size_t>(args.top) < all_records.size()) {
         all_records.resize(static_cast<size_t>(args.top));
+        parse_stats.records = static_cast<uint64_t>(all_records.size());
     }
 
-    if (args.output_format == "binary") emit_binary(args.output_path, all_records);
-    else emit_tsv(args.output_path, all_records);
+    if (stream_binary) {
+        binary_stream.seekp(0);
+        binary_stream.write(
+            reinterpret_cast<const char *>(&parse_stats.records), 8);
+        binary_stream.close();
+        trace("streamed binary records=" + std::to_string(parse_stats.records));
+    } else if (args.output_format == "binary") {
+        emit_binary(args.output_path, all_records);
+    } else {
+        emit_tsv(args.output_path, all_records);
+    }
 
     float avg_us = timed_dispatches ? total_us / timed_dispatches : 0.0f;
     if (timed_dispatches == 0) min_us = 0.0f;
@@ -421,6 +469,6 @@ int main(int argc, char **argv) {
     std::cout << "Avg NPU time: " << avg_us << "us.\n";
     std::cout << "Min NPU time: " << min_us << "us.\n";
     std::cout << "Max NPU time: " << max_us << "us.\n";
-    std::cout << "Records: " << all_records.size() << "\n";
+    std::cout << "Records: " << parse_stats.records << "\n";
     return 0;
 }

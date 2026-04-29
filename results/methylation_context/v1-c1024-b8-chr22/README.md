@@ -8,9 +8,9 @@ Artifact:
 The `b8` artifact preserves full chr22 record equality while reducing
 the number of launches from 12,505 to 1,564. The host runner now filters
 chunk-overlap records into strict owned intervals, observes monotonic
-output, and skips the global sort/unique pass. End-to-end wall remains
-nearly identical to `b4`, so the next major lever is output
-materialization/write rather than sorting.
+output, skips the global sort/unique pass, and streams binary records
+directly to the output file. End-to-end runner wall dropped by ~41x
+versus the prior vector-materialized `b8` path.
 
 | metric | value |
 | --- | ---: |
@@ -18,8 +18,8 @@ materialization/write rather than sorting.
 | records | 18,406,838 |
 | record-equal | true |
 | record recovery | 100.00% |
-| silicon wall | 150.795 s |
-| avg NPU dispatch | 1,778.95 us |
+| silicon wall | 3.675 s |
+| avg NPU dispatch | 1,545.51 us |
 
 Counts match the CPU oracle exactly for `CG`, `CHG`, `CHH`, `+`, and
 `-`.
